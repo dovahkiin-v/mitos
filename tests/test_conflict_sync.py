@@ -28,7 +28,7 @@ always routed through `_execution([...])` (a bare Mock return makes 3a's
 
 import datetime as _datetime
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -229,7 +229,11 @@ def test_graph_fault_inside_check_never_blocks_commit(
     judge = _RecordingJudge(_execution([]))
 
     class _BoomVector(_FakeVector):
-        def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        def query(self, vector: List[float], limit: int = 5, *,
+                  with_payload: bool = True) -> List[Dict[str, Any]]:
+            raise RuntimeError("qdrant/graph exploded mid-check")
+
+        def delete_points(self, point_ids: Sequence[str]) -> None:
             raise RuntimeError("qdrant/graph exploded mid-check")
 
     manager.embed_provider = _FakeEmbed()  # type: ignore[assignment]
@@ -800,3 +804,44 @@ def test_telemetry_write_failure_never_aborts_sync(
     assert "Could not persist conflict telemetry" in captured.err  # best-effort warning
     assert manager.store.get_node_by_slug("health-public") is not None  # commit landed
     assert _read_conflict_rows(config) == []  # the write rolled back — no partial row
+
+
+# --------------------------------------------------------------------------- #
+# 2d — the sensor names a gather cut above its floor, per entry
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("last_above", [True, False])
+def test_a_cut_gather_prints_its_line_beside_the_findings_and_trips_nothing(
+    env: Tuple[MitosConfig, MitosSyncManager, str], capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, last_above: bool,
+) -> None:
+    """The bound moved to 21; the entry's fetch holds one live decision, then orphans.
+
+    The line prints only when the last point scores at or above the check's floor;
+    the finding still surfaces, the entry still commits, and the breaker stays open.
+    """
+    from mitos import conflict
+    from mitos.sync import _CONFLICT_GATHER_CUT_LINE
+    from _point_hits import orphan_hit
+
+    monkeypatch.setattr(conflict, "CONFLICT_RAW_BOUND", conflict.CONFLICT_OVERFETCH_LIMIT + 1)
+    config, manager, _ = env
+    _seed_active(manager, "endpoints-auth", "All API endpoints require authentication.")
+    floor = conflict.CONFLICT_SIMILARITY_FLOOR
+    tail = floor + 0.01 if last_above else floor - 0.01
+    count = conflict.CONFLICT_OVERFETCH_LIMIT
+    matches = [_match("endpoints-auth", 0.9)] + [
+        orphan_hit(0.89 - (0.89 - tail) * i / (count - 1), tag=f"sensor-cut-{i}")
+        for i in range(count)]
+    judge = _RecordingJudge(_execution([("endpoints-auth", False, 0.9, "They clash.")]))
+    _wire_fakes(manager, judge=judge, matches=matches)
+    _append_decision(config, "health-public", "The /health endpoint is publicly accessible.")
+
+    with patch("builtins.input", side_effect=["a"]):
+        manager.perform_sync(auto_accept=False)
+
+    out = capsys.readouterr().out
+    assert "endpoints-auth" in out                       # the finding still surfaces
+    assert (_CONFLICT_GATHER_CUT_LINE in out) is last_above
+    assert "[Conflict sensor unavailable]" not in out    # a cut trips nothing
+    assert manager.store.get_node_by_slug("health-public") is not None

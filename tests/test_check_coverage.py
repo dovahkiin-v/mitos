@@ -318,8 +318,11 @@ def test_scoped_run_never_marks_outside_its_scope(workspace, monkeypatch, capsys
     code, obj = _run(config, capsys, scope="x")
 
     assert code == 0
-    # Non-vacuous: the run named both exclusions and still marked neither.
-    assert _run_row(config, obj["run_id"])["coverage_exclusions"] == 2
+    # Non-vacuous: the run named y1's exclusion and still did not mark it. The open
+    # question's poisoned row is a negative control: since phase 3a of the
+    # recall-confidence vision the probe counts live decisions' rows only, so it is
+    # not an exclusion at all (ADR `check-stale-index-probe-counts-only-live-decisions-rows`).
+    assert _run_row(config, obj["run_id"])["coverage_exclusions"] == 1
     assert set(_coverage(config.telemetry_path)) == {x1, x2}
 
     # The transition: an unscoped run marks y1 excluded (never the open question) ...

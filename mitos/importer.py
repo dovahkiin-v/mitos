@@ -23,6 +23,7 @@ from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer
+from mitos.shell_quote import shell_flag
 
 def run_llm_prose_compression(
     client: "anthropic.Anthropic",
@@ -184,6 +185,14 @@ class MitosProseImporter:
         renderer = MitosRenderer(self.config.workspace_dir)
 
         imported_count = 0
+        # Read once, before any commit: an import into a graph holding no decision is
+        # one of the rejection seed marker's producers (its commits then queue every
+        # decision holding an item, which is the rejection index's whole expected
+        # set). An unreadable graph counts as holding one — no stamp, the safe side.
+        try:
+            graph_held_decision = self.store.holds_any_decision()
+        except Exception:
+            graph_held_decision = True
 
         for sec in sections:
             header_line = sec["header"]
@@ -280,6 +289,22 @@ class MitosProseImporter:
                 print(f"[Warning] Failed to save imported node '{slug}': {str(e)}")
 
         print(f"Successfully imported {imported_count} nodes from {filepath} ✓")
+
+        if not graph_held_decision and imported_count > 0:
+            # An import into an empty graph covers the rejection index's expected set,
+            # so it licenses the next drain to create the collection. Over a populated
+            # graph it never stamps: the other owners are not queued, and a create
+            # would be the implicit build the creation ADR forbids. A crash before
+            # this line leaves no licence — the rows wait and `status` names
+            # `reconcile`.
+            try:
+                self.store.stamp_rejection_seed("import")
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection index's seed marker was not stamped: {e}. "
+                    f"`mitos reconcile {shell_flag('-p', self.config.project)}` builds "
+                    f"the rejection index."
+                )
         
         # Regenerate live_axioms
         try:
@@ -299,6 +324,13 @@ class MitosProseImporter:
         durability of a deferral is free here; what the arm below adds is the **notice**
         — the surrounding ``except Exception: pass`` would otherwise swallow the refusal
         into complete silence.
+
+        It is the decision leg only. The rejection backlog rows the commit queued are
+        left to the rejection backlog's drain (``drain_rejection_backlog``, run by the
+        next ``sync`` or ``reconcile``), which writes each owner's items whole. It may
+        create an absent rejection collection only under the rejection seed marker,
+        which :meth:`import_from_file` stamps after an import into a graph that held
+        no decision; over a populated graph ``mitos reconcile`` builds it.
         """
         if not self.embed_provider or not self.vector_store:
             return
@@ -307,6 +339,8 @@ class MitosProseImporter:
             # Reported once for this import; say nothing and spend nothing further.
             return
 
+        # ``state`` is an inert literal no reader trusts (M3): a retired decision's
+        # point carries "active" too. Do not "fix" it.
         payload = {
             "slug": entry.slug,
             "scope": entry.scope,
@@ -320,7 +354,7 @@ class MitosProseImporter:
         try:
             # Inside the try for the same reason as the sync twin: the graph read must
             # not be able to escape a helper whose whole contract is best-effort.
-            may_create = not self.store.has_active_node_other_than(delta.node_id)
+            may_create = not self.store.decision_index_expects_node_other_than(delta.node_id)
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
             self.vector_store.upsert(
                 delta.node_id, vector, payload, may_create=may_create
@@ -333,8 +367,10 @@ class MitosProseImporter:
             self._collection_absent = True
             print(
                 "[Warning] Embeddings deferred for this import: the Qdrant collection "
-                "is missing and these writes do not cover the active set. Every node is "
-                "queued — run `mitos reconcile` to build the index in one pass."
+                "is missing and these writes do not cover every decision the index "
+                "should hold. Every node is queued — run "
+                f"`mitos reconcile {shell_flag('-p', self.config.project)}` to build "
+                "the index in one pass."
             )
         except Exception:
             pass

@@ -12,7 +12,10 @@ graph. It:
 
 1. Re-parses the whole corpus and **replays it oldest-first** into a *separate*
    build-aside graph file (the live graph is never opened for writing).
-2. Bounds the embedding seed (``pending_embeddings``) to the active set.
+2. Bounds the embedding seed (``pending_embeddings``) to the decision index's
+   expected set: every decision, live or retired, plus the active open questions,
+   and stamps both seed markers (the decision index's and the rejection index's)
+   in that same transaction, so the next ``sync`` builds both indexes.
 3. Runs a **reconstruction-completeness gate**: it reads the still-live old
    prototype graph's active-core set and proves every active core survived into
    the rebuild — surfacing any offender for the operator.
@@ -37,7 +40,9 @@ CLI verb — those are Phase 7b's, which consumes the verdict this module return
 Governing ADRs: ``v1a-cutover-wipe-and-rebuild``,
 ``cutover-chronological-replay-by-file-position``,
 ``cutover-gate-defaults-abort-with-p6-operator-override``,
-``cutover-bounds-embedding-seed-to-active``, ``cutover-build-aside-atomic-swap``.
+``cutover-build-aside-atomic-swap``, and for the seed's bound
+``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node`` (which
+amends ``cutover-bounds-embedding-seed-to-active``: retired decisions stay seeded).
 
 Tier 3 (orchestration): composes ``parser`` (T2), ``store`` (T2), ``identity``
 (T1), ``config`` (T1), ``errors`` (T1). Nothing here is imported by those modules.
@@ -51,7 +56,7 @@ import re
 import shutil
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import AbstractSet, Callable, Dict, List, Optional, Set, Tuple
 
 from mitos.config import MitosConfig
 from mitos.errors import (
@@ -66,7 +71,8 @@ from mitos.identity import compute_node_id
 from mitos.migrations import is_pre_v1a_schema
 from mitos.parser import ParsedEntry, parse_file_reversed
 from mitos.replay import commit_quarantine_fixpoint
-from mitos.store import GraphStore, open_connection, write_embedding_seed
+from mitos.store import (GraphStore, open_connection, write_embedding_seed,
+                         write_rejection_seed)
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +369,7 @@ def rebuild_and_gate(
        the per-entry quarantine + intra-sync fixpoint (so an acyclic chain converges
        in one pass regardless of authoring order). Entries that still cannot commit
        are **casualties**.
-    4. Bound the embedding seed to the active set.
+    4. Bound the embedding seed to the decision index's expected set.
     5. Run the completeness gate against the live old graph (read-only) — a verdict,
        not an abort.
 
@@ -432,16 +438,19 @@ def rebuild_and_gate(
         print(f"Provenance written for {carried} reconstructed node(s) "
               f"(from the graph being replaced)")
 
-    # 4. Bound the embedding seed to the active set. Every commit self-enqueued one
-    #    pending_embeddings row (5c), so the queue holds the whole corpus incl. dead
-    #    nodes; prune it to the store's own active set (G5 — never a re-encoded
-    #    predicate). The prune also stamps the coverage marker in its own transaction,
+    # 4. Bound the embedding seed to the decision index's expected set. Every commit
+    #    self-enqueued one pending_embeddings row (5c), so the queue holds the whole
+    #    corpus; prune it to the store's own expected-set read (never a re-encoded
+    #    predicate). That keeps every decision, retired ones included — a decision's
+    #    vector lives as long as its node — and drops only superseded/corrected open
+    #    questions. The prune also stamps the coverage marker in its own transaction,
     #    naming the verb that asked for it — which is what makes the next `sync`'s drain
-    #    a covering write and so makes both verbs' printed next-step true.
+    #    a covering write and so makes both verbs' printed next-step true. The active
+    #    read stays, for the live-surface count only.
     reconstructed_active_ids = _reconstructed_active_ids(store)
-    _prune_embedding_queue_to_active(
+    _prune_embedding_queue_to_expected(
         aside_db_path,
-        reconstructed_active_ids,
+        store.get_decision_index_expected_ids(),
         established_by="cutover" if strict else "rebuild",
     )
 
@@ -877,26 +886,29 @@ def _reconstructed_all_ids(store: GraphStore) -> Set[str]:
     return {node["id"] for node in store.get_all_nodes()}
 
 
-def _prune_embedding_queue_to_active(
-    aside_db_path: str, active_ids: Set[str], *, established_by: str
+def _prune_embedding_queue_to_expected(
+    aside_db_path: str, expected_ids: AbstractSet[str], *, established_by: str
 ) -> None:
-    """Prunes ``pending_embeddings`` to exactly the active id set, and records it.
+    """Prunes ``pending_embeddings`` to exactly the expected id set, and records it.
 
     Every commit self-enqueued one ``pending_embeddings`` row unconditionally
-    (5c), so the queue holds the whole corpus including dead/superseded nodes; the
-    embedding seed must be bounded to the active set (``cutover-bounds-embedding-
-    seed-to-active``).
+    (5c), so the queue holds the whole corpus. The seed is bounded to the decision
+    index's expected set (:meth:`~mitos.store.GraphStore.get_decision_index_expected_ids`):
+    every decision, live or retired, plus the active open questions — so the rows this
+    removes are those of superseded or corrected open questions only (ADR
+    ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``). It
+    stays a prune rather than a no-op for exactly those rows.
 
-    Uses a connection-local temp table of the active ids rather than a bound
-    ``NOT IN (?, ?, …)`` list: at the Dyson horizon (tens of thousands of active
-    decisions) a bound list would exceed SQLite's host-parameter limit (~32k),
-    while the temp-table anti-join has no such ceiling (P11/P17, the Dyson check).
-    The active ids still come from the store's own read methods (G5); this changes
-    only *how* they bind, not the active definition. An empty active set correctly
-    empties the whole queue (``NOT IN`` over an empty subquery matches every row,
-    never the ``NOT IN ()`` syntax error).
+    Uses a connection-local temp table of the expected ids rather than a bound
+    ``NOT IN (?, ?, …)`` list: at the Dyson horizon (tens of thousands of decisions)
+    a bound list would exceed SQLite's host-parameter limit (~32k), while the
+    temp-table anti-join has no such ceiling (P11/P17, the Dyson check). The ids
+    still come from the store's own read (never a re-encoded predicate); this changes
+    only *how* they bind. An empty expected set correctly empties the whole queue
+    (``NOT IN`` over an empty subquery matches every row, never the ``NOT IN ()``
+    syntax error).
 
-    This prune **is** the act that makes the outbox equal the active set, so it is also
+    This prune **is** the act that makes the outbox equal the expected set, so it is also
     where that fact is recorded: the ``embedding_seed`` marker is stamped in the same
     connection and the same commit as the ``DELETE``. Stamping anywhere else would let
     the marker claim coverage the prune had not delivered — and the marker is what makes
@@ -909,28 +921,40 @@ def _prune_embedding_queue_to_active(
     refused rebuild (casualties, a shortfall, a declined confirmation) discards the aside
     file and leaves no marker behind.
 
+    The rejection index's seed marker (``rejection_seed``) is stamped in the same
+    connection and commit, with the same verb. No rejection prune exists or is needed:
+    the replay's commits queued a backlog row for every decision whose field holds an
+    item, which is exactly the rejection index's expected set. The marker is what lets
+    the next ``sync``'s rejection drain create the collection and write every item.
+
     Args:
         aside_db_path: The build-aside graph (writable).
-        active_ids: The active node ids to keep.
+        expected_ids: The node ids to keep — the decision index's expected set.
         established_by: The verb doing the bounding — ``"cutover"`` or ``"rebuild"``
-            (one of ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``).
+            (one of ``migrations.EMBEDDING_SEED_ESTABLISHED_BY`` and of
+            ``migrations.REJECTION_SEED_ESTABLISHED_BY``).
     """
     conn = open_connection(aside_db_path)
     try:
         # TEMP table is connection-scoped and dropped on close; no transaction
         # gymnastics needed — populate, delete, commit the DELETE, close.
-        conn.execute("CREATE TEMP TABLE _active_ids (id TEXT PRIMARY KEY NOT NULL)")
+        conn.execute("CREATE TEMP TABLE _expected_ids (id TEXT PRIMARY KEY NOT NULL)")
         conn.executemany(
-            "INSERT OR IGNORE INTO _active_ids (id) VALUES (?)",
-            [(node_id,) for node_id in active_ids],
+            "INSERT OR IGNORE INTO _expected_ids (id) VALUES (?)",
+            [(node_id,) for node_id in expected_ids],
         )
         conn.execute(
             "DELETE FROM pending_embeddings "
-            "WHERE node_id NOT IN (SELECT id FROM _active_ids)"
+            "WHERE node_id NOT IN (SELECT id FROM _expected_ids)"
         )
         # Same connection, same commit as the DELETE above: the claim and the act that
         # makes it true land together or not at all.
         write_embedding_seed(conn, established_by)
+        # The rejection index's marker, unconditionally, as the decision stamp is: the
+        # replay's commits already queued every decision holding an item (field-aware
+        # enqueue), so its backlog covers its expected set with no prune of its own.
+        # Over an empty expected set the next drain spends it on an empty backlog.
+        write_rejection_seed(conn, established_by)
         conn.commit()
     finally:
         conn.close()

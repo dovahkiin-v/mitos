@@ -778,3 +778,101 @@ def test_stale_index_words_carry_no_recipe() -> None:
     words = cli._check_degradation_summary(("stale_index",), project="p")
     assert "embeddings are queued" in words and "drain on sync" in words
     assert "`" not in words
+
+
+# --------------------------------------------------------------------------- #
+# 2d — a corpus sweep's gather cut above the floor: counted, never a degradation
+# --------------------------------------------------------------------------- #
+
+def _cut_corpus(tmp_path, monkeypatch, capsys, *, last_above: bool, as_json: bool):
+    """The ``_pair`` corpus in a fresh workspace, a's gather cut (or not) at a 21 bound.
+
+    a's fetch holds b and its own point, then orphans; the last orphan's score sits
+    just above or below the sweep's floor. b's fetch is empty (exhausted, never cut).
+    """
+    from mitos import conflict
+    from _point_hits import orphan_hit
+    monkeypatch.setattr(conflict, "CONFLICT_RAW_BOUND", conflict.CONFLICT_OVERFETCH_LIMIT + 1)
+    config = MitosConfig(str(tmp_path / f"ws-{last_above}-{as_json}"))
+    store = GraphStore(config.db_path)
+    telemetry = TelemetryStore(config.telemetry_path)
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    floor = conflict.CONFLICT_SIMILARITY_FLOOR
+    tail = floor + 0.01 if last_above else floor - 0.01
+    count = conflict.CONFLICT_OVERFETCH_LIMIT - 1
+    a_axiom = next(axiom for axiom, hits in nbhds.items() if hits)
+    nbhds[a_axiom] = [_match("cli-a", 0.99), _match("cli-b", 0.9)] + [
+        orphan_hit(0.89 - (0.89 - tail) * i / (count - 1), tag=f"corpus-cut-{i}")
+        for i in range(count)]
+    # Bound to this run's graph: the twin's workspace is a second graph in the same test.
+    embed, vector = _keyed_substrate(nbhds, store=store)
+    monkeypatch.setattr(cli, "_build_check_substrate", lambda cfg: (embed, vector, None))
+    _wire_judge(monkeypatch, _canned_for(store, embed, vector, telemetry))
+    capsys.readouterr()
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=True, as_json=as_json)
+    return code, capsys.readouterr().out, config
+
+
+def test_2d_corpus_json_counts_a_cut_and_changes_no_degradation_exit_or_coverage(
+        tmp_path, monkeypatch, capsys):
+    """Against its uncut twin: the same degradations, exit code and coverage marks.
+
+    Break B9 (a cut setting ``sweep_degraded``) reds this row.
+    """
+    cut_code, cut_out, _ = _cut_corpus(tmp_path, monkeypatch, capsys, last_above=True,
+                                       as_json=True)
+    twin_code, twin_out, _ = _cut_corpus(tmp_path, monkeypatch, capsys, last_above=False,
+                                         as_json=True)
+    cut, twin = json.loads(cut_out), json.loads(twin_out)
+    assert set(cut) == set(twin) == _CORPUS_JSON_KEYS
+    assert cut["gathers_cut"] == 1 and twin["gathers_cut"] == 0
+    assert cut_code == twin_code == cut["exit_code"] == twin["exit_code"] == 1
+    assert cut["degradations"] == twin["degradations"] == []
+    assert cut["nodes_swept"] == twin["nodes_swept"] == 2
+
+
+def test_2d_a_cut_gather_still_covers_its_node(tmp_path, monkeypatch) -> None:
+    """At the engine: ``run_degradations``, ``exit_code_for`` and the coverage marks of
+    a cut run equal its twin's; the count rides ``CheckRunResult`` alone."""
+    from mitos import conflict
+    from _point_hits import orphan_hit
+    monkeypatch.setattr(conflict, "CONFLICT_RAW_BOUND", conflict.CONFLICT_OVERFETCH_LIMIT + 1)
+    results = {}
+    for last_above in (True, False):
+        store = GraphStore(str(tmp_path / f"engine-{last_above}.sqlite"))
+        a_id, b_id, nbhds = _pair(store)
+        _drain_outbox(store)
+        floor = conflict.CONFLICT_SIMILARITY_FLOOR
+        tail = floor + 0.01 if last_above else floor - 0.01
+        a_axiom = next(axiom for axiom, hits in nbhds.items() if hits)
+        count = conflict.CONFLICT_OVERFETCH_LIMIT - 1
+        nbhds[a_axiom] = [_match("cli-b", 0.9)] + [
+            orphan_hit(0.89 - (0.89 - tail) * i / (count - 1), tag=f"engine-cut-{i}")
+            for i in range(count + 1)]
+        embed, vector = _keyed_substrate(nbhds, store=store)
+        telemetry = TelemetryStore(str(tmp_path / f"engine-{last_above}" / "telemetry.sqlite"))
+        plan = check.plan_corpus_check(store=store, embed_provider=embed, vector_store=vector,
+                                       telemetry=telemetry, model_alias=PRODUCTION_ALIAS)
+        result = check.execute_corpus_check(plan, judge=_canned_judge(plan),
+                                            telemetry=telemetry, store=store)
+        results[last_above] = (plan, result)
+    (cut_plan, cut), (_twin_plan, twin) = results[True], results[False]
+    assert cut_plan.gathers_cut == cut.gathers_cut == 1 and twin.gathers_cut == 0
+    assert cut_plan.sweep_degraded is None
+    assert check.run_degradations(cut) == check.run_degradations(twin)
+    assert check.exit_code_for(cut) == check.exit_code_for(twin)
+    marks = check.coverage_marks_from_result(cut)
+    twin_marks = check.coverage_marks_from_result(twin)
+    assert marks is not None and twin_marks is not None
+    assert (marks.covered, marks.excluded) == (twin_marks.covered, twin_marks.excluded)
+    assert len(marks.covered) == 2      # the cut node is covered like any other
+
+
+def test_2d_corpus_text_reports_the_cut_line_only_when_cut(tmp_path, monkeypatch, capsys):
+    _, cut_out, _ = _cut_corpus(tmp_path, monkeypatch, capsys, last_above=True,
+                                as_json=False)
+    _, twin_out, _ = _cut_corpus(tmp_path, monkeypatch, capsys, last_above=False,
+                                 as_json=False)
+    assert "Neighbour search was cut short for 1 decision" in cut_out
+    assert "Neighbour search was cut short" not in twin_out

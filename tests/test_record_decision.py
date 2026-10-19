@@ -1259,14 +1259,15 @@ def _excise_block(config, slug: str) -> None:
         f.write(head + tail.partition("\n### ")[1] + tail.partition("\n### ")[2])
 
 
-@pytest.mark.parametrize("state", ["buffer", "graph-only"])
+@pytest.mark.parametrize("state", ["buffer", "graph-only", "retired"])
 @pytest.mark.parametrize("project", [None, "my proj", "vinga's proj"])
 def test_exists_cli_recipes_parse(ws, capsys, project, state) -> None:
     """R3: every recipe the text receipt prints parses through the real parser, selectored.
 
     Read off the printed stdout, so a plant that changes what is printed is what reds.
     The graph-only state is the one `restore-source` heals; the receipt prints the
-    same recipes on it, as conditionals.
+    same recipes on it, as conditionals. The retired state (7b) binds the amend
+    recipe to the node's id, and advises no relation naming the retired slug.
     """
     from mitos import cli
     config, m = ws
@@ -1276,9 +1277,18 @@ def test_exists_cli_recipes_parse(ws, capsys, project, state) -> None:
         m.record_decision_entry("Pin the digest length.", "The original reasoning.", [],
                                 slug="pin-digest-length")
         _excise_block(config, "pin-digest-length")
+    if state == "retired":
+        m.record_decision_entry("Pin the digest length.", "The original reasoning.", [],
+                                slug="pin-digest-length")
+        m.record_decision_entry("Pin the digest length to 16.", "rej", [],
+                                slug="pin-digest-length-16", supersedes="pin-digest-length")
     out = _replay_text(config, m, capsys=capsys)
     if state == "graph-only":
         assert "### pin-digest-length" not in _read(config)
+    node_id = re.search(r"ID:\s+([0-9a-f]+)", out).group(1)
+    if state == "retired":
+        assert "naming this slug" not in out and "pass this to --supersedes" not in out
+        assert f"Handle:    {node_id}" in out
 
     spans = re.findall(r"`(mitos [^`]+)`", out)
     verbs = set()
@@ -1287,7 +1297,7 @@ def test_exists_cli_recipes_parse(ws, capsys, project, state) -> None:
         verbs.add(args.command)
         assert args.project_post == config.project, span
         if args.command == "amend-commentary":
-            assert args.handle == "pin-digest-length"
+            assert args.handle == (node_id if state == "retired" else "pin-digest-length")
         elif args.command == "restore-source":
             assert args.slug == "pin-digest-length"
         elif args.command == "sync":

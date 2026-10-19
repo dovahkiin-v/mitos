@@ -604,7 +604,11 @@ def test_5c_cascade_empty_on_byte_identical_recommit(temp_store: GraphStore) -> 
 
 
 def test_5c_commit_delta_struct_shape_preserved(temp_store: GraphStore) -> None:
-    """The CommitDelta still carries all five fields with the correct types (V1b extends, never rebuilds)."""
+    """The CommitDelta carries all seven fields with the correct types (V1b extends, never rebuilds).
+
+    Five since V1b; recall-confidence 4b added ``created`` and
+    ``rejection_enqueue_seq`` (what the commit decided for the rejection index).
+    """
     delta = temp_store.commit_parsed_entry(
         _decision(slug="d", axiom="A.", scope=["x"])
     )
@@ -613,7 +617,9 @@ def test_5c_commit_delta_struct_shape_preserved(temp_store: GraphStore) -> None:
     assert isinstance(delta.self_old_scope, list)
     assert isinstance(delta.commentary_fields_changed, bool)
     assert isinstance(delta.cascade_affected_scopes, list)
-    # to_dict() carries exactly the five fields, JSON-safe (no tuples).
+    assert delta.created is True
+    assert delta.rejection_enqueue_seq is None or isinstance(delta.rejection_enqueue_seq, int)
+    # to_dict() carries exactly the seven fields, JSON-safe (no tuples).
     d = delta.to_dict()
     assert set(d.keys()) == {
         "node_id",
@@ -621,7 +627,10 @@ def test_5c_commit_delta_struct_shape_preserved(temp_store: GraphStore) -> None:
         "self_old_scope",
         "commentary_fields_changed",
         "cascade_affected_scopes",
+        "created",
+        "rejection_enqueue_seq",
     }
+    assert json.loads(json.dumps(d)) == d
 
 
 def test_atomic_commit_rolls_back_on_midcommit_failure(

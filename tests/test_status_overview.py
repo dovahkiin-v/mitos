@@ -673,7 +673,9 @@ def test_the_payload_is_json_native_and_carries_no_set_or_tuple(tmp_path, qdrant
     assert json.loads(json.dumps(payload)) == payload
     assert set(payload["projects"][0]) == {
         "name", "path", "state", "error", "shares_path_with", "qdrant_url",
-        "collection", "collection_present"}
+        "collection", "collection_present",
+        # recall-confidence 4d: the rejection index's presence, from the same listing.
+        "rejection_collection", "rejection_collection_present"}
     assert set(payload["instances"][0]) == {
         "url", "reachable", "listing_available", "collection_count", "error"}
     assert payload["instances"][0]["collection_count"] == 2
@@ -825,10 +827,9 @@ def test_a_populated_project_with_no_collection_is_flagged_and_names_no_heal(
 
     The overview reads no graph, so it cannot tell the clone whose graph was never
     built (heal: `mitos rebuild`) from the project whose collection was swept (heal:
-    `mitos reconcile`) — and for the clone `reconcile` is the heal 4b calls *"one
-    word away and worse than silence"*: it diffs an empty active set against an
-    absent collection, enqueues nothing, and reports success on a workspace it did
-    not touch. So the note hands the reader to `mitos status <name>`, which reads the
+    `mitos reconcile`) — and for the clone `reconcile` is not the heal: over an
+    unbuilt graph it judges no point, deletes nothing, refuses naming `rebuild` and
+    exits 1. So the note hands the reader to `mitos status <name>`, which reads the
     graph and names the right one.
     """
     project = _workspace(tmp_path / "project")

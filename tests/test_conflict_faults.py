@@ -33,7 +33,7 @@ hard transitive dep of ``anthropic`` (both already installed); it constructs the
 exception objects. No ``mitos/`` source change, no ``__version__`` bump — test-only.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -41,10 +41,11 @@ import pytest
 
 import anthropic
 
-from mitos.conflict import ConflictUnavailableReason, Unavailable
+from mitos.conflict import ConflictUnavailableReason, Gathering, Unavailable
 from mitos.conflict_judgment import make_judgment_executor
 from mitos.config import MitosConfig
 from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
+from mitos.retrieval_walk import EXHAUSTED
 from mitos.sync import MitosSyncManager
 
 from _conflict_helpers import (
@@ -87,9 +88,13 @@ class _SeveredVector(_FakeVector):
     breaker gate returned first (the clean freeze counter, plan D3).
     """
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         self.queries += 1
         raise VectorStoreError("qdrant query severed")
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        raise VectorStoreError("qdrant delete severed")
 
 
 class _CollectionlessVector(_FakeVector):
@@ -99,8 +104,14 @@ class _CollectionlessVector(_FakeVector):
     turns on, injected at the same seam as its sibling above.
     """
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         self.queries += 1
+        raise CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
         raise CollectionMissingError(
             "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
         )
@@ -432,8 +443,12 @@ def test_raw_cause_detail_never_leaks_to_stdout(
     secret = "QDRANT-RAW-CAUSE-DO-NOT-PRINT-7f3a"
 
     class _DetailVector(_FakeVector):
-        def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        def query(self, vector: List[float], limit: int = 5, *,
+                  with_payload: bool = True) -> List[Dict[str, Any]]:
             self.queries += 1
+            raise VectorStoreError(secret)
+
+        def delete_points(self, point_ids: Sequence[str]) -> None:
             raise VectorStoreError(secret)
 
     judge = _RecordingJudge(_execution([]))
@@ -467,15 +482,20 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
     from mitos.conflict import gather_candidates
 
     class _Store:
-        def get_node_by_slug(self, slug: str) -> Any:  # never reached on these legs
+        # The walk's two graph reads, declared so the contract checks pass and the
+        # legs reach the substrate; neither may run when the substrate is severed.
+        def resolve_point_ids(self, point_ids: Any) -> Any:  # never reached on these legs
             raise AssertionError("graph read must not run when the substrate is severed")
 
-        def get_active_node_ids(self) -> set:
+        def get_modifiers_map(self, node_ids: Any) -> Any:  # never reached on these legs
+            raise AssertionError("graph read must not run when the substrate is severed")
+
+        def get_decision_index_expected_ids(self) -> frozenset:
             # Declared explicitly, not left to the I8 gate's unreadable-graph
             # fallback: a stub missing this method degrades via `except Exception`
             # and the COLLECTION_MISSING leg below would then pass for the wrong
             # reason. A populated graph is what makes an absent collection a gap.
-            return {"some-node-id"}
+            return frozenset({"some-node-id"})
 
     embed_fault = gather_candidates(
         "Some axiom.", embed_provider=_SeveredEmbed(),
@@ -503,38 +523,41 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
 
 
 @pytest.mark.parametrize(
-    "active_ids, expect_degraded",
+    "expected_ids, expect_degraded",
     [
         pytest.param({"a-committed-node"}, True, id="populated-graph-is-a-gap"),
         pytest.param(set(), False, id="empty-graph-is-the-empty-index"),
     ],
 )
 def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
-    active_ids: set, expect_degraded: bool,
+    expected_ids: set, expect_degraded: bool,
 ) -> None:
     """I8 at the sweep: absence is a gap iff `mitos reconcile` would index something.
 
     The predicate has two opposite outcomes, so it needs a fixture for each — a
     one-sided row passes under either behaviour. The empty-graph half is the one
-    that was missing: `gather_candidates`' own contract already promises `[]` for
+    that was missing: `gather_candidates`' own contract already promises an empty gathering for
     "a legitimate empty: an empty corpus", and re-keying `check`'s precondition
     onto the operation broke that promise for the state where the collection has
     never been created. It bites hardest on a fresh workspace whose first commit
     runs `mitos check --staged` from a pre-commit hook: exit 2, advised to run
-    `mitos reconcile`, which enqueues nothing over an empty active set and so
+    `mitos reconcile`, which enqueues nothing over an empty expected set and so
     cannot heal what it names — a dead end, not a vector.
 
-    Gated on the same `get_active_node_ids` the four read surfaces use, and the
-    same set `reconcile_embeddings` enqueues, so the gate and the heal agree by
-    construction.
+    Gated on the same `get_decision_index_expected_ids` the four read surfaces use,
+    and the same set `reconcile_embeddings` enqueues, so the gate and the heal agree
+    by construction.
     """
     from mitos.conflict import gather_candidates
 
     class _Store:
-        def get_active_node_ids(self) -> set:
-            return active_ids
+        def get_decision_index_expected_ids(self) -> frozenset:
+            return frozenset(expected_ids)
 
-        def get_node_by_slug(self, slug: str) -> Any:  # no match survives to S3
+        def resolve_point_ids(self, point_ids: Any) -> Any:  # the query raised first
+            raise AssertionError("the query raised — S3 must never run")
+
+        def get_modifiers_map(self, node_ids: Any) -> Any:
             raise AssertionError("the query raised — S3 must never run")
 
     result = gather_candidates(
@@ -546,7 +569,10 @@ def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
         assert isinstance(result, Unavailable)
         assert result.reason is ConflictUnavailableReason.COLLECTION_MISSING
     else:
-        assert result == []
+        # The healthy empty: the corpus ran out, so it is never a cut.
+        assert isinstance(result, Gathering)
+        assert result.live == [] and result.retired == []
+        assert result.end == EXHAUSTED and not result.cut_above(0.0)
 
 
 def test_an_unreadable_graph_still_degrades_on_an_absent_collection() -> None:
@@ -559,10 +585,13 @@ def test_an_unreadable_graph_still_degrades_on_an_absent_collection() -> None:
     from mitos.conflict import gather_candidates
 
     class _UnreadableStore:
-        def get_active_node_ids(self) -> set:
+        def get_decision_index_expected_ids(self) -> frozenset:
             raise RuntimeError("graph unreadable")
 
-        def get_node_by_slug(self, slug: str) -> Any:
+        def resolve_point_ids(self, point_ids: Any) -> Any:
+            raise AssertionError("the query raised — S3 must never run")
+
+        def get_modifiers_map(self, node_ids: Any) -> Any:
             raise AssertionError("the query raised — S3 must never run")
 
     result = gather_candidates(

@@ -625,3 +625,39 @@ def test_scenario_x1_decision_lifecycle(live_workspace) -> None:
         mcp_res = surface_decisions("spec dynamic retrieval", "substrate",
                                     project=config.workspace_dir)
         assert committed_axiom in mcp_res
+
+
+# ==============================================================================
+# 8a — the stamp label map over real Qdrant
+# ==============================================================================
+@pytest.mark.skipif(not HAS_LIVE_KEYS, reason="Requires live GEMINI API key")
+def test_scenario_8a_a_real_ranked_read_labels_an_amended_hit(live_workspace) -> None:
+    """A real-Qdrant ``surface_decisions`` over a hit a later decision amends carries
+    that decision's first clause in ``stamp_labels`` (recall-confidence 8a)."""
+    config, tmpdir = live_workspace
+    from mitos.cli import cmd_init
+    from mitos.stamp_labels import cut_label
+    cmd_init(config)
+    manager = MitosSyncManager(config)
+    amender_axiom = ("Webhook retries back off exponentially; the cache TTL above "
+                     "follows the retry window.")
+    with skip_on_embed_quota():
+        first = manager.record_decision_entry(
+            "Cache entries expire after exactly one hour.", "Never expiring.",
+            ["cache"], slug="cache-ttl-hour")
+        second = manager.record_decision_entry(
+            amender_axiom, "Fixed one-second retries.", ["webhooks"],
+            slug="webhook-backoff", amends="cache-ttl-hour")
+    assert first["status"] == "created" and second["status"] == "created"
+    assert first["embedding"] == second["embedding"] == "indexed", (first, second)
+
+    store = GraphStore(config.db_path)
+    with patch("mitos.mcp_server.get_workspace_components") as components:
+        components.return_value = (store, manager.embed_provider, manager.vector_store)
+        with skip_on_embed_quota():
+            res = json.loads(surface_decisions("how long do cache entries live", limit=1,
+                                               project=config.workspace_dir))
+    assert [d["slug"] for d in res["active_decisions"]] == ["cache-ttl-hour"]
+    assert res["active_decisions"][0]["amended_by"] == ["webhook-backoff"]
+    assert res["stamp_labels"] == {"webhook-backoff": cut_label(amender_axiom)}
+    assert res["stamp_labels"]["webhook-backoff"].endswith("…")

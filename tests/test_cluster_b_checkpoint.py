@@ -66,7 +66,9 @@ _RECIPE = re.compile(r"`(mitos rebuild -p [^`]+)`")
 # `status` keys that legitimately move across a write: the two buffer measurements this
 # cluster added, and the node counts a `record` raises (the 2g/3d count-shaped idiom).
 _MOVING_CHECKS = {"decisions_buffer_entries", "decisions_buffer_chars",
-                  "graph_nodes", "active_nodes"}
+                  "graph_nodes", "active_nodes",
+                  # 4d: the rejection index's expected set grows with the corpus.
+                  "rejection_expected_items"}
 
 
 # --------------------------------------------------------------------------- #

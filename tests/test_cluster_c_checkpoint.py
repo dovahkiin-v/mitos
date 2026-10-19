@@ -425,7 +425,9 @@ def test_f6_the_sweep_runs_only_unfiltered_and_takes_only_its_own_files(frame) -
 # entries, not because of overflow. The buffer's two size counts (surface-entropy 3d)
 # are the same class: the two corpora hold different entries.
 _COUNT_SHAPED_CHECKS = {"graph_nodes", "active_nodes",
-                        "decisions_buffer_entries", "decisions_buffer_chars"}
+                        "decisions_buffer_entries", "decisions_buffer_chars",
+                        # 4d: the rejection index's expected set grows with the corpus.
+                        "rejection_expected_items"}
 
 
 def test_f7_status_reports_overflow_without_moving_the_verdict(frame) -> None:

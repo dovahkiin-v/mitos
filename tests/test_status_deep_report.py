@@ -278,9 +278,9 @@ class TestCorpusHasEntries:
 class _Store:
     """A store answering a fixed fingerprint, recording what was asked of it."""
 
-    def __init__(self, node_count, active=None, raises=False):
+    def __init__(self, node_count, expected=None, raises=False):
         self.node_count = node_count
-        self._active = active if active is not None else set()
+        self._expected = frozenset(expected) if expected is not None else frozenset()
         self.raises = raises
         self.asked = []
 
@@ -290,9 +290,12 @@ class _Store:
             raise RuntimeError("graph unreadable")
         return (self.node_count, "2026-07-31T00:00:00+00:00")
 
-    def get_active_node_ids(self):
-        self.asked.append("get_active_node_ids")
-        return self._active
+    def get_decision_index_expected_ids(self):
+        # The SIBLING's gate (`missing_index_is_a_gap`), present so the "forced to the
+        # sibling's gate" break has something to call — and named after the current
+        # sibling, which keyed on `get_active_node_ids` before recall-confidence 3b.
+        self.asked.append("get_decision_index_expected_ids")
+        return self._expected
 
 
 class _Config:
@@ -309,20 +312,21 @@ class _Config:
 class TestTheGateIsTheNodeCount:
     """The one way to ship a confidently wrong rung is to copy the sibling's gate.
 
-    `missing_index_is_a_gap` gates on `get_active_node_ids` because that set is
-    exactly what `mitos reconcile` enqueues. This predicate must gate on the NODE
+    `missing_index_is_a_gap` gates on `get_decision_index_expected_ids` because that
+    set is exactly what `mitos reconcile` enqueues. This predicate must gate on the NODE
     COUNT, because `mitos sync` commits entries to nodes regardless of computed
     state — the gate and the heal agree by construction, and they are different
     heals.
     """
 
-    def test_a_populated_graph_with_an_empty_active_set_is_not_a_gap(self, tmp_path) -> None:
+    def test_a_populated_graph_with_an_empty_expected_set_is_not_a_gap(self, tmp_path) -> None:
         """The direct contract row, and it is a leaf row on purpose.
 
         End-to-end this state is **unconstructible**: kill edges are acyclic by
         write-path guard, so a non-empty graph always has at least one node with no
         incoming kill edge (measured — a supersession chain always leaves a live
-        tip). That makes the sibling's gate *equivalent in practice* and wrong in
+        tip), and since 3b every decision is expected whatever its state. That makes
+        the sibling's gate *equivalent in practice* and wrong in
         contract, so the pin has to be taken where the difference exists: at the
         predicate. Measured: forced to the sibling's gate, exactly this row, the
         one below it, and one parameter of the state matrix red — and **nothing
@@ -331,7 +335,7 @@ class TestTheGateIsTheNodeCount:
         from mitos.recall import missing_graph_is_a_gap
         corpus = tmp_path / "decisions.md"
         corpus.write_text("<!-- BEGIN ENTRIES -->\n### an-entry\n", encoding="utf-8")
-        store = _Store(node_count=7, active=set())
+        store = _Store(node_count=7, expected=set())
 
         assert missing_graph_is_a_gap(
             store, _Config(str(corpus)), corpus_scan=corpus_holds_entries
@@ -339,9 +343,9 @@ class TestTheGateIsTheNodeCount:
 
     def test_the_predicate_never_hydrates_the_active_view(self, tmp_path) -> None:
         """And the node count is also the CHEAP gate — the reachable half of the same
-        decision. `get_active_node_ids` runs two full active-view fetches, each
-        hydrating the entire live corpus (its own sibling's docstring says so); this
-        predicate rides every empty answer on four read surfaces, so it must be a
+        decision. The sibling's `get_decision_index_expected_ids` is a whole-corpus id
+        read (and before 3b its `get_active_node_ids` hydrated the entire live corpus);
+        this predicate rides every empty answer on four read surfaces, so it must be a
         `COUNT`, never a corpus read.
         """
         from mitos.recall import missing_graph_is_a_gap
@@ -392,12 +396,13 @@ class TestTheGateIsTheNodeCount:
             missing_graph_is_a_gap(None, _Config("/nope"))
 
     def test_the_note_names_rebuild_per_boundary_and_never_reconcile(self) -> None:
-        """One word away from being the wrong answer, on both surfaces.
+        """`rebuild` is the heal on both surfaces; `reconcile` is never named.
 
-        `mitos reconcile` over an unbuilt graph diffs an empty active set against an
-        absent collection, enqueues nothing, and reports SUCCESS on a workspace it
-        did not touch — converting a recoverable state into one the operator
-        believes they already fixed. And `mitos sync` is the other wrong word: it
+        `mitos reconcile` over an unbuilt graph judges no point, deletes nothing,
+        refuses naming `rebuild` and exits 1 (3c of the recall-confidence vision;
+        before it, it reported success on a workspace it did not touch), so naming it
+        would route the reader through a refusal. And `mitos sync` is the other wrong
+        word: it
         reads the buffer alone, so over a rotated corpus it builds nothing. The CLI
         names `rebuild` with its selector; MCP names no command at all.
         """
@@ -1039,7 +1044,15 @@ _SHIPPED_CHECK_KEYS = {
     "decisions_buffer_chars", "format_spec", "gemini_api_key",
     "qdrant_reachable", "collection_exists", "collection_points", "graph_nodes",
     "active_nodes", "missing_active_vectors", "missing_active_slugs",
-    "orphan_points", "graph_unbuilt", "mcp_project_entry",
+    # recall-confidence 3b: retired-decision completeness, siblings of the active keys.
+    "retired_decisions", "missing_retired_vectors", "missing_retired_slugs",
+    "orphan_points",
+    # recall-confidence 3c: the orphan count's partition, history and garbage.
+    "retired_node_points", "nodeless_points",
+    "graph_unbuilt", "mcp_project_entry",
+    # recall-confidence 4d: the rejection index, from its own id diff.
+    "rejection_collection_exists", "rejection_expected_items", "missing_rejection_items",
+    "stale_rejection_items", "orphan_rejection_items", "rejection_backlog_past_tolerance",
 }
 
 _PATH_KEYS = ("decisions_file", "questions_file", "archive_dir", "db_path")

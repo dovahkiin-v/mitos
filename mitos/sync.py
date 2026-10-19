@@ -5,6 +5,8 @@ concurrency file locks, LLM capture enrichment, user reviews, and content-aware
 archive rotation.
 """
 
+import dataclasses
+import functools
 import hashlib
 import math
 import os
@@ -14,9 +16,12 @@ import re
 import json
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_FLOOR
-from typing import TYPE_CHECKING, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable
+from typing import (
+    TYPE_CHECKING, AbstractSet, List, Dict, Mapping, NamedTuple, Optional, Any, Sequence, Set,
+    Tuple, Callable,
+)
 from filelock import FileLock, Timeout
 
 if TYPE_CHECKING:
@@ -38,6 +43,7 @@ from mitos.conflict import (
     ConflictCheckResult,
     ConflictFinding,
     ConflictUnavailableReason,
+    Gathering,
     SEMANTIC_SUBSTRATE_REASONS,
     Unavailable,
     candidate_payload,
@@ -50,17 +56,20 @@ from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch
 from mitos.check_notice import compose_check_notice
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.divergence import (
-    code_point_names, declared_edges, differing_span, entry_divergence, is_reconcilable,
-    judged_text, needs_code_points,
+    code_point_names, corpus_holds_entries, declared_edges, differing_span, entry_divergence,
+    is_reconcilable, judged_text, needs_code_points,
 )
 from mitos.errors import (
     CollectionMissingError,
+    EmbeddingError,
     MitosError,
     SynthesisError,
     ParseError,
     ValidationError,
     DatabaseError,
     EntryFailure,
+    VectorStoreError,
+    VectorStoreUnreachableError,
     CommitError,
     STORE_CYCLE_VIOLATION,
     STORE_DANGLING_EDGE,
@@ -80,8 +89,14 @@ from mitos.store import (
     _EDGE_KIND_REQUIREMENT,
     _KILL_EDGE_FIELDS,
     MODIFIER_EDGE_KEYS,
+    REJECTION_BACKLOG_FAILURE_TOLERANCE,
+    RejectionBacklogRow,
     edge_kind_is_legal,
+    live_ends_from_chains,
+    LIVE_STATES,
 )
+from mitos.display import retired_handle
+from mitos.retrieval_walk import EDGE_FOUND, EDGE_UNMEASURED
 from mitos.identity import (
     SLUG_LENGTH_REASON,
     SLUG_MAX_LEN,
@@ -89,11 +104,17 @@ from mitos.identity import (
     embedding_text,
     mechanism_canonical_norm,
 )
-from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.provider_cause import describe_embed_failure
+from mitos.embeddings import GeminiEmbeddingProvider, fit_batch
+from mitos.provider_cause import (AUTH, QUOTA, TRANSIENT, classify_provider_error,
+                                  describe_embed_failure)
 from mitos.shell_quote import shell_flag
+from mitos.stamp_labels import pause_labels
 from mitos.tool_markup import field_values, find_tool_call_markup
-from mitos.vector_store import QdrantVectorStore, hash_to_uuid
+from mitos.recall import missing_graph_is_a_gap, stamp_labels_unread_clause
+from mitos.rejections import (diff_rejection_index, expected_rejection_points,
+                              rejection_points, render_rejected_paths)
+from mitos.vector_store import (QdrantRejectionIndex, QdrantVectorStore, RejectionPoint,
+                                hash_to_uuid, partition_points)
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
 
@@ -664,18 +685,32 @@ EXISTS_NO_OP_FACT = (
     "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
     "them is a no-op."
 )
-_EXISTS_NO_OP_NOTE = (
-    EXISTS_NO_OP_FACT + " "
-    "To change its commentary (rejected_paths, scope, invalidates_if, context, or its "
-    "slug with new_slug), call the `amend_commentary` tool on this same project with "
-    "this slug; it edits the entry in place and keeps the id. Relations are not "
+# The note's state-blind middle, shared by the live note and the retired one (7b):
+# relations are not commentary, and the two states the tool cannot reach.
+_EXISTS_RELATIONS_AND_ARCHIVED = (
+    "Relations are not "
     "commentary and that tool refuses them: relation lines are edited in decisions.md "
     "and applied by a sync reconcile, which no tool here performs — a person with a "
     "shell in that project runs it. The tool reaches an entry only while its `### ` "
     "block is in decisions.md. A node with no source block and an entry already "
     "rotated into decisions/archive/ both answer `archived` from it, and the tool cannot "
-    "tell the two apart; either one is repaired by a person. To record a changed "
+    "tell the two apart; either one is repaired by a person."
+)
+_EXISTS_COMMENTARY_FIELDS = (
+    "(rejected_paths, scope, invalidates_if, context, or its slug with new_slug)"
+)
+_EXISTS_NO_OP_NOTE = (
+    EXISTS_NO_OP_FACT + " "
+    f"To change its commentary {_EXISTS_COMMENTARY_FIELDS}, call the `amend_commentary` "
+    "tool on this same project with "
+    "this slug; it edits the entry in place and keeps the id. "
+    + _EXISTS_RELATIONS_AND_ARCHIVED + " To record a changed "
     "decision, record a new one with supersedes or amends naming this slug."
+)
+# The handle keys a retired node's `exists` receipt adds (7b, vision §4.9), and the
+# four that go `null` together when the handle read faults.
+_EXISTS_HANDLE_KEYS: Tuple[str, ...] = (
+    "superseded_by", "corrected_by", "live_end", "successor_ambiguous",
 )
 
 # The standing coherence debt, stated without a number: the `created` receipt's
@@ -753,6 +788,179 @@ _ROTATION_FAILED_NOTE = (
 )
 
 
+# The decision outbox's drain (`drain_pending_embeddings`): why a walk stopped and what
+# it did with the seed marker it read. Two closed vocabularies, named once here; the
+# tests import them rather than retype them.
+DRAIN_STOP_OUTAGE = "outage"            # auth/quota/transient on the embed, or the store failed the write
+DRAIN_STOP_REFUSED = "refused"          # absent collection and no covering intent
+DRAIN_STOP_UNAVAILABLE = "unavailable"  # no provider or no vector store; nothing read
+DRAIN_STOP_CLAIM_FAILED = "claim_failed"  # the outbox read itself failed
+DRAIN_STOPS = (DRAIN_STOP_OUTAGE, DRAIN_STOP_REFUSED, DRAIN_STOP_UNAVAILABLE,
+               DRAIN_STOP_CLAIM_FAILED)
+
+DRAIN_MARKER_SPENT = "spent"
+DRAIN_MARKER_KEPT = "kept"
+DRAIN_MARKERS = (DRAIN_MARKER_SPENT, DRAIN_MARKER_KEPT)
+
+# The provider causes that are outages, not properties of a row: the drain stops at the
+# first one instead of charging it to every row behind it (ADR
+# `drain-outage-is-a-provider-cause-auth-quota-or-transient-or-an-unreachable-store`).
+_DRAIN_OUTAGE_CAUSES = frozenset({AUTH, QUOTA, TRANSIENT})
+
+# Rows per outbox read. The walk is keyset-paged, so this sizes each read, not the walk.
+_DRAIN_CLAIM_SIZE = 10
+
+# Node-less points per delete request in `reconcile`'s collection — the scroll's page
+# size. Read at call time, so a row can force several chunks.
+_ORPHAN_DELETE_CHUNK = 256
+
+
+@dataclass(frozen=True)
+class DrainOutcome:
+    """What one drain of the decision outbox did. Runtime-only, never persisted.
+
+    Attributes:
+        written: Rows embedded and upserted, then removed.
+        skipped_present: Rows removed without embedding, because the seed marker stood
+            and the node's point was already in the collection.
+        pruned: Rows removed because their node is no longer in the graph.
+        failed: Rows attempted and left queued with their retry count moved, the
+            outage row included.
+        stop: None when the walk reached the end of the backlog, else one of
+            :data:`DRAIN_STOPS`.
+        marker: None when no seed marker stood at entry (or nothing was read), else
+            one of :data:`DRAIN_MARKERS`.
+    """
+
+    written: int
+    skipped_present: int
+    pruned: int
+    failed: int
+    stop: Optional[str]
+    marker: Optional[str]
+
+
+# The rejection backlog's drain (`drain_rejection_backlog`) reuses the decision drain's
+# stops and markers and adds one stop of its own. `DRAIN_STOPS` stays the decision
+# drain's closed vocabulary: that drain never stops `held`.
+REJECTION_DRAIN_STOP_HELD = "held"  # another drain holds the backlog's lock; nothing read
+REJECTION_DRAIN_STOPS = DRAIN_STOPS + (REJECTION_DRAIN_STOP_HELD,)
+
+# What `reconcile`'s collection of the rejection index did (`rejection_index.collected`),
+# a closed vocabulary beside the drain's stops; the tests import it rather than retype it.
+REJECTION_COLLECT_JUDGED = "judged"            # the listing was judged (an empty one included)
+REJECTION_COLLECT_HELD = "held"                # a drain held the backlog's lock; nothing deleted
+REJECTION_COLLECT_UNBUILT = "unbuilt"          # the graph holds no node; nothing judged
+REJECTION_COLLECT_UNREAD = "unread"            # the graph read under the lock failed
+REJECTION_COLLECT_UNAVAILABLE = "unavailable"  # no provider or index, a fault, or no lock
+REJECTION_COLLECT_OUTCOMES = (
+    REJECTION_COLLECT_JUDGED, REJECTION_COLLECT_HELD, REJECTION_COLLECT_UNBUILT,
+    REJECTION_COLLECT_UNREAD, REJECTION_COLLECT_UNAVAILABLE,
+)
+
+# Rows per rejection backlog read: the owners one page's cross-owner batches are cut
+# from. Read at call time, so a row can force several pages.
+_REJECTION_DRAIN_CLAIM_SIZE = 100
+
+
+def rejection_drain_lock_path(config: MitosConfig) -> str:
+    """Returns the path of the rejection drain's operating-system lock.
+
+    It is never the ``decisions.md`` lock, which is held only briefly around the
+    buffer; this one is held for a whole drain, embedding calls included.
+
+    Args:
+        config: The workspace config.
+
+    Returns:
+        ``<workspace>/.mitos/rejection_drain.lock``.
+    """
+    return os.path.join(config.mitos_dir, "rejection_drain.lock")
+
+
+@dataclass(frozen=True)
+class RejectionDrainOutcome:
+    """What one drain of the rejection backlog did. Runtime-only, never persisted.
+
+    Attributes:
+        owners_cleared: Rows cleared: their owner's items replaced whole, or their
+            node gone from the graph.
+        items_embedded: Items embedded and written.
+        items_skipped_present: Items the owner's field states that the index already
+            held, so nothing was embedded for them.
+        items_removed: Items deleted because their owner's field no longer states
+            them.
+        owners_failed: Owners taken and left queued for a reason of their own.
+        owners_past_tolerance: Rows standing at exit whose retry count is at least
+            ``REJECTION_BACKLOG_FAILURE_TOLERANCE``; None when not read.
+        calls: ``embed_documents`` calls attempted.
+        left_queued: Rows standing at exit, read; None when not read.
+        stop: None when the walk reached the end of the backlog, else one of
+            :data:`REJECTION_DRAIN_STOPS`.
+        marker: None when no seed marker stood at entry (or nothing was read), else
+            one of :data:`DRAIN_MARKERS`.
+    """
+
+    owners_cleared: int
+    items_embedded: int
+    items_skipped_present: int
+    items_removed: int
+    owners_failed: int
+    owners_past_tolerance: Optional[int]
+    calls: int
+    left_queued: Optional[int]
+    stop: Optional[str]
+    marker: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Returns the outcome as ``reconcile --json``'s ``rejection_drain`` object."""
+        return asdict(self)
+
+
+def rejection_drain_report(drain: Dict[str, Any]) -> List[str]:
+    """Words a rejection drain's summary from its ``to_dict()``; names no command.
+
+    The one renderer of the summary: the drain prints it on ``sync``, and
+    ``cmd_reconcile`` prints it from ``rejection_drain``, so neither prints it twice.
+
+    Args:
+        drain: A :meth:`RejectionDrainOutcome.to_dict` value.
+
+    Returns:
+        The lines to print; empty when the drain did nothing worth a line.
+    """
+    lines: List[str] = []
+    left = drain["left_queued"]
+    worked = any(drain[key] for key in (
+        "owners_cleared", "items_embedded", "items_skipped_present", "items_removed",
+        "owners_failed",
+    ))
+    if worked:
+        line = (
+            f"Rejection index: {drain['owners_cleared']} owner(s) replaced — "
+            f"{drain['items_embedded']} item(s) embedded, "
+            f"{drain['items_skipped_present']} already present, "
+            f"{drain['items_removed']} removed"
+        )
+        if drain["owners_failed"]:
+            line += f"; {drain['owners_failed']} owner(s) failed"
+        if left is not None:
+            line += f"; {left} row(s) left queued"
+        lines.append(line + ".")
+    elif drain["stop"] == DRAIN_STOP_UNAVAILABLE and left:
+        lines.append(
+            f"Rejection index: not drained this run; {left} backlog row(s) stay queued."
+        )
+    past = drain["owners_past_tolerance"]
+    if past:
+        lines.append(
+            f"Rejection index: {past} backlog row(s) have failed "
+            f"{REJECTION_BACKLOG_FAILURE_TOLERANCE} or more times. They stay queued "
+            f"and every drain attempts them again."
+        )
+    return lines
+
+
 def _rotation_failure_stage(exc: BaseException) -> str:
     """Classifies where a record-path rotation failed, by exception type.
 
@@ -810,18 +1018,32 @@ def _rotation_report(outcome: "rotation.RotationOutcome") -> Optional[Dict[str, 
         return {"outcome": ROTATION_SKIPPED, "archives": [], "skipped": skipped}
     return None
 
-# A new decision at/above this document-document similarity to an existing one the
-# author did NOT reference is paused for review (AX P4): the neighbour must surface
-# BEFORE commit, while the author can still point an amends/supersedes/contradicts
-# at it (you can't relink after commit — re-record is a no-op; the retired
-# post-commit `related` echo was exactly one step too late).
-# 0.80 is the floor of the strong-match band (see recall.py's calibration):
-# an unlinked strong match must force an explicit confirm-or-link, because prose-only
-# obsoletion is invisible to state-filtered retrieval — only edges retire a node (ADR
-# `record-pause-floor-lowered-to-strong-match-band`; the routine-case pause tax stays
-# low via --acknowledge-neighbors, the declared-target exemption, and transitive
-# lineage suppression). Tune here.
+# A new decision at/above this similarity to an existing live one the author did NOT
+# reference is paused for review (AX P4): the neighbour must surface BEFORE commit, while
+# the author can still point an amends/supersedes/contradicts at it (you can't relink
+# after commit — re-record is a no-op; the retired post-commit `related` echo was exactly
+# one step too late). An unlinked near-duplicate must force an explicit confirm-or-link,
+# because prose-only obsoletion is invisible to state-filtered retrieval — only edges
+# retire a node (ADR `record-pause-floor-lowered-to-strong-match-band`; the routine-case
+# pause tax stays low via --acknowledge-neighbors, the declared-target exemption, and
+# transitive lineage suppression).
+# It is a document-space floor: the gather embeds the draft as a document and compares it
+# with documents. The confidence band rates a query against documents and shares no scale
+# with it, so this is not the band's strong line. Recall first: it stays where it is while
+# every measured duplicate sits at or above it, and never rises. The measured placement,
+# its rule and its runs: tests/golden/calibration/record.json.
 _NEIGHBOR_REVIEW_THRESHOLD = 0.80
+
+# A retired decision the draft sits at or above this document-space similarity to is a
+# tombstone on the pause: the draft may re-tread ground the corpus already tried and
+# abandoned (vision §4.9). It separates a re-tread of a retired decision from proximity to
+# a retired family. Its own constant, never an alias of the live floor above: the two share
+# a space and a population of vectors but not a class boundary, so either may move without
+# the other (§6.3). Its recall rule would place it at or below every measured re-tread and
+# never above the live floor's start; its cry-wolf ceiling then raised it, past the lowest
+# labelled re-tread, which therefore no longer pauses (the stated trade, filed on the
+# ROADMAP with its re-read triggers). Rule, runs and ceiling: tests/golden/calibration/record.json.
+_TOMBSTONE_FLOOR = 0.8265
 
 # The relations the pause offers for resolving a flagged neighbour — a fourth
 # edge-field set beside store.py's kill/deferred/mutation trio, derivable from none
@@ -875,6 +1097,15 @@ _REVIEW_UNAVAILABLE_CAUSES = {
     ),
 }
 
+# The sync sensor's per-entry line when the conflict check's gather was cut above its
+# floor (``ConflictCheckResult.gather_cut``). Printed on stdout beside the finding
+# block; it names no command and trips nothing.
+_CONFLICT_GATHER_CUT_LINE = (
+    "[Conflict] The neighbour search for this decision read its whole bound and held "
+    f"fewer than {CONFLICT_OVERFETCH_LIMIT} live decisions while its last point still "
+    "scored at or above the floor; a conflicting decision may lie past what it read."
+)
+
 # What the reconcile pre-flight (``_uncommittable_edges``) does about each store
 # failure code — the whole class, declared, so none can be silently missed.
 #
@@ -907,6 +1138,207 @@ _PREFLIGHT_DISPOSITIONS: Dict[str, str] = {
         "per-entry failure names it. Revisit if one is ever observed repeating."
     ),
 }
+
+
+def _ambiguous_target(ids: Sequence[str]) -> bool:
+    """Whether a relation target's resolved ids name more than one decision.
+
+    The one predicate behind every ambiguity refusal ``record_decision`` makes
+    (``supersedes_ambiguous``, ``corrects_ambiguous``, ``relation_target_ambiguous``)
+    and behind the pause's ``successor_ambiguous`` fact, so the pause can never call a
+    successor relatable that the validator would refuse. The ids come from
+    ``GraphStore.resolve_slug``, which is casefold-exact and state-agnostic: a
+    retired decision that shares its slug with its live successor makes that slug
+    ambiguous for every relation.
+
+    Args:
+        ids: ``resolve_slug``'s answer for the target.
+
+    Returns:
+        True when the target names two or more nodes.
+    """
+    return len(ids) > 1
+
+
+def _live_successors(handle: Mapping[str, Any]) -> List[str]:
+    """Where a retired handle's current word lives: the one successor rule (7a, 7b).
+
+    ``live_end`` when the handle holds one (an immediate successor is itself retired;
+    ``[]`` when the chain reaches no live decision), else ``superseded_by`` ∪
+    ``corrected_by`` in order, deduplicated — the live-end rule guarantees those are
+    live then. The pause's tombstone loop, the retired ``exists`` receipt and the CLI's
+    retired lines all read it. A ``null`` key (a faulted ``exists`` handle read)
+    contributes nothing, so a caller that must tell a fault from "no live successor"
+    tests the keys itself.
+
+    ``recall._successor_slugs`` is a deliberate twin on the read path: it answers
+    ``None`` for "no successor key read" (lock 3 there) and does not deduplicate, and
+    ``recall.py`` sits behind the check family's fence, so the two are not merged.
+
+    Args:
+        handle: A :func:`~mitos.display.retired_handle` dict, or a receipt carrying its
+            successor keys.
+
+    Returns:
+        The live successor slugs, possibly empty.
+    """
+    if handle.get("live_end") is not None:
+        return list(handle["live_end"])
+    return list(dict.fromkeys(list(handle.get("superseded_by") or [])
+                              + list(handle.get("corrected_by") or [])))
+
+
+def _quoted_slugs(slugs: Sequence[str]) -> str:
+    """Backticks each slug and joins them, for a receipt sentence."""
+    return ", ".join(f"`{s}`" for s in slugs)
+
+
+def _retired_exists_note(slug: str, node_id: str, state: str,
+                         keys: Mapping[str, Any]) -> str:
+    """The ``no_op_reason`` of an ``exists`` receipt whose node is retired (7b, §4.9).
+
+    MCP-worded, like :data:`_EXISTS_NO_OP_NOTE` (the dict reaches MCP and ``record
+    --json`` verbatim): it names tools and argument names, never a shell command. It
+    opens with :data:`EXISTS_NO_OP_FACT`, then says the decision is retired and where
+    its current word lives, then how its commentary is still repaired — by this node's
+    **id**, because ``amend_commentary`` resolves a handle as ``show_node`` does and a
+    slug a live decision also carries names that live decision — then keeps the live
+    note's state-blind relations and archived sentences, and closes with exactly one
+    of three forms, from the keys alone:
+
+    * **relatable** (a live successor, none ambiguous): record a new decision relating
+      to the live successor, a deliberate reversal being a ``supersedes`` of it; never
+      this node's slug, a relation the commit refuses because a relation resolves only
+      to a live target (P3);
+    * **ambiguous** (``successor_ambiguous``): the successor's slug names two
+      decisions, so ``record_decision`` refuses a relation to it; no relation is named.
+      When the successor's slug is this node's own (a same-slug supersession), the note
+      says the slug reads the live decision and the id reads this one;
+    * **no live end, or a fault**: no relation is named.
+
+    Args:
+        slug: The retired node's stored slug.
+        node_id: Its id.
+        state: Its computed state (``superseded`` / ``corrected``).
+        keys: The receipt's handle keys (:data:`_EXISTS_HANDLE_KEYS`; all ``None`` on
+            a faulted read).
+
+    Returns:
+        The note.
+    """
+    faulted = keys.get("superseded_by", []) is None
+    successors = [] if faulted else _live_successors(keys)
+    if faulted:
+        where = ("its successors could not be read; `show_node` with this decision's id "
+                 "reads them.")
+    elif successors:
+        where = f"its current word lives in {_quoted_slugs(successors)}."
+    else:
+        where = "its chain of successors reaches no live decision."
+    parts = [
+        EXISTS_NO_OP_FACT,
+        f"This decision is {state}: {where}",
+        f"To change its commentary {_EXISTS_COMMENTARY_FIELDS}, call the "
+        "`amend_commentary` tool on this same project and pass this decision's id, "
+        f"{node_id}, as `slug`: the tool reads a handle the way `show_node` does, and a "
+        "slug that a live decision also carries names the live one. It edits the entry "
+        "in place and keeps the id.",
+        _EXISTS_RELATIONS_AND_ARCHIVED,
+    ]
+    if not faulted and successors:
+        if keys.get("successor_ambiguous"):
+            # A fan-out (out-of-band only) may hold one ambiguous successor among
+            # several, and the key does not say which: claim no more than that.
+            parts.append(
+                f"`record_decision` refuses a relation to {_quoted_slugs(successors)}: "
+                "two decisions carry that slug." if len(successors) == 1 else
+                "`record_decision` refuses a relation to a slug that two decisions "
+                f"carry, and at least one of {_quoted_slugs(successors)} is one.")
+            if slug.casefold() in {s.casefold() for s in successors}:
+                parts.append(
+                    f"The slug `{slug}` reads the live decision through `show_node`; "
+                    "this decision's id reads this one.")
+        else:
+            parts.append(
+                "To record a changed decision, record a new one with a relation to "
+                f"{_quoted_slugs(successors)}, where a deliberate reversal is a "
+                "supersedes of it, and never to this decision's slug: a relation can "
+                "name only a live decision.")
+    return " ".join(parts)
+
+
+class DeclaredReview(NamedTuple):
+    """What a draft's declarations exempt on the pause, by slug and by node id (7a).
+
+    One lineage walk fills the first three fields
+    (:meth:`MitosSyncManager._review_declared`); its resolution loop fills the fourth.
+
+    Attributes:
+        slugs: Casefolded declared targets of all nine relations, plus the casefolded
+            slugs of the transitive mutation lineage of the ``supersedes`` /
+            ``amends`` / ``narrows`` targets. The live screen's suppression set.
+        ids_by_target: Each declared target's casefolded slug → its node id, plus, for
+            a mutation target, every lineage ancestor's id. A target that does not
+            resolve to exactly one node contributes nothing (Phase A refuses it before
+            the pause; a replay shell may meet one).
+        ids: The union of ``ids_by_target``'s values.
+        direct_ids: Each declared target's casefolded slug → its own node id, with no
+            lineage (7c). The sibling note matches it: a neighbour descends from a
+            target only when its lineage holds that target's own id, never one of the
+            target's ancestors (``ids_by_target`` would claim a cousin descends).
+    """
+
+    slugs: Set[str]
+    ids_by_target: Dict[str, Set[str]]
+    ids: Set[str]
+    direct_ids: Dict[str, str]
+
+
+class TombstoneReview(NamedTuple):
+    """The pause's tombstone partition (:meth:`MitosSyncManager._review_tombstones`).
+
+    Attributes:
+        shown: The tombstone entries, closest first, at most the bound.
+        omitted: Non-exempt retired hits at or above the floor that were not shown.
+        cleared_by: The casefolded declared targets that exempted at least one
+            retired hit at or above the floor (the declared echo reads it).
+    """
+
+    shown: List[Dict[str, Any]]
+    omitted: int
+    cleared_by: Set[str]
+
+
+class AcknowledgedReview(NamedTuple):
+    """What an acknowledged write went past (:meth:`MitosSyncManager._acknowledged_fields`).
+
+    Each field is its own lock-3 statement about a write that has landed (7b, D4): a
+    list when read, ``[]`` when read and empty, ``None`` when it could not be read.
+
+    Attributes:
+        neighbors: The ``acknowledged_neighbors`` slugs, most similar first.
+        tombstones: The ``acknowledged_tombstones`` retired handles, closest first,
+            uncut.
+    """
+
+    neighbors: Optional[List[str]]
+    tombstones: Optional[List[Dict[str, Any]]]
+
+
+class PauseReview(NamedTuple):
+    """What the pre-commit near-duplicate review found (:meth:`MitosSyncManager._review_pause`).
+
+    Attributes:
+        pause: The ``needs_review`` dict to return (nothing written), or None when no
+            partition holds anything (or the review could not run).
+        unavailable: The fail-open notice when the review could not run, else None.
+        cut: The cut sentence when the review ran over less than it should have and no
+            pause carries it, else None (the created receipt carries it).
+    """
+
+    pause: Optional[Dict[str, Any]]
+    unavailable: Optional[str]
+    cut: Optional[str]
 
 
 def _review_unavailable_notice(cause: str) -> str:
@@ -943,11 +1375,105 @@ def _review_unavailable_notice(cause: str) -> str:
     )
 
 
+def _floor_text(floor: float) -> str:
+    """Renders a floor exactly: two places when that is the whole value (``0.80``), else
+    every place it holds (``0.8265``, ``0.82649``: the shortest spelling that reads back
+    as the value). A floor rounded up would state a bound the partition does not keep
+    (a tombstone at 0.827 under "≥0.83")."""
+    two = f"{floor:.2f}"
+    return two if float(two) == floor else repr(float(floor))
+
+
+def _past_what(score: float, floor: float, tombstone_floor: Optional[float]) -> str:
+    """Names what may lie past a gather whose last score is ``score``: a live neighbour
+    when it sits at or above the live floor, a tombstone when at or above the tombstone
+    floor (scores fall down the fetch, so nothing past it scores higher)."""
+    parts = []
+    if score >= floor:
+        parts.append("a live neighbour")
+    if tombstone_floor is not None and score >= tombstone_floor:
+        parts.append("a tombstone")
+    return " or ".join(parts)
+
+
+def _review_cut_notice(gathering: Optional[Gathering], floor: float, *,
+                       tombstone_floor: Optional[float] = None) -> Optional[str]:
+    """One calm sentence for a near-dup review whose gather was cut above its floor.
+
+    The sibling of :func:`_review_unavailable_notice`: that one says the review could
+    not run, this one says it ran over less than it should have. The gather read its
+    whole raw bound, held fewer live decisions than it fills, and its last point still
+    scored at or above the lower of the pause's floors — so a live neighbour, or a
+    tombstone when the score also clears the tombstone floor, may lie past what it read
+    (7a D7: a cut above a lower tombstone floor can hide a tombstone too). It names **no
+    command**, for the same boundary reason its sibling documents (this string is a
+    receipt dict value, so it reaches an MCP caller verbatim), and with no command in it
+    there is nothing to word per surface.
+
+    Args:
+        gathering: The review's healthy gathering, or None when the gather never ran
+            healthy.
+        floor: The live floor (the pause's ``_NEIGHBOR_REVIEW_THRESHOLD``).
+        tombstone_floor: The tombstone floor (``_TOMBSTONE_FLOOR``) when the review's
+            consumer reads tombstones; the cut is judged at the lower of the two.
+
+    Returns:
+        The sentence when the gathering was cut above the lower floor; otherwise None.
+    """
+    judged = floor if tombstone_floor is None else min(floor, tombstone_floor)
+    if gathering is None or not gathering.cut_above(judged):
+        return None
+    return (
+        f"Near-duplicate review read its whole bound of {gathering.bound} points and "
+        f"held {len(gathering.live)} live decision(s), fewer than the "
+        f"{CONFLICT_OVERFETCH_LIMIT} it fills; its last point still scored "
+        f"{gathering.last_score:.2f}, at or above the {_floor_text(judged)} floor, so "
+        f"{_past_what(gathering.last_score, floor, tombstone_floor)} may lie past what it read."
+    )
+
+
+def _review_full_notice(gathering: Optional[Gathering], floor: float,
+                        tombstone_floor: float) -> Optional[str]:
+    """One calm sentence for a review whose live fill ended full of above-floor candidates (7a D7).
+
+    The gather fills ``CONFLICT_OVERFETCH_LIMIT`` live candidates; when it holds all of
+    them, the last still at or above the lower of the two floors, and the walk ended at
+    an edge rather than running out, live neighbours and tombstones above their floors
+    may lie past what it walked — so the pause's ``neighbors_omitted`` and
+    ``tombstones_omitted`` count what it read, not what exists. The sentence names what
+    filled (the gather's candidates, never what the pause shows, which is at most
+    ``CONFLICT_TOP_K``) and no command; it is :func:`_review_cut_notice`'s sibling and
+    never rides beside it (a cut gather holds fewer than the limit, a full one does not).
+
+    Args:
+        gathering: The review's healthy gathering, or None.
+        floor: The live floor.
+        tombstone_floor: The tombstone floor.
+
+    Returns:
+        The sentence when the review ended full; otherwise None.
+    """
+    if gathering is None or len(gathering.live) < CONFLICT_OVERFETCH_LIMIT \
+            or gathering.end not in (EDGE_FOUND, EDGE_UNMEASURED):
+        return None
+    last = gathering.live[-1].score
+    if last < min(floor, tombstone_floor):
+        return None
+    return (
+        f"Near-duplicate review filled all {CONFLICT_OVERFETCH_LIMIT} of its live candidates "
+        f"and the last still scored {last:.2f}, at or above the "
+        f"{_floor_text(min(floor, tombstone_floor))} floor, so "
+        f"{_past_what(last, floor, tombstone_floor)} may lie past them; the omitted counts "
+        "cover what it read."
+    )
+
+
 def _declared_echo(
     declared_by_relation: Dict[str, Optional[str]],
     canonical_slugs: Dict[str, str],
     gathered_index: Dict[str, Tuple[str, float]],
     floor: float,
+    cleared_by: AbstractSet[str] = frozenset(),
 ) -> Dict[str, Any]:
     """Partitions the caller's own declared targets for the pause body (A2).
 
@@ -957,9 +1483,16 @@ def _declared_echo(
     :data:`_PAUSE_RESOLVING_RELATIONS`:
 
     * **Group two** (``declared_no_near_match``) — targets in ``V`` declared through at
-      least one ``PR`` relation that fall outside ``V ∩ G ∩ (score >= floor)``.
+      least one ``PR`` relation that fall outside ``V ∩ G ∩ (score >= floor)`` and did
+      not clear a tombstone on this call (``cleared_by``, 7a D9).
     * **Group one** (``declared``) — the complement over ``V``, keyed on all nine
       relations.
+
+    The tombstone clause keeps group two's sentence true: a declaration whose id set
+    meets a retired hit's ``{T.id} ∪ KillChain(T).reached`` at or above the tombstone
+    floor did resolve part of the pause, so it is not reported as one that "does not
+    resolve this pause". It adds no tombstone to the echo and no key; ``cleared_by`` is
+    computed from the primary sets (the declarations and the exemption decision, M8).
 
     Four properties are contract, not implementation taste:
 
@@ -995,6 +1528,8 @@ def _declared_echo(
         gathered_index: Casefolded gathered slug -> ``(stored slug, score)`` for every
             candidate this call's sweep returned, pre-screen.
         floor: The similarity floor the screen applied (``_NEIGHBOR_REVIEW_THRESHOLD``).
+        cleared_by: Casefolded declared targets that exempted a retired hit at or above
+            the tombstone floor (``TombstoneReview.cleared_by``); never in group two.
 
     Returns:
         The echo's keys, ready to merge into the pause dict — any of ``declared``,
@@ -1022,7 +1557,8 @@ def _declared_echo(
         # on the write path.
         handle = canonical_slugs.get(folded, verbatim)
         gathered = gathered_index.get(folded)
-        if folded in resolving and not (gathered is not None and gathered[1] >= floor):
+        if folded in resolving and folded not in cleared_by \
+                and not (gathered is not None and gathered[1] >= floor):
             item: Dict[str, Any] = {"slug": handle}
             if gathered is not None:
                 item["score"] = gathered[1]
@@ -1094,7 +1630,7 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
             rendered.append(
                 item["slug"] if score is None
                 else f"{item['slug']} ({_floored_score_text(score)}, below the "
-                     f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f} floor)"
+                     f"{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} floor)"
             )
         line = "Declared, not a near neighbour here: " + ", ".join(rendered)
         total = payload.get("declared_no_near_match_total")
@@ -1111,6 +1647,83 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
         lines.append("Pass every declaration again when you re-record")
 
     return lines
+
+
+def _pause_message(payload: Dict[str, Any]) -> str:
+    """The pause's ``message``, composed from the pause dict's own keys (7a D6).
+
+    Every clause is gated on a key the payload carries, so the MCP message, the CLI
+    text (which composes its own lines from the same keys) and ``--json`` cannot
+    disagree. It is in the MCP register: it names ``acknowledge_neighbors=True`` and
+    relation arguments by their bare names, never a shell command. A tombstone-only
+    pause opens on its tombstones and never says it is similar to zero decisions.
+
+    Args:
+        payload: The pause dict, without its ``message``.
+
+    Returns:
+        The message.
+    """
+    slug = payload["slug"]
+    neighbors = payload.get("neighbors") or []
+    tombstones = payload.get("tombstones") or []
+    parts: List[str] = []
+    if neighbors:
+        omitted = payload.get("neighbors_omitted")
+        parts.append(
+            f"Paused: '{slug}' is ≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} similar to "
+            f"{len(neighbors)} existing decision(s) you did not reference"
+            + (f", and {omitted} more above the floor are not shown." if omitted else ".")
+            + " Judge each neighbour from its axiom, rejected_paths, scope, and modifier "
+            "stamps, then re-record with that judgment: a relation arg "
+            f"({'/'.join(_PAUSE_RESOLVING_RELATIONS)}) pointing at any neighbour this "
+            "decision genuinely relates to, acknowledge_neighbors=True for neighbours that "
+            "stand independently alongside it — or both at once for a mixed set.")
+        if any(n.get("amended_by") or n.get("narrowed_by") for n in neighbors):
+            # B9's dereference sentence only where it can apply: a neighbour that
+            # carries a stamp.
+            parts.append("If you go on to supersede or amend a neighbour, an "
+                         "amended_by/narrowed_by stamp on it means it has moved on — "
+                         "dereference that slug before linking.")
+        if any(n.get("descends_from_declared") for n in neighbors):
+            parts.append("A neighbour marked descends_from_declared descends from a "
+                         "decision this draft declares, named there; that declaration "
+                         "does not clear it, so judge it like any other neighbour.")
+    if tombstones:
+        omitted = payload.get("tombstones_omitted")
+        lead = f"Paused: '{slug}' is" if not neighbors else "It is also"
+        parts.append(
+            f"{lead} ≥{_floor_text(_TOMBSTONE_FLOOR)} similar to {len(tombstones)} decision(s) this "
+            "corpus retired (tombstones): ground it already tried and abandoned, which the "
+            "draft sits closer to than the floor"
+            + (f"; {omitted} more tombstone(s) above the floor are not shown." if omitted else ".")
+            + " Each names where its current word lives (live_end, else superseded_by or "
+            "corrected_by). If the draft does not re-tread it, declare a relation to that "
+            "live successor, which clears it (a deliberate reversal is a supersedes of the "
+            "successor), or pass acknowledge_neighbors=True.")
+        if any(t.get("successor_on_pause") for t in tombstones):
+            parts.append("A tombstone marked successor_on_pause has that successor among "
+                         "the neighbours above, so one relation to it clears both.")
+        ambiguous = [t for t in tombstones if t.get("successor_ambiguous")]
+        if any(len(_live_successors(t)) == 1 for t in ambiguous):
+            # No "only": a supersedes/amends/narrows of a decision descended from the
+            # successor reaches the tombstone and clears it too (9b, D5).
+            parts.append("A tombstone marked successor_ambiguous has a successor whose "
+                         "slug two decisions carry, a relation target record_decision "
+                         "refuses; acknowledge_neighbors=True clears it.")
+        if any(len(_live_successors(t)) > 1 for t in ambiguous):
+            # A fan-out (out-of-band only) may hold one ambiguous successor among
+            # several, and the key does not say which: claim no more than that (7b's
+            # `exists` rule).
+            parts.append("A tombstone marked successor_ambiguous with several successors "
+                         "has at least one whose slug two decisions carry, a relation target "
+                         "record_decision refuses; acknowledge_neighbors=True clears it.")
+    if payload.get("stamp_labels_unread"):
+        # 8a: the label read faulted after the review; the stamps themselves stand.
+        parts.append(stamp_labels_unread_clause(surface="mcp", config=None))
+    echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(payload))
+    return (" ".join(parts) + f" {PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} "
+            f"{echo_prose}Nothing was written.")
 
 
 def _floored_score_text(score: float) -> str:
@@ -1408,6 +2021,497 @@ class _RepairLedger:
         return line
 
 
+class _OwnerTake:
+    """One owner, taken once by a rejection drain: the row read, then its plan.
+
+    Attributes:
+        row: The backlog row as claimed; its seq is the only one the take may clear
+            or note.
+        slug: The owner's slug, for its lines.
+        expected: ``rejection_points`` of the field read after the claim.
+        relist: Whether the owner's holdings must be listed afresh rather than taken
+            from the entry listing (a retake, or a row queued after that listing).
+        to_write: ``(point_id, text)`` of the expected items not held, in
+            enumeration order.
+        to_remove: Held point ids the field no longer states.
+        landed: How many of ``to_write`` are written.
+        aborted: Set once the take failed; it is then never finalized and noted once.
+    """
+
+    def __init__(self, row: RejectionBacklogRow, slug: str,
+                 expected: Dict[str, Any], relist: bool) -> None:
+        self.row = row
+        self.slug = slug
+        self.expected = expected
+        self.relist = relist
+        self.to_write: List[Tuple[str, str]] = []
+        self.to_remove: Set[str] = set()
+        self.landed = 0
+        self.aborted = False
+
+    @property
+    def owner(self) -> str:
+        return self.row.node_id
+
+    def plan(self, held: AbstractSet[str]) -> int:
+        """Splits the expected items against what the owner holds.
+
+        Returns:
+            How many expected items are already held.
+        """
+        self.to_write = [(pid, ref.text) for pid, ref in self.expected.items()
+                         if pid not in held]
+        self.to_remove = set(held) - set(self.expected)
+        return len(self.expected) - len(self.to_write)
+
+
+# One queued item of a page: its owner's take, its point id, its text.
+_QueuedItem = Tuple[_OwnerTake, str, str]
+
+
+class _RejectionDrainWalk:
+    """One walk of the rejection backlog, run under the drain lock its caller holds.
+
+    The steps, in order, are :meth:`MitosSyncManager.drain_rejection_backlog`'s
+    contract. Every exit returns ``(stop, marker)``; the counters are read off the
+    walk afterwards, also when an exception escaped it.
+    """
+
+    def __init__(self, manager: "MitosSyncManager") -> None:
+        self.store = manager.store
+        self.index = manager.rejection_index
+        self.provider = manager.embed_provider
+        self.selector = shell_flag("-p", manager.config.project)
+        self.owners_cleared = 0
+        self.items_embedded = 0
+        self.items_skipped_present = 0
+        self.items_removed = 0
+        self.owners_failed = 0
+        self.calls = 0
+        self.model = ""  # the provider's model id, validated once at entry
+        self.seed: Optional[Dict[str, str]] = None
+        self.may_create = False
+        self.collection_present = False
+        # Under the marker: the entry listing, by owner, and the largest seq queued
+        # before it was taken. A row above that seq re-lists, as a retake does.
+        self.entry_holdings: Optional[Dict[str, Set[str]]] = None
+        self.watermark = 0
+        self.taken: Set[str] = set()
+
+    def kept(self) -> Optional[str]:
+        return DRAIN_MARKER_KEPT if self.seed is not None else None
+
+    # -- the walk ---------------------------------------------------------- #
+
+    def run(self) -> Tuple[Optional[str], Optional[str]]:
+        # A provider naming no model is its own fault, not any row's: checked once,
+        # before the claim, so it never reads as every owner's poison.
+        model = self.provider.model_id
+        if not isinstance(model, str) or not model:
+            print(
+                "[Warning] The rejection backlog was not drained: the embedding "
+                "provider reported no model id. Its rows stay queued."
+            )
+            return DRAIN_STOP_UNAVAILABLE, None
+        self.model = model
+        # Declared intent, from the state a covering verb established (read once).
+        self.seed = self.store.rejection_seed()
+        self.may_create = self.seed is not None
+        try:
+            page = self.store.claim_rejection_backlog(_REJECTION_DRAIN_CLAIM_SIZE)
+        except Exception as e:
+            self._claim_failed(e)
+            return DRAIN_STOP_CLAIM_FAILED, self.kept()
+        if not page:
+            # Nothing to replace: whatever the marker claimed is moot. Lists nothing.
+            if self.seed is None:
+                return None, None
+            return None, self._spend()
+
+        if self.seed is not None:
+            stop = self._list_entry_holdings(page)
+            if stop is not None:
+                return stop, self.kept()
+
+        while page:
+            stop = self._walk_page(page)
+            if stop is not None:
+                return stop, self.kept()
+            try:
+                page = self.store.claim_rejection_backlog(
+                    _REJECTION_DRAIN_CLAIM_SIZE, after_seq=page[-1].enqueue_seq
+                )
+            except Exception as e:
+                self._claim_failed(e)
+                return DRAIN_STOP_CLAIM_FAILED, self.kept()
+
+        if self.seed is None:
+            return None, None
+        if self.collection_present:
+            return None, self._spend()
+        # Still absent (nothing written). Spend only if nothing is left to cover:
+        # read, never inferred — a row queued behind the cursor is invisible to it.
+        try:
+            empty = self.store.claim_rejection_backlog(1) == []
+        except Exception as e:
+            self._claim_failed(e)
+            return None, DRAIN_MARKER_KEPT
+        return None, (self._spend() if empty else DRAIN_MARKER_KEPT)
+
+    def _list_entry_holdings(self, page: List[RejectionBacklogRow]) -> Optional[str]:
+        """Under the marker: one listing of the whole index, with owners."""
+        seqs = [row.enqueue_seq for row in page]
+        try:
+            last = self.store.rejection_backlog_last_seq()
+        except Exception:
+            last = None  # the head page's seqs still bound what predates the listing
+        self.watermark = max(seqs + ([last] if last is not None else []))
+        try:
+            owners = self.index.list_point_owners()
+            self.collection_present = True
+        except CollectionMissingError:
+            owners = {}  # absent: this licensed drain creates it on its first write
+        except VectorStoreError as e:
+            self._stop_store(e, "could not list the rejection index")
+            return DRAIN_STOP_OUTAGE
+        holdings: Dict[str, Set[str]] = {}
+        for point_id, owner in owners.items():
+            if owner is not None:
+                holdings.setdefault(owner, set()).add(point_id)
+        self.entry_holdings = holdings
+        return None
+
+    def _walk_page(self, page: List[RejectionBacklogRow]) -> Optional[str]:
+        # Seq first, field after (the claim above): a commit between the two mints
+        # a larger seq, so this take's clear fails and the retake reads that field.
+        try:
+            fields = self.store.get_rejection_owner_fields(
+                [row.node_id for row in page]
+            )
+        except Exception as e:
+            # One read for the page, so one fault for the page: no row is charged
+            # (the fault is the store's), and the next drain retries every one.
+            print(
+                f"[Warning] Could not read {len(page)} rejection backlog owner(s) "
+                f"from the graph: {describe_embed_failure(e)}. Their rows stay queued."
+            )
+            return None
+
+        takes: List[_OwnerTake] = []
+        for row in page:
+            retake = row.node_id in self.taken
+            self.taken.add(row.node_id)
+            if row.node_id not in fields:
+                # The node left the graph (only with foreign keys off). Its points
+                # are orphans for `reconcile`'s collection, not for this drain.
+                self._clear(row, None)
+                continue
+            slug, field = fields[row.node_id]
+            try:
+                expected = rejection_points(row.node_id, field)
+            except Exception as e:
+                self._fail_row(row, slug, e)
+                continue
+            relist = (retake or self.entry_holdings is None
+                      or row.enqueue_seq > self.watermark)
+            takes.append(_OwnerTake(row, slug, expected, relist))
+
+        # Holdings for every owner of the page, before anything of the page embeds.
+        for take in takes:
+            if take.relist:
+                try:
+                    held: AbstractSet[str] = self.index.list_owner_point_ids(take.owner)
+                    self.collection_present = True
+                except CollectionMissingError:
+                    if self.seed is None:
+                        self._stop_refused()
+                        return DRAIN_STOP_REFUSED
+                    held = set()  # licensed: the first write creates it
+                except VectorStoreError as e:
+                    self._stop_store(e, "could not list an owner's items")
+                    return DRAIN_STOP_OUTAGE
+            else:
+                held = self.entry_holdings.get(take.owner, set())
+            self.items_skipped_present += take.plan(held)
+
+        for take in takes:
+            if not take.to_write:
+                stop = self._finalize(take)
+                if stop is not None:
+                    return stop
+
+        queue: List[_QueuedItem] = [
+            (take, pid, text) for take in takes for pid, text in take.to_write
+        ]
+        while queue:
+            n = fit_batch([text for _, _, text in queue])
+            batch, queue = queue[:n], queue[n:]
+            stop, queue = self._send_batch(batch, queue)
+            if stop is not None:
+                return stop
+        return None
+
+    # -- batches ----------------------------------------------------------- #
+
+    def _send_batch(
+        self, batch: List[_QueuedItem], queue: List[_QueuedItem]
+    ) -> Tuple[Optional[str], List[_QueuedItem]]:
+        owners = list(dict.fromkeys(take for take, _, _ in batch))
+        try:
+            vectors = self._embed_batch([text for _, _, text in batch])
+        except Exception as e:
+            cause = classify_provider_error(e)
+            if cause in _DRAIN_OUTAGE_CAUSES:
+                self._stop_provider(cause, e)
+                return DRAIN_STOP_OUTAGE, queue
+            if len(owners) == 1:
+                self._abort(owners[0], e)
+                return None, self._drop(owners[0], queue)
+            # A batch failing for a reason of its own: find its owner by retrying
+            # owner by owner, each with every text it has not landed.
+            for take in owners:
+                stop, queue = self._solo(take, batch, queue)
+                if stop is not None:
+                    return stop, queue
+            return None, queue
+
+        try:
+            self._upsert(batch, vectors)
+        except VectorStoreUnreachableError as e:
+            self._stop_store(e, "did not answer the write")
+            return DRAIN_STOP_OUTAGE, queue
+        except CollectionMissingError:
+            self._stop_missing_on_write()
+            return DRAIN_STOP_REFUSED, queue
+        except Exception:
+            # Refused or unconfirmed: retry each owner's points alone, with the
+            # vectors in hand (no second embed).
+            for take in owners:
+                mine = [(item, vector) for item, vector in zip(batch, vectors)
+                        if item[0] is take]
+                try:
+                    self._upsert([item for item, _ in mine], [v for _, v in mine])
+                except VectorStoreUnreachableError as e:
+                    self._stop_store(e, "did not answer the write")
+                    return DRAIN_STOP_OUTAGE, queue
+                except CollectionMissingError:
+                    self._stop_missing_on_write()
+                    return DRAIN_STOP_REFUSED, queue
+                except Exception as e:
+                    self._abort(take, e)
+                    queue = self._drop(take, queue)
+                    continue
+                stop = self._landed(take, len(mine))
+                if stop is not None:
+                    return stop, queue
+            return None, queue
+
+        for take in owners:
+            stop = self._landed(take, sum(1 for item in batch if item[0] is take))
+            if stop is not None:
+                return stop, queue
+        return None, queue
+
+    def _solo(
+        self, take: _OwnerTake, batch: List[_QueuedItem], queue: List[_QueuedItem]
+    ) -> Tuple[Optional[str], List[_QueuedItem]]:
+        """Retries one owner alone, over every text of it not landed, in its own chunks.
+
+        Its texts leave the queue first, so its tail never rides a later batch. It
+        stops at its first failing chunk.
+        """
+        items = [item for item in batch if item[0] is take]
+        items += [item for item in queue if item[0] is take]
+        queue = self._drop(take, queue)
+        while items:
+            n = fit_batch([text for _, _, text in items])
+            chunk, items = items[:n], items[n:]
+            try:
+                vectors = self._embed_batch([text for _, _, text in chunk])
+            except Exception as e:
+                cause = classify_provider_error(e)
+                if cause in _DRAIN_OUTAGE_CAUSES:
+                    self._stop_provider(cause, e)
+                    return DRAIN_STOP_OUTAGE, queue
+                self._abort(take, e)
+                return None, queue
+            try:
+                self._upsert(chunk, vectors)
+            except VectorStoreUnreachableError as e:
+                self._stop_store(e, "did not answer the write")
+                return DRAIN_STOP_OUTAGE, queue
+            except CollectionMissingError:
+                self._stop_missing_on_write()
+                return DRAIN_STOP_REFUSED, queue
+            except Exception as e:
+                self._abort(take, e)
+                return None, queue
+            stop = self._landed(take, len(chunk))
+            if stop is not None:
+                return stop, queue
+        return None, queue
+
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """One ``embed_documents`` call, its answer validated (the model was, at entry)."""
+        self.calls += 1
+        vectors = self.provider.embed_documents(texts)
+        if not (
+            isinstance(vectors, list)
+            and len(vectors) == len(texts)
+            and all(isinstance(v, list) and v for v in vectors)
+        ):
+            raise EmbeddingError(
+                "the embedding provider answered a document batch with the wrong shape"
+            )
+        return vectors
+
+    def _upsert(self, items: List[_QueuedItem], vectors: List[List[float]]) -> None:
+        self.index.upsert_points(
+            [RejectionPoint(pid, take.owner, vector)
+             for (take, pid, _), vector in zip(items, vectors)],
+            model=self.model,
+            may_create=self.may_create,
+        )
+        # Written: the collection exists now, whatever the listing said.
+        self.collection_present = True
+
+    def _landed(self, take: _OwnerTake, count: int) -> Optional[str]:
+        self.items_embedded += count
+        take.landed += count
+        if take.landed == len(take.to_write) and not take.aborted:
+            return self._finalize(take)
+        return None
+
+    @staticmethod
+    def _drop(take: _OwnerTake, queue: List[_QueuedItem]) -> List[_QueuedItem]:
+        return [item for item in queue if item[0] is not take]
+
+    # -- finalizing an owner ----------------------------------------------- #
+
+    def _finalize(self, take: _OwnerTake) -> Optional[str]:
+        """Removes what the field no longer states, then clears against the seq read.
+
+        Runs only once every item the owner lacked is written, so an interrupted
+        drain leaves the old items beside the new ones, never none.
+        """
+        if take.to_remove:
+            try:
+                self.index.delete_points(sorted(take.to_remove))
+            except VectorStoreUnreachableError as e:
+                self._stop_store(e, "did not answer a delete")
+                return DRAIN_STOP_OUTAGE
+            except CollectionMissingError:
+                self._stop_missing_on_write()
+                return DRAIN_STOP_REFUSED
+            except Exception as e:
+                # Reported and left queued, never counted as done.
+                self._abort(take, e, removing=True)
+                return None
+            self.items_removed += len(take.to_remove)
+        self._clear(take.row, take.slug)
+        return None
+
+    def _clear(self, row: RejectionBacklogRow, slug: Optional[str]) -> None:
+        try:
+            cleared = self.store.clear_rejection_backlog_row(
+                row.node_id, enqueue_seq=row.enqueue_seq
+            )
+        except Exception as e:
+            self.owners_failed += 1
+            print(
+                f"[Warning] The rejection backlog row for '{slug or row.node_id}' "
+                f"could not be cleared: {describe_embed_failure(e)}. The row stays "
+                f"queued; the next drain finds its items in place."
+            )
+            return
+        if cleared:
+            self.owners_cleared += 1
+        # False: a commit re-queued the owner since the claim. Its new row carries a
+        # larger seq, ahead of the cursor, so this walk takes it again.
+
+    def _abort(self, take: _OwnerTake, exc: BaseException, *, removing: bool = False) -> None:
+        if take.aborted:
+            return
+        take.aborted = True
+        self._fail_row(take.row, take.slug, exc, removing=removing)
+
+    def _fail_row(self, row: RejectionBacklogRow, slug: str, exc: BaseException,
+                  *, removing: bool = False) -> None:
+        self.owners_failed += 1
+        what = ("its old items were not removed" if removing
+                else "its items were not replaced")
+        print(
+            f"[Warning] Rejected items for '{slug}': {what} — "
+            f"{describe_embed_failure(exc)}. Its rejection backlog row stays queued."
+        )
+        try:
+            self.store.note_rejection_backlog_failure(
+                row.node_id, enqueue_seq=row.enqueue_seq
+            )
+        except Exception:
+            pass  # the row stands either way; only its count did not move
+
+    # -- stops and the marker ---------------------------------------------- #
+
+    def _stop_provider(self, cause: str, exc: BaseException) -> None:
+        print(
+            f"Rejection index: stopping the drain — the embedding provider is "
+            f"unavailable ({cause}): {describe_embed_failure(exc)}. No row was "
+            f"charged; the rows stay queued for the next `mitos sync {self.selector}`."
+        )
+
+    def _stop_store(self, exc: BaseException, what: str) -> None:
+        print(
+            f"Rejection index: stopping the drain — the vector store {what}: "
+            f"{describe_embed_failure(exc)}. No row was charged; the rows stay "
+            f"queued for the next `mitos sync {self.selector}`."
+        )
+
+    def _stop_refused(self) -> None:
+        # Names the heal: `reconcile` queues every owner the index lacks and stamps the
+        # rejection seed marker, which licenses the create this drain refused. An
+        # ordinary `sync` over a populated graph never builds the index (the build is
+        # operator-invoked, never implicit).
+        try:
+            waiting: Optional[int] = self.store.count_rejection_backlog()
+        except Exception:
+            waiting = None
+        count = f"{waiting} " if waiting is not None else ""
+        print(
+            f"Rejection index: {count}rejection backlog row(s) wait until the "
+            f"rejection index is built; nothing was created or embedded. "
+            f"`mitos reconcile {self.selector}` builds it."
+        )
+
+    def _stop_missing_on_write(self) -> None:
+        if self.may_create:
+            print(
+                "Rejection index: stopping the drain — the rejection collection was "
+                "created and still answered missing to the write. No row was "
+                "charged; the rows stay queued."
+            )
+        else:
+            self._stop_refused()
+
+    def _claim_failed(self, exc: BaseException) -> None:
+        print(
+            f"[Warning] Failed to read the rejection backlog: "
+            f"{describe_embed_failure(exc)}"
+        )
+
+    def _spend(self) -> str:
+        """Spends the marker this drain read; one re-stamped meanwhile survives."""
+        try:
+            self.store.clear_rejection_seed(established_at=self.seed["established_at"])
+        except Exception as e:
+            print(
+                f"[Warning] Failed to clear the rejection seed marker: "
+                f"{describe_embed_failure(e)}"
+            )
+            return DRAIN_MARKER_KEPT
+        return DRAIN_MARKER_SPENT
+
+
 class MitosSyncManager:
     """Manages the full parse-enrich-commit sync flow and side effects."""
 
@@ -1420,14 +2524,33 @@ class MitosSyncManager:
         # Lazy initialize vector / embedding dependencies as best-effort (C2/P14)
         self.embed_provider: Optional[GeminiEmbeddingProvider] = None
         self.vector_store: Optional[QdrantVectorStore] = None
+        # The sibling rejection-item collection's client (recall-confidence 4b).
+        # Written inline by ``_write_rejection_items_inline``; None whenever either
+        # constructor above failed, so a keyless or "down" workspace runs no leg.
+        self.rejection_index: Optional[QdrantRejectionIndex] = None
 
         # Set once an inline embed has met an absent collection it may not create, so
         # a multi-entry sync prints ONE deferral line and skips N−1 wasted Qdrant round
         # trips (and N−1 embedding calls). Per manager instance — one per command — and
-        # read ONLY by ``_best_effort_embed``: a covering drain later in the same
+        # read by the decision leg (``_embed_decision_inline``) and the post-commit
+        # acknowledged-neighbour gather (``_acknowledged_fields``), which would
+        # meet the same absence. Neither reads the rejection latches below, and the
+        # rejection leg never reads this one. A covering drain later in the same
         # ``perform_sync`` must not consult it, or a rebuild-then-sync would refuse to
         # heal because a record earlier in the run found the collection missing.
         self._collection_absent = False
+
+        # The rejection leg's two per-command latches, read ONLY by
+        # ``_write_rejection_items_inline``. ``_rejection_collection_absent``: an
+        # unlicensed leg found the rejection collection absent, so later entries skip
+        # the probe and spend nothing (the absence is silent — every upgraded
+        # workspace sits there until its one rebuild of the index, and the backlog
+        # row is the durable record). ``_rejection_leg_stopped``: an outage (an
+        # auth, quota or transient provider cause, or an unreachable store), so a
+        # sync committing forty entries during a 429 spends one failed call, not
+        # forty. An ``unknown`` cause or a refusal latches neither: it costs one owner.
+        self._rejection_collection_absent = False
+        self._rejection_leg_stopped = False
 
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
@@ -1439,6 +2562,12 @@ class MitosSyncManager:
             self.vector_store = QdrantVectorStore(
                 self.config.qdrant_url,
                 self.config.qdrant_collection
+            )
+            # Last, inside the same try: no network I/O at construct, and any
+            # earlier failure leaves it None exactly as it leaves the others.
+            self.rejection_index = QdrantRejectionIndex(
+                self.config.qdrant_url,
+                self.config.rejection_collection,
             )
         except Exception as e:
             # Let operations continue in degraded graph-only mode per S1/F2
@@ -1509,6 +2638,11 @@ class MitosSyncManager:
         absent from the buffer), while the key-floor return must stay silent. One
         report site after every path, and one explicit carve-out marked at the
         floor, beats four call sites and four chances to miss the one that matters.
+
+        The two drains, the decision outbox's and then the rejection backlog's, run
+        at the end of a run that read the buffer, each in a try of its own. The
+        early returns (the buffer lock busy, no entry parsed, the key floor) skip
+        both; ``--embed-only`` runs both without a sync.
 
         Args:
             auto_accept: Whether ``--yes`` is in force.
@@ -1877,7 +3011,7 @@ class MitosSyncManager:
                 # is strict-deterministic; ADR sync-strict-deterministic-no-llm-enrichment).
                 print(f"\nProposed Decision: {entry.slug}")
                 print(f"  Core Axiom:  {entry.axiom}")
-                print(f"  Rejected:    {entry.rejected_paths}")
+                print(render_rejected_paths(entry.rejected_paths, "  Rejected:    "))
                 print(f"  Mechanisms:  {', '.join(entry.mechanisms)}")
                 print(f"  Scope:       {', '.join(entry.scope)}")
 
@@ -1975,8 +3109,9 @@ class MitosSyncManager:
             print(f"Committed node: {entry.slug} ✓")
             ledger.note(entry, "committed")
 
-            # best-effort embedding upsert (C2) — applies to OQ nodes too.
-            self._best_effort_embed(delta, entry)
+            # best-effort embedding upsert (C2) — applies to OQ nodes too. The
+            # rejection leg is left to this sync's own drain (step 6b).
+            self._best_effort_embed(delta, entry, rejection_leg=False)
 
         # 3b. Intra-sync fixpoint retry (4b). The main pass committed every entry
         # whose targets were already present; re-attempt the quarantined set until a
@@ -2019,6 +3154,18 @@ class MitosSyncManager:
             self.drain_pending_embeddings()
         except Exception as e:
             print(f"[Warning] Outbox queue drain failed: {describe_embed_failure(e)}")
+
+        # 6b. The rejection backlog's drain, after the decision drain and in a try of
+        # its own: a fault here never touches that drain, its marker or the exit. It
+        # takes every row the commit loop above left (that loop runs no inline
+        # rejection leg), cross-owner batched.
+        try:
+            self.drain_rejection_backlog()
+        except Exception as e:
+            print(
+                f"[Warning] Rejection backlog drain failed: {describe_embed_failure(e)}",
+                file=sys.stderr,
+            )
 
         # 7. Surplus hit/miss stats observability (4.D)
         if verbose and self.embed_provider:
@@ -2160,7 +3307,7 @@ class MitosSyncManager:
         committed, passes, residual = commit_quarantine_fixpoint(
             self.store,
             quarantined,
-            embed_fn=self._best_effort_embed,
+            embed_fn=functools.partial(self._best_effort_embed, rejection_leg=False),
         )
 
         # Convergence observability: make the fixpoint's work visible (the vision
@@ -2352,6 +3499,10 @@ class MitosSyncManager:
         # → `findings == []` → print nothing.
         if result.findings:
             self._print_conflict_findings(result.findings)
+        # The gather was cut above the check's floor: say so beside the findings, on
+        # the same channel. Data, never a degradation — the breaker stays untouched.
+        if result.gather_cut:
+            print(_CONFLICT_GATHER_CUT_LINE)
 
         # 5b persistence: a JUDGED result (the LLM fired) writes its judged pairs to the
         # telemetry corpus — the surfaced findings AND the silent-but-judged negative labels
@@ -2632,7 +3783,7 @@ class MitosSyncManager:
             # only when non-empty (blind indexing KeyErrors on the common unmodified
             # candidate), so guard every optional key (mirrors 2b's own copy guard).
             if "rejected_paths" in payload:
-                print(f"       Rejected: {payload['rejected_paths']}")
+                print(render_rejected_paths(payload["rejected_paths"], "       Rejected: "))
             scope = payload.get("scope") or []
             scope_text = ", ".join(scope) if scope else "(global — no scope declared)"
             print(f"       Scope:    {scope_text}")
@@ -2647,8 +3798,51 @@ class MitosSyncManager:
             "  decisions.md, then re-sync. Quit to abort."
         )
 
-    def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
-        """Best-effort async embedding upsert pipeline (C2).
+    def _best_effort_embed(
+        self, delta: CommitDelta, entry: ParsedEntry, *, rejection_leg: bool = True
+    ) -> Optional[List[float]]:
+        """Best-effort inline embedding of one committed node into both indexes.
+
+        Every path that indexes a committed node calls this: ``record_decision``,
+        ``amend_commentary``, and ``mitos sync``'s commit loop and quarantine
+        fixpoint. Two legs run in order, each a bulkhead for the other:
+
+        1. :meth:`_embed_decision_inline`, the decision index (the axiom's point,
+           through the shared embedding cache). Gated by ``_collection_absent``.
+        2. :meth:`_write_rejection_items_inline`, the rejection index (the items
+           the commit's ``rejected_paths`` states, uncached). Gated by
+           ``_rejection_collection_absent`` and ``_rejection_leg_stopped``.
+
+        The rejection leg runs whatever the decision leg returned: the decision
+        collection being absent or its write failing costs that leg alone. The
+        axiom's leg goes first, so the post-commit gather reads exactly what it
+        read before the rejection leg existed. Neither leg raises.
+
+        ``mitos sync``'s commit loop and fixpoint pass ``rejection_leg=False``: their
+        rows wait for the same command's :meth:`drain_rejection_backlog`, which
+        batches across owners rather than spending a call per entry (ADR
+        ``sync-commit-loop-leaves-rejection-rows-to-its-own-drain-record-and-amend-write-inline``).
+        ``record_decision`` and ``amend_commentary`` keep the default, because a
+        workspace written only over MCP has no drain until its next ``sync``.
+
+        Args:
+            delta: The commit's delta.
+            entry: The ``ParsedEntry`` that commit stored.
+            rejection_leg: Whether to run the rejection leg inline.
+
+        Returns:
+            The decision leg's document vector (a caller may reuse it for a
+            neighbour query), or None if that leg deferred or failed.
+        """
+        vector = self._embed_decision_inline(delta, entry)
+        if rejection_leg:
+            self._write_rejection_items_inline(delta, entry)
+        return vector
+
+    def _embed_decision_inline(
+        self, delta: CommitDelta, entry: ParsedEntry
+    ) -> Optional[List[float]]:
+        """The decision leg of the inline embed: the axiom's point (C2).
 
         The committing node is already enqueued on the ``pending_embeddings`` Outbox
         by ``commit_parsed_entry`` (``_enqueue_outbox``, 5c), so this is the inline
@@ -2661,10 +3855,11 @@ class MitosSyncManager:
         deferred/failed.
 
         This is a **single-node** write, so it may create an absent collection only when
-        that one node *is* the whole active set — the fresh-project carve-out. The
-        declaration comes from the graph gate
-        (:meth:`~mitos.store.GraphStore.has_active_node_other_than`), the same shipped
-        active-view predicate the read-side gate uses; a populated graph defers instead,
+        that one node *is* the whole of what the decision index should hold — the
+        fresh-project carve-out. The declaration comes from the graph gate
+        (:meth:`~mitos.store.GraphStore.decision_index_expects_node_other_than`), the
+        twin of the expected-set read the read-side gate uses; a populated graph — one
+        holding only retired decisions included — defers instead,
         keeping the collection absent so the honest "couldn't check" notice keeps firing
         rather than quietly becoming "checked, clean" over a one-point index.
         """
@@ -2687,7 +3882,9 @@ class MitosSyncManager:
                   file=sys.stderr)
             return None
 
-        # Prepare payload
+        # Prepare payload. ``state`` is an inert literal no reader trusts: state is
+        # computed (M3), a retired decision's point carries "active" too, and a stored
+        # state would go stale on the next kill edge. Do not "fix" it.
         payload = {
             "slug": entry.slug,
             "scope": entry.scope,
@@ -2697,14 +3894,15 @@ class MitosSyncManager:
         }
 
         try:
-            # Declared intent, from the graph gate: this write covers the active set iff
-            # there is no other active node. Cheap enough to run unconditionally (an
-            # EXISTS … LIMIT 1), and it must be computed before the write because only
-            # the 404 reveals whether it matters. Deliberately INSIDE this try: the
+            # Declared intent, from the graph gate: this write covers the decision index's
+            # expected set iff the graph expects no other node. Cheap enough to run
+            # unconditionally (an EXISTS … LIMIT 1), and it must be computed before the
+            # write because only the 404 reveals whether it matters. Deliberately INSIDE
+            # this try: the
             # helper's contract is that it swallows its own faults and leaves the outbox
             # row (that is what makes deferral cheap), and a graph read added outside it
             # would let a store fault escape a path that has never raised.
-            may_create = not self.store.has_active_node_other_than(delta.node_id)
+            may_create = not self.store.decision_index_expects_node_other_than(delta.node_id)
             # Check embedding provider and generate vector
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
             self.vector_store.upsert(delta.node_id, vector, payload, may_create=may_create)
@@ -2723,7 +3921,8 @@ class MitosSyncManager:
             self._collection_absent = True
             print(
                 f"[Warning] Embedding upsert deferred for '{entry.slug}': the Qdrant "
-                f"collection is missing and this write does not cover the active set. "
+                f"collection is missing and this write does not cover every decision "
+                f"the index should hold. "
                 f"Queued — run `mitos reconcile` to rebuild the index.",
                 file=sys.stderr,
             )
@@ -2734,94 +3933,338 @@ class MitosSyncManager:
             print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
             return None
 
-    def drain_pending_embeddings(self) -> None:
-        """Drains the pending embeddings outbox queue (C2).
+    def _write_rejection_items_inline(
+        self, delta: CommitDelta, entry: ParsedEntry
+    ) -> None:
+        """Adds the items a commit's ``rejected_paths`` states to the rejection index.
 
-        Claims a batch of pending embeddings atomically to prevent concurrent
-        drainers from double-processing rows, processes them, and removes resolved entries.
+        The inline half of the rejection index's lifecycle (recall-confidence 4b). It
+        runs only when the commit queued a rejection backlog row, and it only
+        **adds**: it never removes, never retries and never notes the row (ADR
+        ``rejection-index-inline-writes-only-add-and-only-one-drain-at-a-time-removes``).
 
-        **Whether this drain may create an absent collection is not a property of the
-        running call site.** The drain has three callers (``mitos sync --embed-only``,
-        the sync commit path, and ``reconcile_embeddings``), and ``--embed-only`` is a
-        drain with no buffer at all — its covering-ness is entirely a property of outbox
-        state that a *prior* command deliberately established, which a call-site flag
-        structurally cannot express. So the knowledge travels to the substrate: the
-        ``embedding_seed`` marker, written by ``rebuild``/``cutover``'s prune (the act
-        that makes the outbox equal the active set) and by ``reconcile``'s enqueue pass.
-        This is the marker's only consumer. It is read **once at entry** — not per
-        claim-batch, so a concurrent second drainer cannot flip it mid-run — and cleared
-        the moment the outbox empties, because that is the moment coverage has been
-        delivered and the claim stops being true. A drain that stops early (the
-        zero-progress guard, or a refusal) **keeps** the marker: rows remain, so the next
-        drain is still covering.
+        - The items are read from ``entry``, the field this commit stored, and the
+          only seq it may clear is ``delta.rejection_enqueue_seq``, the one this
+          commit minted. That (seq, field) pair is one snapshot; a row read back
+          after the commit could hold a newer seq a concurrent re-queue minted.
+        - **Licence**: it may create the absent collection only when its decision is
+          the graph's only decision, live or retired
+          (``rejection_index_expects_owner_other_than``).
+        - **Presence**: a new owner holding the licence asks nothing (its ids derive
+          from an owner that is new). Every other write asks once, by the ids its
+          field determines: an unlicensed new owner learns that the collection exists
+          before it embeds anything, and an amend embeds only what is not present
+          (ADR ``inline-rejection-write-checks-presence-by-item-id-and-a-new-owner-asks-nothing``).
+          An unlicensed write that finds the collection absent latches and returns
+          silently, having embedded nothing.
+        - **One call**: at most one ``embed_documents`` call, holding ``fit_batch``'s
+          prefix of the items not present, in enumeration order. It never touches
+          the shared embedding cache. Any overflow waits in the row for the drain.
+        - **Clear**: a new owner whose every item landed clears its own row against
+          its seq (a ``False`` answer means a newer commit re-queued it, which the
+          drain converges). An amend never clears: the items its field dropped are
+          still in the index, and only a drain removes.
 
-        It is emphatically *not* an inferred comparison of outbox size against the active
-        set — that is not a completeness measure (the outbox holds rows for
-        no-longer-active nodes), it is more expensive than the signals it would replace,
-        and it decays silently once a migration hands every project a clean collection
-        holding only active points.
+        Every fault leaves the row and costs this leg alone: the commit, the
+        receipt and the decision leg are untouched. An outage (``auth``, ``quota``
+        or ``transient`` provider cause, or an unreachable store) latches the leg
+        off for the rest of the command; any other fault costs one owner. A failed
+        write prints one stderr line naming the selectored ``sync`` whose drain
+        retries the row (stdout is the MCP JSON-RPC channel); the unlicensed
+        absent-collection probe stays silent (``status`` states that gap).
+
+        Args:
+            delta: The commit's delta (``created``, ``rejection_enqueue_seq``).
+            entry: The ``ParsedEntry`` that commit stored.
+        """
+        seq = getattr(delta, "rejection_enqueue_seq", None)
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            return
+        if self.embed_provider is None or self.rejection_index is None:
+            return
+        if self._rejection_collection_absent or self._rejection_leg_stopped:
+            return
+        may_create = False
+        try:
+            points = rejection_points(delta.node_id, entry.rejected_paths or "")
+            if not points:
+                # An amend to an empty field: nothing to add. The row stays for a
+                # drain to remove the old items.
+                return
+            ids = list(points)
+            may_create = not self.store.rejection_index_expects_owner_other_than(
+                delta.node_id
+            )
+            if delta.created and may_create:
+                present: AbstractSet[str] = frozenset()
+            else:
+                try:
+                    present = self.rejection_index.retrieve_present(ids)
+                except CollectionMissingError:
+                    if not may_create:
+                        self._rejection_collection_absent = True
+                        return
+                    present = frozenset()
+            missing = [pid for pid in ids if pid not in present]
+            if missing:
+                model = self.embed_provider.model_id
+                if not isinstance(model, str) or not model:
+                    raise EmbeddingError(
+                        "the embedding provider reported no model id"
+                    )
+                texts = [points[pid].text for pid in missing]
+                n = fit_batch(texts)
+                vectors = self.embed_provider.embed_documents(texts[:n])
+                if not (
+                    isinstance(vectors, list)
+                    and len(vectors) == n
+                    and all(isinstance(v, list) and v for v in vectors)
+                ):
+                    raise EmbeddingError(
+                        "the embedding provider answered a document batch with the "
+                        "wrong shape"
+                    )
+                self.rejection_index.upsert_points(
+                    [
+                        RejectionPoint(pid, delta.node_id, vector)
+                        for pid, vector in zip(missing[:n], vectors)
+                    ],
+                    model=model,
+                    may_create=may_create,
+                )
+                landed = n == len(missing)
+            else:
+                landed = True
+            if delta.created and landed:
+                try:
+                    self.store.clear_rejection_backlog_row(
+                        delta.node_id, enqueue_seq=seq
+                    )
+                except Exception as exc:
+                    # The items landed; only the clear failed. Say so, rather than
+                    # the not-indexed line, and leave the row (a drain finds every
+                    # item present and clears it). One owner, no latch.
+                    self._warn_rejection_row_not_cleared(entry, exc)
+        except CollectionMissingError as exc:
+            if not may_create:
+                # Deleted between the probe and the write: the steady-state absence,
+                # silent as the probe's. The batch is spent and lost (bounded to one).
+                self._rejection_collection_absent = True
+                return
+            # The create ran and the retry still answered missing: the endpoint is
+            # broken for this write, a refusal of one owner, not a latch.
+            self._warn_rejection_items_not_indexed(entry, exc)
+        except VectorStoreUnreachableError as exc:
+            self._rejection_leg_stopped = True
+            self._warn_rejection_items_not_indexed(entry, exc)
+        except EmbeddingError as exc:
+            if classify_provider_error(exc) in (AUTH, QUOTA, TRANSIENT):
+                self._rejection_leg_stopped = True
+            self._warn_rejection_items_not_indexed(entry, exc)
+        except Exception as exc:
+            # A refusal (``VectorStoreError``), a store fault, a caller's
+            # ValueError: one owner's leg, no latch. A racing create's 409 is not
+            # among them: the client reads it as "exists" and writes.
+            self._warn_rejection_items_not_indexed(entry, exc)
+
+    def _warn_rejection_items_not_indexed(
+        self, entry: ParsedEntry, exc: BaseException
+    ) -> None:
+        """Prints the rejection leg's one failure line on stderr.
+
+        It names the selectored ``sync``: a failure arises only where a write was
+        attempted, so the collection exists or the write was licensed, and the next
+        ``sync``'s rejection drain does act on the row. stderr only, never an MCP
+        payload — the channel the decision leg's ``reconcile`` line already uses.
+        """
+        try:
+            print(
+                f"[Warning] Rejected items for '{entry.slug}' were not indexed: "
+                f"{describe_embed_failure(exc)}. Its rejection backlog row stays queued; "
+                f"the next `mitos sync {shell_flag('-p', self.config.project)}` "
+                f"retries it.",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+
+    def _warn_rejection_row_not_cleared(
+        self, entry: ParsedEntry, exc: BaseException
+    ) -> None:
+        """Prints the line for a write that landed and a clear that failed.
+
+        Like :meth:`_warn_rejection_items_not_indexed`, it names the selectored
+        ``sync``, whose drain finds every item present and clears the row.
+        """
+        try:
+            print(
+                f"[Warning] Rejected items for '{entry.slug}' were indexed, but its "
+                f"rejection backlog row could not be cleared: "
+                f"{describe_embed_failure(exc)}. The row stays queued; the next "
+                f"`mitos sync {shell_flag('-p', self.config.project)}` clears it.",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+
+    def drain_pending_embeddings(
+        self, *, listing: Optional[AbstractSet[str]] = None
+    ) -> DrainOutcome:
+        """Drains the decision outbox (``pending_embeddings``, C2) in one walk.
+
+        This is the decision drain; "the drain" below means it. The rejection
+        backlog has a drain of its own, :meth:`drain_rejection_backlog`, with its
+        own lock and its own seed marker.
+
+        **The walk.** The outbox is read in queue order, ``(queued_at, node_id)``, a
+        claim-sized page at a time, each page keyed after the last row walked. The
+        read is a plain ordered ``SELECT``, not a claim: two concurrent drainers can
+        both process a row, which costs an idempotent upsert and at worst a second
+        embed. Each row standing at entry is attempted once per walk. A row that
+        fails for a reason of its own (the provider classifier's ``unknown``, or a
+        fault after the embed) keeps its place and gains one retry, and the walk
+        moves on to the rows behind it, so no head of failing rows can stop a later
+        drain (ADR ``backlog-drains-never-let-a-failing-or-held-row-block-the-rows-behind-it``).
+        A row enqueued mid-walk is re-stamped ahead of the cursor and taken in the same
+        walk. An **outage** stops the walk at once: the embed call failing ``auth``,
+        ``quota`` or ``transient``, or the vector store failing the write with anything
+        but a missing collection. The row the outage hit still gains its retry, exactly
+        as every failure always has; the gain is that an outage charges one row, not
+        every row behind it. There is no backoff: the next drain is the retry.
+
+        **The seed marker.** Whether this drain may create an absent collection is not a
+        property of the call site: ``--embed-only`` is a drain with no buffer at all, so
+        its covering-ness is outbox state a prior command established. The
+        ``embedding_seed`` marker carries it — stamped by ``rebuild``/``cutover``'s
+        prune and by ``reconcile``'s enqueue. It has two readers: this drain, which acts
+        on it, and ``mitos status``, which prints it. It is read **once at entry**, so a
+        concurrent drainer cannot flip it mid-walk.
+
+        Under a standing marker the drain lists the collection's point ids once, and a
+        row whose point is already present is removed without embedding or reading its
+        node: a content-derived point id means presence is the right vector under the
+        same model (ADR ``mass-seed-drain-skips-present-points-under-the-seed-marker-an-ordinary-drain-re-upserts``).
+        The residual is known: a per-commit row queued for a present node while a
+        marker stands is skipped too, so a renamed decision's payload slug waits for
+        that node's next commit. With no marker nothing is listed and every row is
+        embedded and upserted, which is what heals such a payload.
+
+        The marker is **spent** when the drain finds its backlog empty, or when its walk
+        completes with the collection present (the listing found it, or a write in this
+        drain created it). A walk that completes with the collection still absent spends
+        it only if the backlog reads empty afterwards. An outage, a refusal, a failed
+        read or an exception escaping the walk **keeps** it: spending is never in a
+        ``finally``. Only the marker this drain read is spent; one re-stamped while it
+        ran survives (ADR ``seed-marker-is-spent-once-a-drain-has-attempted-every-row-standing-at-its-entry``).
+
+        It is emphatically *not* an inferred comparison of outbox size against the
+        decision index's expected set — that is not a completeness measure (the outbox
+        can hold rows for nodes that have left the graph), it is more expensive than the
+        signals it would replace, and it decays silently once a migration hands every
+        project a clean collection.
+
+        Args:
+            listing: A point-id listing of a **present** collection that the caller has
+                already taken (``reconcile_embeddings``, which just listed it to diff).
+                Consulted only when a seed marker stands at entry, and then it replaces
+                the walk's own listing, exactly as a normal listing return would — so a
+                reconcile scrolls the collection once, not twice. With no marker it is
+                ignored. A caller that met ``CollectionMissingError`` passes nothing, so
+                this walk lists for itself and the absent-collection spend rule applies
+                untouched; a handed listing must never fake a present collection.
+
+        Returns:
+            The walk's :class:`DrainOutcome`. ``reconcile_embeddings`` reports from it;
+            ``sync`` ignores it.
         """
         if not self.embed_provider or not self.vector_store:
             print("Cannot drain outbox: Embedding provider or vector store down.")
-            return
+            return DrainOutcome(0, 0, 0, 0, stop=DRAIN_STOP_UNAVAILABLE, marker=None)
 
-        import uuid
         drainer_id = f"drainer-{uuid.uuid4()}"
 
         # Declared intent, from the state a prior command established (read once).
-        may_create = self.store.embedding_seed() is not None
+        seed = self.store.embedding_seed()
+        may_create = seed is not None
 
-        printed_header = False
-        total_drained = 0
-        # Set by the refusal arm below; the refusal must escape BOTH loops (the per-item
-        # `for` and the enclosing claim-batch `while`), and a bare `break` leaves only
-        # the inner one.
-        refused = False
+        written = skipped = pruned = failed = 0
+
+        def outcome(stop: Optional[str], marker: Optional[str]) -> DrainOutcome:
+            # Every exit after a skip says how many rows it skipped: a skip prints no
+            # per-row line, so an outage after hundreds of skips would otherwise hide them.
+            if skipped:
+                print(
+                    f"Skipped {skipped} already-indexed row(s): the embedding queue was "
+                    f"seeded by `{seed['established_by']}`."
+                )
+            return DrainOutcome(written, skipped, pruned, failed, stop=stop, marker=marker)
+
+        kept = DRAIN_MARKER_KEPT if seed is not None else None
+
         try:
-            # Drain the outbox in claim-batches until it is EMPTY. A single call must
-            # not stop after one `limit`-sized batch: a corpus with more than `limit`
-            # unembedded nodes — the common state right after `mitos rebuild`/`cutover`,
-            # which re-seed the outbox with the whole active set — would otherwise be
-            # left with `vectors < nodes` until the operator happened to run `sync`
-            # again (the documented single-`sync` re-embed silently under-delivering).
-            #
-            # Progress guard: a batch that resolves ZERO rows (every claimed row errored
-            # — e.g. an embedding-provider 429/outage) breaks the loop rather than
-            # re-claiming the same failing rows forever. Those rows keep their
-            # incremented `retry_count` and drain on a later sync — fail-fast in
-            # aggregate: one outage costs one batch of attempts, not a hot spin. An
-            # orphan row (node gone from the graph) counts as resolved (it LEAVES the
-            # outbox), so a batch of orphans still makes progress and the loop continues.
-            while True:
+            try:
+                pending = self.store.claim_pending_embeddings(
+                    drainer_id, limit=_DRAIN_CLAIM_SIZE
+                )
+            except Exception as e:
+                print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+                return outcome(DRAIN_STOP_CLAIM_FAILED, kept)
+
+            if not pending:
+                # Nothing to deliver: whatever coverage the marker claimed is moot, so
+                # it is spent. Never lists the collection.
+                if seed is None:
+                    return outcome(None, None)
+                return outcome(None, self._spend_embedding_seed(seed))
+
+            # Under the marker, one listing for the whole walk — the caller's, when it
+            # handed one (always of a present collection), else our own. A normal return
+            # means the collection is present, whatever it holds — an empty set included.
+            present: AbstractSet[str] = set()
+            collection_present = False
+            if seed is not None:
                 try:
-                    pending = self.store.claim_pending_embeddings(drainer_id, limit=10)
-                except Exception as e:
-                    print(f"[Warning] Failed to claim outbox queue: {str(e)}")
-                    return
+                    present = self.vector_store.list_point_ids() if listing is None else listing
+                    collection_present = True
+                except CollectionMissingError:
+                    present = set()
+                except VectorStoreError as e:
+                    print(
+                        f"Stopping the drain before any row: the vector store could not "
+                        f"list the collection ({str(e)}). The queue is unchanged; the "
+                        f"next `mitos sync` retries."
+                    )
+                    return outcome(DRAIN_STOP_OUTAGE, kept)
 
-                if not pending:
-                    # The outbox is empty: any coverage the marker claimed has been
-                    # delivered (or there was nothing to deliver), so the claim is spent
-                    # and must stop authorizing creation. Clearing here covers both the
-                    # drained-to-empty exit and an already-empty outbox on entry.
-                    self._clear_embedding_seed_best_effort()
-                    break
+            print("Draining pending embeddings queue ...")
 
-                if not printed_header:
-                    print("Draining pending embeddings queue ...")
-                    printed_header = True
-
-                batch_resolved = 0  # rows that LEFT the outbox this batch (embedded or orphan-pruned)
+            while pending:
                 for item in pending:
                     node_id = item["node_id"]
+
+                    if seed is not None and hash_to_uuid(node_id) in present:
+                        # Presence-skip: before `get_node`, so a skipped row costs no
+                        # graph read and no provider call. A present point whose node
+                        # has left the graph is skipped too; the point is an orphan
+                        # for the collector, not for this drain.
+                        try:
+                            self.store.remove_pending_embedding(node_id)
+                            skipped += 1
+                        except Exception as e:
+                            failed += 1
+                            self._increment_pending_best_effort(node_id)
+                            print(f"[Warning] Failed to clear an already-indexed outbox row: {str(e)}")
+                        continue
 
                     # Fetch node details from graph for Qdrant payload
                     node = self.store.get_node(node_id)
                     if not node:
-                        # Node has been deleted from graph; remove from queue
+                        # The node left the graph. Close to unreachable in production:
+                        # `pending_embeddings.node_id` is a foreign key to `nodes`, so
+                        # only a store opened with foreign keys off can leave this row.
                         try:
                             self.store.remove_pending_embedding(node_id)
-                            batch_resolved += 1
+                            pruned += 1
                         except Exception:
                             pass
                         continue
@@ -2834,6 +4277,8 @@ class MitosSyncManager:
                         topic=node.get("topic"), questions_raised=node.get("questions_raised"),
                     )
 
+                    # ``state`` is an inert literal no reader trusts (M3): a retired
+                    # decision's point carries "active" too. Do not "fix" it.
                     payload = {
                         "slug": node["slug"],
                         "scope": node["scope"],
@@ -2842,52 +4287,82 @@ class MitosSyncManager:
                         "embedding_text": embed_text
                     }
 
+                    # The embed call has a try of its own: only ITS exception is
+                    # classified (a store or graph error's text can carry "429").
                     try:
-                        # 1. Fetch embedding vector
                         vector = self.embed_provider.get_embedding(embed_text, is_query=False)
-                        # 2. Upsert to Qdrant
+                    except Exception as e:
+                        cause = classify_provider_error(e)
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        if cause in _DRAIN_OUTAGE_CAUSES:
+                            print(
+                                f"Stopping the drain: the embedding provider is unavailable "
+                                f"({cause}). The rows behind this one stay queued for the "
+                                f"next `mitos sync`."
+                            )
+                            return outcome(DRAIN_STOP_OUTAGE, kept)
+                        continue
+
+                    try:
                         self.vector_store.upsert(
                             node_id, vector, payload, may_create=may_create
                         )
-                        # 3. Clean up queue row on success
-                        self.store.remove_pending_embedding(node_id)
-                        batch_resolved += 1
-                        total_drained += 1
-                        print(f"Successfully drained embedding for '{node['slug']}' ✓")
                     except CollectionMissingError:
-                        # Ahead of the generic arm below, and deliberately quiet: a
-                        # refusal is a property of the whole drain, not of this row, so
-                        # it costs ONE calm line and stops immediately rather than
-                        # repeating per node. And NO `increment_pending_attempts` — the
-                        # row was not rejected, the drain declined; inflating a counter
-                        # that exists to describe genuine failure would poison it.
+                        # Ahead of the VectorStoreError arm (it is a subclass), and
+                        # deliberately quiet: a refusal is a property of the whole drain,
+                        # not of this row, so it costs ONE calm line and stops
+                        # immediately. And NO `increment_pending_attempts` — the row was
+                        # not rejected, the drain declined; inflating a counter that
+                        # exists to describe genuine failure would poison it.
                         print(
                             "Stopping the drain: the Qdrant collection is missing and no "
                             "covering re-embed has been requested, so writing now would "
                             "index only part of the corpus. Run `mitos reconcile` to "
                             "rebuild it in one pass."
                         )
-                        refused = True
-                        break
-                    except Exception as e:
-                        # Increment retry count on failure (which also releases this row)
-                        try:
-                            self.store.increment_pending_attempts(node_id)
-                        except Exception:
-                            pass
+                        return outcome(DRAIN_STOP_REFUSED, kept)
+                    except VectorStoreError as e:
+                        # A store outage: the point id, vector and payload are well-formed
+                        # by construction, so a fault on the write belongs to the store,
+                        # and trying the next row would only spend another embedding.
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
                         print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        print(
+                            "Stopping the drain: the vector store failed the write. The "
+                            "rows behind this one stay queued for the next `mitos sync`."
+                        )
+                        return outcome(DRAIN_STOP_OUTAGE, kept)
+                    except Exception as e:
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        continue
 
-                # The refusal escapes the claim-batch loop too — the inner `break` only
-                # left the per-item one, and re-claiming would meet the same absent
-                # collection. The marker (if any) is deliberately RETAINED: rows remain,
-                # so the coverage claim still holds for the next drain.
-                if refused:
-                    break
+                    # Written: the collection exists now, whatever the listing said.
+                    collection_present = True
+                    try:
+                        self.store.remove_pending_embedding(node_id)
+                    except Exception as e:
+                        # The point is written; the row stays and the next drain
+                        # re-upserts it (a cache hit).
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        continue
+                    written += 1
+                    print(f"Successfully drained embedding for '{node['slug']}' ✓")
 
-                # Nothing left the outbox this batch — every claimed row errored (a
-                # dead/erroring provider). Stop; re-claiming would return the same rows.
-                if batch_resolved == 0:
-                    break
+                cursor = (pending[-1]["queued_at"], pending[-1]["node_id"])
+                try:
+                    pending = self.store.claim_pending_embeddings(
+                        drainer_id, limit=_DRAIN_CLAIM_SIZE, after=cursor
+                    )
+                except Exception as e:
+                    print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+                    return outcome(DRAIN_STOP_CLAIM_FAILED, kept)
         finally:
             # Clean up: release any remaining locks held by this specific drainer
             try:
@@ -2895,52 +4370,317 @@ class MitosSyncManager:
             except Exception:
                 pass
 
-    def _clear_embedding_seed_best_effort(self) -> None:
+        if seed is None:
+            return outcome(None, None)
+        if collection_present:
+            return outcome(None, self._spend_embedding_seed(seed))
+        # The collection is still absent (nothing written). Spend only if nothing is
+        # left to cover — read, never inferred from `failed == 0`: a row queued behind
+        # the cursor mid-walk is invisible to the walk.
+        try:
+            empty = self.store.claim_pending_embeddings(drainer_id, limit=1) == []
+        except Exception as e:
+            print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+            return outcome(None, DRAIN_MARKER_KEPT)
+        if empty:
+            return outcome(None, self._spend_embedding_seed(seed))
+        return outcome(None, DRAIN_MARKER_KEPT)
+
+    def _increment_pending_best_effort(self, node_id: str) -> None:
+        """Moves a failed row's retry count, swallowing a store fault (as always)."""
+        try:
+            self.store.increment_pending_attempts(node_id)
+        except Exception:
+            pass
+
+    def _spend_embedding_seed(self, seed: Dict[str, str]) -> str:
+        """Spends the marker the drain read, and reports which way it went.
+
+        Args:
+            seed: The marker as the drain read it at entry.
+
+        Returns:
+            ``DRAIN_MARKER_SPENT``, or ``DRAIN_MARKER_KEPT`` when the clear failed.
+        """
+        if self._clear_embedding_seed_best_effort(established_at=seed["established_at"]):
+            return DRAIN_MARKER_SPENT
+        return DRAIN_MARKER_KEPT
+
+    def _clear_embedding_seed_best_effort(self, *, established_at: Optional[str] = None) -> bool:
         """Clears the coverage marker, reporting rather than raising on failure.
 
         The clear is bookkeeping on a delivered claim, not part of the drain's product,
         so a graph fault here must not turn a fully-drained outbox into a failed
         ``sync``. Failing to clear is also the *safe* direction — the marker only ever
-        authorizes a covering drain, and the next one re-reads the (now empty) outbox
-        and clears it again.
-        """
-        try:
-            self.store.clear_embedding_seed()
-        except Exception as e:
-            print(f"[Warning] Failed to clear the embedding seed marker: {str(e)}")
+        authorizes a covering drain, and the next one re-reads the outbox and spends it
+        again.
 
-    def reconcile_embeddings(self) -> Dict[str, int]:
-        """Re-embeds active nodes missing from Qdrant, then drains the outbox.
-
-        Heals the gap Fix 1's drain cannot reach: when Qdrant is wiped directly
-        (a bare ``curl -X DELETE`` of the collection) WITHOUT a ``rebuild``/
-        ``cutover`` — which re-seed the outbox — the graph has nodes, Qdrant has
-        none, and the outbox is empty, so ``sync`` drains nothing. This pass
-        diffs the graph's ACTIVE node set against Qdrant's actual point ids,
-        enqueues every missing active node, and drains.
-
-        Only the active surface is reconciled (``get_active_node_ids``): dead and
-        superseded nodes are intentionally not re-embedded (retrieval filters
-        them via ``has_id`` and never returns them — see the
-        ``cutover-bounds-embedding-seed-to-active`` decision). Bounded to one
-        paginated scroll + a set difference (no per-node probes), so it stays
-        cheap at the P11 horizon. Idempotent: a second run finds nothing missing
-        and enqueues nothing. Re-queued nodes hit the embedding cache, so the
-        heal costs no embedding-API calls when the text is unchanged.
+        Args:
+            established_at: The stamp of the marker read at the drain's entry; the
+                delete spends only that marker, so a re-stamp made meanwhile survives.
 
         Returns:
-            Counts ``{"active", "present", "enqueued"}`` — active nodes, points
-            already in Qdrant, and nodes enqueued for re-embedding.
+            True when the delete ran, False when it failed.
+        """
+        try:
+            self.store.clear_embedding_seed(established_at=established_at)
+        except Exception as e:
+            print(f"[Warning] Failed to clear the embedding seed marker: {str(e)}")
+            return False
+        return True
+
+    def drain_rejection_backlog(self, *, report: bool = True) -> RejectionDrainOutcome:
+        """Drains the rejection backlog in one walk: each owner's items replaced whole.
+
+        The only writer that removes from the rejection index (ADR
+        ``rejection-index-inline-writes-only-add-and-only-one-drain-at-a-time-removes``).
+        It never raises: every exit returns an outcome, an escaped fault included
+        (worded, ``stop="unavailable"``, the marker kept). It is silent and returns
+        ``stop="unavailable"`` when the provider or the rejection index is None: the
+        decision drain has already said so on the same output.
+
+        **One at a time.** The walk runs under a non-blocking operating-system lock of
+        its own, :func:`rejection_drain_lock_path`, taken before any read and released
+        when the walk ends or its process dies: never a lease in the graph, never the
+        ``decisions.md`` lock, never taken by an inline write. A drain that finds it
+        held returns ``held`` having read and written nothing, leaving the backlog to
+        the holder (ADR ``rejection-backlog-hold-dies-with-its-writer-and-the-record-path-never-waits-on-it``).
+        A held lock file a killed holder left behind is acquired over, never unlinked.
+
+        **The walk.** Rows are read in ``enqueue_seq`` order, a page at a time, keyed
+        after the last seq walked, so each row standing at entry is attempted once.
+        Per row: the seq is read (the claim), **then** the owner's raw field; the
+        expected items are the field's ``rejection_points``; what the owner holds is
+        listed; the items it lacks are written (those held are skipped and counted),
+        and only once every one has landed are the items its field no longer states
+        deleted by point id, and the row cleared against the seq read. A clear that
+        answers False means a commit re-queued the owner; its new row lies ahead of
+        the cursor, so this walk takes it again, listing afresh, and converges it on
+        the latest field (ADR ``rejection-drain-retakes-an-owner-it-left-standing-only-overlapping-inline-writes-wait``).
+        An interrupted owner keeps old and new items, never none.
+
+        **Batches and failure.** The page's texts are cut into cross-owner batches by
+        ``fit_batch``, one ``embed_documents`` call and one upsert each, and an owner
+        is finalized as soon as its last item lands. An ``auth``, ``quota`` or
+        ``transient`` embed cause, an unreachable store, or a listing the store
+        refused stops the drain at once (``outage``) and charges no row. An absent
+        collection with no marker stops it (``refused``), creating and embedding
+        nothing. A batch failing for any other reason is retried owner by owner, and
+        a solo failure notes that owner's row once against its seq and aborts the
+        owner for this take (its tail is dropped, nothing of it is removed or
+        cleared), while the walk goes on (ADRs ``backlog-drains-never-let-a-failing-or-held-row-block-the-rows-behind-it``,
+        ``rejection-drain-charges-a-row-only-for-its-own-failure-never-for-an-outage-or-refusal``).
+
+        **The marker** (``rejection_seed``, never the decision index's) is read once
+        at entry. Only a standing marker licenses creating the collection, and it
+        makes the drain list the whole index once, with owners, instead of each
+        owner; a row queued after that listing is listed afresh. It is spent by 3a's
+        rule: on an empty backlog, or when the walk completes with the collection
+        present, or completes with it absent and a fresh read finds no row; an
+        outage, a refusal, a read fault or an escaped exception keeps it, and only
+        the marker this drain read is spent (ADR
+        ``seed-marker-is-spent-once-a-drain-has-attempted-every-row-standing-at-its-entry``).
+        Its four producers are the operator's covering acts, never a read, a record or
+        a check (``migrations.REJECTION_SEED_ESTABLISHED_BY``): ``reconcile``, when it
+        queued an owner the index lacked; ``rebuild`` and ``cutover``, in the aside
+        transaction beside the decision marker; and an import into a graph that held no
+        decision. Without one, an absent collection makes the drain refuse, naming
+        ``mitos reconcile``.
+
+        Args:
+            report: Print the summary lines (:func:`rejection_drain_report`) after
+                the walk. ``reconcile`` passes False and its renderer prints them.
+
+        Returns:
+            The walk's :class:`RejectionDrainOutcome`, with ``left_queued`` and
+            ``owners_past_tolerance`` read at exit.
+        """
+        if self.embed_provider is None or self.rejection_index is None:
+            return self._rejection_drain_unavailable()
+
+        lock = FileLock(rejection_drain_lock_path(self.config), timeout=0)
+        try:
+            lock.acquire()
+        except Timeout:
+            # Ahead of OSError, which Timeout subclasses.
+            print(
+                "Rejection index: another drain holds the rejection backlog; this one "
+                "leaves it to that drain."
+            )
+            return RejectionDrainOutcome(
+                0, 0, 0, 0, 0, None, 0, None,
+                stop=REJECTION_DRAIN_STOP_HELD, marker=None,
+            )
+        except OSError as e:
+            # Not another drain's hold: the lock could not be taken at all.
+            print(
+                f"[Warning] The rejection backlog was not drained: its lock could not "
+                f"be taken ({e})."
+            )
+            return self._rejection_drain_unavailable()
+
+        walk = _RejectionDrainWalk(self)
+        try:
+            try:
+                stop, marker = walk.run()
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection drain stopped: {describe_embed_failure(e)}. "
+                    f"Its rows stay queued."
+                )
+                stop, marker = DRAIN_STOP_UNAVAILABLE, walk.kept()
+            left, past = self._rejection_backlog_counts()
+        finally:
+            lock.release()
+
+        outcome = RejectionDrainOutcome(
+            walk.owners_cleared, walk.items_embedded, walk.items_skipped_present,
+            walk.items_removed, walk.owners_failed, past, walk.calls, left,
+            stop=stop, marker=marker,
+        )
+        if report:
+            for line in rejection_drain_report(outcome.to_dict()):
+                print(line)
+        return outcome
+
+    def _rejection_backlog_counts(self) -> Tuple[Optional[int], Optional[int]]:
+        """Reads the standing rows and those past the tolerance; None when unreadable."""
+        try:
+            left: Optional[int] = self.store.count_rejection_backlog()
+            past: Optional[int] = self.store.count_rejection_backlog(
+                min_retry=REJECTION_BACKLOG_FAILURE_TOLERANCE
+            )
+        except Exception:
+            left = past = None
+        return left, past
+
+    def _rejection_drain_unavailable(self) -> RejectionDrainOutcome:
+        """The outcome of a drain that did not run, its two counts read."""
+        left, past = self._rejection_backlog_counts()
+        return RejectionDrainOutcome(
+            0, 0, 0, 0, 0, past, 0, left, stop=DRAIN_STOP_UNAVAILABLE, marker=None,
+        )
+
+    def reconcile_embeddings(self) -> Dict[str, Any]:
+        """Heals both indexes: embeds what each is missing, drains, then collects what is dead.
+
+        Heals the gap an ordinary drain cannot reach: when Qdrant is wiped directly
+        (a bare ``curl -X DELETE`` of the collection) WITHOUT a ``rebuild``/
+        ``cutover`` — which re-seed the outbox — the graph has nodes, Qdrant has
+        none, and the outbox is empty, so ``sync`` drains nothing. This pass diffs
+        the decision index's **expected set**
+        (:meth:`~mitos.store.GraphStore.get_decision_index_expected_ids`: every
+        decision, live or retired, plus the active open questions) against Qdrant's
+        actual point ids, enqueues every missing node, and drains. It is the same
+        read ``mitos status`` reports completeness against, so the heal clears its
+        own warning by construction.
+
+        A retired decision is seeded like a live one: its vector lives exactly as
+        long as its node, and the read surfaces partition it by computed state (ADR
+        ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``).
+        Bounded to one paginated scroll + a set difference (no per-node probes), so
+        it stays cheap at the P11 horizon, and the drain is handed that same listing
+        rather than scrolling again. Idempotent: a second run finds nothing missing
+        and enqueues nothing. Re-queued decision nodes hit the embedding cache, so
+        the decision half costs no embedding-API calls when the text is unchanged;
+        the rejection index keeps no cache (below).
 
         An **absent collection reads as empty**, not as an error: it is the very
         state this heal exists for (a wipe, or a rename that left the old name
-        behind), so every active node is missing and every one gets enqueued — the
-        drain's first upsert then creates the collection. Only genuine
+        behind), so every expected node is missing and every one gets enqueued —
+        the drain's first upsert then creates the collection. Only genuine
         unreachability raises.
+
+        **The collection** (the index's death story, P4). After the drain the graph
+        is read — active ids, then every node id — and the listing is partitioned
+        (:func:`~mitos.vector_store.partition_points`, the one partition ``status``
+        applies too): points of retired nodes are history and kept, killed open
+        questions included; points whose node is not in the graph are garbage and
+        are deleted by their listed id (ADR
+        ``reconcile-heals-every-decision-vector-and-collects-only-node-less-points``).
+        The graph read comes **after** the listing: a write commits its node before
+        it upserts its point, so every listed point's node is committed by then, and
+        a record landing mid-collection keeps its point. The delete runs in chunks of
+        ``_ORPHAN_DELETE_CHUNK``; a refused chunk is counted in ``delete_failed`` and
+        the next is tried, while an unreachable Qdrant or a missing collection stops
+        the loop and counts every unconfirmed id as failed. A foreign point written
+        into this workspace's collection by another workspace sharing it is node-less
+        here and is deleted too — accepted, because nothing deleted is beyond a
+        re-seed.
+
+        **Over a graph holding no nodes, nothing is judged and nothing is deleted.**
+        Every listed point would look node-less there (a clone without its gitignored
+        graph file), so a heal that trusted that would wipe the collection of every
+        such workspace at once — P5's cascade. The guard keys on the **node count**,
+        never on :func:`~mitos.recall.missing_graph_is_a_gap`: that predicate also
+        asks the corpus, and ``corpus_holds_entries`` reads an unreadable file as
+        empty, so a zero-node graph beside an unreadable ``decisions.md`` would read
+        as "built and empty" and lose every point. The predicate answers
+        ``graph_unbuilt`` instead, so ``cmd_reconcile`` names ``mitos rebuild``
+        exactly when ``status``' unbuilt rung does.
+
+        **The rejection index** (R1–R5, after the decision heal, each step in a
+        bulkhead of its own). Its expected set is computable from the graph alone —
+        every decision's ``rejected_paths``, enumerated by the one leaf
+        (:func:`~mitos.rejections.expected_rejection_points`) — and it is diffed by
+        point id (:func:`~mitos.rejections.diff_rejection_index`), the same diff
+        ``status`` words, so the heal clears its own warning. R1 reads the owners'
+        fields, R2 lists the whole index once with owners (absent reads as empty),
+        R3 queues every owner lacking an item (a standing row is never touched) and
+        stamps ``rejection_seed("reconcile")`` when anything is missing, R4 is the
+        rejection drain (it lists for itself and, under that marker, creates an
+        absent collection and writes every item), and R5 deletes the listing's
+        stale items (an owner that no longer states them) and orphaned ones (an
+        owner not in the graph, or unnamed) — judged against a graph read taken
+        after the listing, under the drain's lock, and never over a graph holding
+        no node (:meth:`_collect_rejection_index`). The items bypass the embedding
+        cache: a first build or a lost collection pays one embedding per item, the
+        missing count ``status`` prices. With no provider or no rejection index,
+        nothing of it runs, silently.
+
+        Precedence for the partition keys, first match wins (the same rule
+        ``status`` applies): the graph pair could not be read, or the provider-down
+        return → ``None``/``None``; an empty listing (absent collection, or no
+        point) → ``0``/``0`` on any graph; a non-empty listing over a graph holding
+        no nodes → ``None``/``None``; otherwise the partition's counts.
+
+        Returns:
+            The shipped keys ``active`` (active-node count), ``present`` (the
+            collection's point count, retired and orphan points included) and
+            ``enqueued`` (nodes this reconcile enqueued), plus ``expected`` (the
+            expected set's size), ``expected_present`` (``expected - enqueued``:
+            the part already indexed), ``written`` and ``drain_stop`` (the drain's
+            :class:`DrainOutcome` ``written`` / ``stop``; ``0`` / ``None`` when
+            nothing was missing and no drain ran) and ``left_queued`` (the outbox
+            rows standing when this returns, read — never inferred from the drain's
+            counters, which count only rows attempted). Then the collection's:
+            ``retired_node_points`` and ``nodeless_points`` (the listing's history
+            and garbage buckets, ``None`` when not judged — see the precedence
+            above); ``deleted`` (node-less points whose delete Qdrant confirmed);
+            ``delete_failed`` (node-less points refused or unconfirmed — still
+            there, and the next reconcile retries them); and ``graph_unbuilt``
+            (``missing_graph_is_a_gap``'s answer, ``status --json``'s
+            ``checks.graph_unbuilt``). The partition counts describe the listing
+            this call judged, not the collection after its writes, so
+            ``retired_node_points`` plus the retired points ``written`` here is
+            roughly ``status``' next count. Last, ``rejection_drain``: the
+            rejection backlog's drain, :meth:`RejectionDrainOutcome.to_dict`
+            (``stop="unavailable"`` with its counts read when the drain did not
+            run or raised), and beside it ``rejection_index``: ``expected_items``,
+            ``expected_owners``, ``present_items``, ``collection_present``,
+            ``missing_items`` (R3's count: what this reconcile set out to embed),
+            ``owners_queued``, ``seed_stamped``, ``stale_items`` and
+            ``orphan_items`` (the listing as R5 judged it; None unless
+            ``judged``), ``deleted``, ``delete_failed`` and ``collected`` (one of
+            :data:`REJECTION_COLLECT_OUTCOMES`); a count not computed is None.
+            Every return path carries the same key set.
 
         Raises:
             VectorStoreError: If Qdrant is unreachable while scrolling point ids.
-                A *missing collection* does not raise (see above).
+                A *missing collection* does not raise (see above), and no delete
+                fault escapes: each is counted in ``delete_failed``. That raise
+                carries no result, so no ``rejection_drain`` either: it happens
+                before either drain runs.
         """
         if not self.embed_provider or not self.vector_store:
             # stderr, not stdout: `mitos reconcile --json` promises stdout carries
@@ -2953,36 +4693,362 @@ class MitosSyncManager:
                 "Cannot reconcile: Embedding provider or vector store down.",
                 file=sys.stderr,
             )
-            return {"active": 0, "present": 0, "enqueued": 0}
+            # Nothing was read or done, so the counts are 0 — except ``left_queued``,
+            # which is a read of the standing outbox on every path: rows queued before
+            # this call still stand, and 0 would tell the operator nothing is waiting.
+            return {
+                "active": 0, "present": 0, "enqueued": 0,
+                "expected": 0, "expected_present": 0,
+                "written": 0, "left_queued": len(self.store.get_pending_embeddings()),
+                "drain_stop": None,
+                # Nothing was listed, so nothing was judged or collected. The unbuilt
+                # answer is still computed: it is a graph-and-corpus read, and a
+                # keyless clone is still a clone.
+                "retired_node_points": None, "nodeless_points": None,
+                "deleted": 0, "delete_failed": 0,
+                "graph_unbuilt": self.is_graph_unbuilt(),
+                # Not drained (no provider); its two counts are still read.
+                "rejection_drain": self._rejection_drain_unavailable().to_dict(),
+                "rejection_index": self._rejection_index_unavailable(),
+            }
 
-        active_ids = self.store.get_active_node_ids()
+        expected_ids = self.store.get_decision_index_expected_ids()
+        # The live surface, for the shipped ``active`` count only — never what to seed.
+        active_count = len(self.store.get_active_node_ids())
+        listed = False
         try:
             present = self.vector_store.list_point_ids()
+            listed = True
         except CollectionMissingError:
             # Narrow by design: a connection-level VectorStoreError must keep
             # propagating so `mitos reconcile` can still report Qdrant down.
             present = set()
-        missing = [nid for nid in active_ids if hash_to_uuid(nid) not in present]
+        missing = [nid for nid in expected_ids if hash_to_uuid(nid) not in present]
 
         for node_id in missing:
             self.store.add_pending_embedding(node_id)
 
+        written = 0
+        drain_stop: Optional[str] = None
         if missing:
-            # The enqueue above is the act that makes the outbox cover the active set,
-            # so record it before draining: the drain reads the marker, not a flag, and
-            # stamping it durably buys crash-safety for free — a reconcile that dies
-            # mid-drain leaves the marker standing, and the operator's next `sync`
-            # completes the heal instead of refusing it. This is one of only three
-            # producers, all operator-invoked: nothing implicit ever stamps it, which is
-            # what keeps the heal operator-invoked rather than automatic.
+            # The enqueue above is the act that makes the outbox cover the decision
+            # index's expected set, so record it before draining: the drain reads the
+            # marker, not a flag, and stamping it durably buys crash-safety for free —
+            # a reconcile that dies mid-drain leaves the marker standing, and the
+            # operator's next `sync` completes the heal instead of refusing it. This is
+            # one of only three producers, all operator-invoked: nothing implicit ever
+            # stamps it, which is what keeps the heal operator-invoked rather than
+            # automatic.
             self.store.stamp_embedding_seed("reconcile")
-            self.drain_pending_embeddings()
+            # Hand over the listing only when it is one of a PRESENT collection. Over
+            # a 404 the drain lists for itself (a cheap 404), so 3a's absent-collection
+            # spend rule sees the truth rather than a faked present collection.
+            drained = self.drain_pending_embeddings(listing=present if listed else None)
+            written = drained.written
+            drain_stop = drained.stop
+
+        # The rejection index, R1–R3: measure it against the graph and queue every
+        # owner lacking an item (stamping the marker), in a bulkhead of its own — a
+        # fault leaves nothing queued or stamped and the decision heal untouched.
+        # Silent with no index (the drain is silent there too).
+        rejection_index = self._rejection_index_unavailable()
+        rejection_listing: Optional[Dict[str, Optional[str]]] = None
+        enumerated: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+        if self.rejection_index is not None:
+            try:
+                rejection_listing = self._measure_rejection_index(rejection_index, enumerated)
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection index could not be measured against "
+                    f"the graph: {describe_embed_failure(e)}",
+                    file=sys.stderr,
+                )
+                rejection_index["collected"] = REJECTION_COLLECT_UNAVAILABLE
+
+        # R4, the rejection backlog's drain, in a bulkhead of its own: a fault in it
+        # leaves the decision heal and the collection below untouched, and the key
+        # still lands (an unavailable outcome, its counts read). Before the graph
+        # read below, which judges only the decision collection's points. It lists
+        # for itself: its watermark needs its own read before its own listing.
+        try:
+            rejection = self.drain_rejection_backlog(report=False)
+        except Exception as e:
+            print(
+                f"[Warning] Rejection backlog drain failed: {describe_embed_failure(e)}",
+                file=sys.stderr,
+            )
+            rejection = self._rejection_drain_unavailable()
+
+        # R5, the rejection index's collection, after the drain and in its own
+        # bulkhead: only over a listing R2 actually made.
+        if rejection_listing is not None:
+            try:
+                self._collect_rejection_index(rejection_index, rejection_listing, enumerated)
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection index's collection stopped: {e}",
+                    file=sys.stderr,
+                )
+                rejection_index["collected"] = REJECTION_COLLECT_UNAVAILABLE
+
+        # The collection: the graph pair is read AFTER the listing (and the drain),
+        # so every listed point's node is committed by now — a write commits its node
+        # before it upserts — and a record landing mid-collection keeps its point.
+        # Active first, then every node; the partition intersects them, so a rebuild
+        # swap between the two reads cannot make an active node look node-less.
+        node_ids: Optional[AbstractSet[str]] = None
+        try:
+            active_ids = self.store.get_active_node_ids()
+            node_ids = self.store.get_all_node_ids()
+        except Exception as e:
+            # The seed above already ran; a graph fault here leaves the collection
+            # undone (not judged), it does not fail the heal.
+            print(
+                f"[Warning] Could not read the graph to judge the index's points; "
+                f"nothing was collected: {e}",
+                file=sys.stderr,
+            )
+        retired_node_points: Optional[int] = None
+        nodeless_points: Optional[int] = None
+        deleted = 0
+        delete_failed = 0
+        if node_ids is None:
+            pass  # not judged: the graph pair could not be read
+        elif not present:
+            # An empty listing is judged and empty on any graph: no point to judge.
+            retired_node_points = nodeless_points = 0
+        elif node_ids:
+            # The guard: only over a graph holding nodes. Over a zero-node graph every
+            # listed point would look node-less, so it is left not judged instead.
+            partition = partition_points(present, node_ids=node_ids, active_ids=active_ids)
+            retired_node_points = len(partition.retired_node)
+            nodeless_points = len(partition.nodeless)
+            deleted, delete_failed = self._delete_nodeless_points(partition.nodeless)
 
         return {
-            "active": len(active_ids),
+            "active": active_count,
             "present": len(present),
             "enqueued": len(missing),
+            "expected": len(expected_ids),
+            "expected_present": len(expected_ids) - len(missing),
+            "written": written,
+            # Read, never inferred: ``failed`` counts only rows attempted (an outage on
+            # row 1 of 33 reports 1 while 33 stand), and ``enqueued - written`` misses
+            # per-commit rows that were queued before this reconcile.
+            "left_queued": len(self.store.get_pending_embeddings()),
+            "drain_stop": drain_stop,
+            "retired_node_points": retired_node_points,
+            "nodeless_points": nodeless_points,
+            "deleted": deleted,
+            "delete_failed": delete_failed,
+            "graph_unbuilt": self.is_graph_unbuilt(),
+            "rejection_drain": rejection.to_dict(),
+            "rejection_index": rejection_index,
         }
+
+    def is_graph_unbuilt(self) -> bool:
+        """Answers ``status``' unbuilt-graph question, with ``status``' own predicate.
+
+        Returns:
+            True when the graph holds no node while the corpus holds entries.
+        """
+        return missing_graph_is_a_gap(
+            self.store, self.config, corpus_scan=corpus_holds_entries
+        )
+
+    def _delete_nodeless_points(self, nodeless: AbstractSet[str]) -> Tuple[int, int]:
+        """Deletes the decision collection's node-less points; counts confirmed and failed.
+
+        Args:
+            nodeless: The listed ids whose node is not in the graph.
+
+        Returns:
+            ``(deleted, delete_failed)``.
+        """
+        return self._delete_points_chunked(
+            self.vector_store, nodeless, noun="node-less point"
+        )
+
+    @staticmethod
+    def _delete_points_chunked(
+        client: Any, point_ids: AbstractSet[str], *, noun: str
+    ) -> Tuple[int, int]:
+        """Deletes listed points by id, chunk by chunk; counts confirmed and failed.
+
+        The one stop/continue rule for both indexes' collections. A chunk refused or
+        left unconfirmed (plain ``VectorStoreError``) is counted failed and the next
+        chunk is tried. An unreachable Qdrant or a missing collection stops the loop,
+        because every later chunk would meet the same fault; every id not yet
+        confirmed is counted failed. Nothing else is caught.
+
+        Args:
+            client: The collection's client (``delete_points(ids)``).
+            point_ids: The listed ids to delete.
+            noun: What a point is, singular, for the warnings.
+
+        Returns:
+            ``(deleted, delete_failed)``.
+        """
+        ids = sorted(point_ids)
+        size = _ORPHAN_DELETE_CHUNK
+        deleted = 0
+        failed = 0
+        for start in range(0, len(ids), size):
+            chunk = ids[start:start + size]
+            try:
+                client.delete_points(chunk)
+            except (VectorStoreUnreachableError, CollectionMissingError) as e:
+                failed += len(ids) - start
+                print(
+                    f"[Warning] Stopped deleting {noun}s; "
+                    f"{len(ids) - start} not deleted: {e}",
+                    file=sys.stderr,
+                )
+                break
+            except VectorStoreError as e:
+                failed += len(chunk)
+                print(
+                    f"[Warning] {len(chunk)} {noun}(s) not deleted: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            deleted += len(chunk)
+        return deleted, failed
+
+    @staticmethod
+    def _rejection_index_unavailable() -> Dict[str, Any]:
+        """``reconcile --json``'s ``rejection_index`` when nothing was measured.
+
+        Counts not computed are None; nothing was queued, stamped or deleted.
+        """
+        return {
+            "expected_items": None, "expected_owners": None, "present_items": None,
+            "collection_present": None, "missing_items": None, "owners_queued": 0,
+            "seed_stamped": False, "stale_items": None, "orphan_items": None,
+            "deleted": 0, "delete_failed": 0,
+            "collected": REJECTION_COLLECT_UNAVAILABLE,
+        }
+
+    def _measure_rejection_index(
+        self, index: Dict[str, Any], memo: Dict[Tuple[str, str], Tuple[str, ...]]
+    ) -> Dict[str, Optional[str]]:
+        """Reconcile's R1–R3: reads the owners, lists the index, queues the missing.
+
+        Fills ``index`` in place as each count is computed, so a fault part-way
+        leaves only what was really read. The owner fields are read **before** the
+        listing, for the missing count only: an item written between the two is
+        listed, so it is not queued, and an owner that changes between them is
+        queued anyway and the drain converges it. Every owner lacking an item is
+        queued (never a standing row touched), and the rejection seed marker is
+        stamped (``reconcile``) only when something is missing — the act that
+        makes the backlog cover the expected set, and so the one that licenses the
+        drain to create an absent collection.
+
+        Args:
+            index: The ``rejection_index`` dict being built.
+            memo: The command's enumeration memo, shared with R5.
+
+        Returns:
+            The listing (``{}`` for an absent collection).
+
+        Raises:
+            Exception: Any graph, listing or write fault; the caller reports it.
+        """
+        owner_fields = self.store.get_rejection_index_owner_fields()
+        expected = expected_rejection_points(owner_fields, memo)
+        index["expected_items"] = len(expected)
+        index["expected_owners"] = len(set(expected.values()))
+        try:
+            listing = self.rejection_index.list_point_owners()
+            index["collection_present"] = True
+        except CollectionMissingError:
+            listing = {}
+            index["collection_present"] = False
+        index["present_items"] = len(listing)
+        diff = diff_rejection_index(expected, listing, owners=owner_fields.keys())
+        index["missing_items"] = len(diff.missing)
+        if diff.missing:
+            index["owners_queued"] = self.store.enqueue_rejection_backlog_owners(
+                sorted(diff.missing_owners)
+            )
+            self.store.stamp_rejection_seed("reconcile")
+            index["seed_stamped"] = True
+        return listing
+
+    def _collect_rejection_index(
+        self,
+        index: Dict[str, Any],
+        listing: Dict[str, Optional[str]],
+        memo: Dict[Tuple[str, str], Tuple[str, ...]],
+    ) -> None:
+        """Reconcile's R5: deletes the listing's stale and orphaned items, under the drain lock.
+
+        The listing is judged against a graph read taken **after** it (and after
+        the drain), so an item a record or amend writes mid-collection was never
+        listed and is never judged, and a listed item its owner still states at
+        this read is expected and kept. Precedence, first match wins: an empty
+        listing is judged and empty on any graph (no lock, no second read — every
+        first build); otherwise the rejection drain's operating-system lock is
+        taken non-blocking (held → ``held``, nothing deleted; not takeable →
+        ``unavailable``); under it a graph holding no node is ``unbuilt`` (every
+        item would look ownerless — the decision collection's guard, keyed on the
+        node count); otherwise the listing is judged and its stale and orphaned
+        items are deleted by id. Every remover takes that one lock (ADR
+        ``rejection-index-removers-share-the-drain-lock-reconcile-collects-under-it``),
+        so a concurrent ``sync`` drain cannot interleave between this read and its
+        deletes. A graph fault under the lock is ``unread``. Re-deleting an item
+        the drain already removed is harmless: a delete of an absent id completes.
+
+        Args:
+            index: The ``rejection_index`` dict being built, filled in place.
+            listing: R2's listing (``listing0``).
+            memo: The command's enumeration memo, shared with R1.
+        """
+        if not listing:
+            index.update(stale_items=0, orphan_items=0, collected=REJECTION_COLLECT_JUDGED)
+            return
+        collect_lock = FileLock(rejection_drain_lock_path(self.config), timeout=0)
+        try:
+            collect_lock.acquire()
+        except Timeout:
+            # Ahead of OSError, which Timeout subclasses.
+            index["collected"] = REJECTION_COLLECT_HELD
+            return
+        except OSError as e:
+            print(
+                f"[Warning] The rejection index was not collected: the rejection "
+                f"backlog's lock could not be taken ({e}).",
+                file=sys.stderr,
+            )
+            index["collected"] = REJECTION_COLLECT_UNAVAILABLE
+            return
+        try:
+            try:
+                node_count = len(self.store.get_all_node_ids())
+                owner_fields = (
+                    self.store.get_rejection_index_owner_fields() if node_count else {}
+                )
+                expected = expected_rejection_points(owner_fields, memo)
+            except Exception as e:
+                print(
+                    f"[Warning] Could not read the graph to judge the rejection index's "
+                    f"items; nothing was deleted from it: {e}",
+                    file=sys.stderr,
+                )
+                index["collected"] = REJECTION_COLLECT_UNREAD
+                return
+            if node_count == 0:
+                index["collected"] = REJECTION_COLLECT_UNBUILT
+                return
+            diff = diff_rejection_index(expected, listing, owners=owner_fields.keys())
+            index["stale_items"] = len(diff.stale)
+            index["orphan_items"] = len(diff.orphaned)
+            index["deleted"], index["delete_failed"] = self._delete_points_chunked(
+                self.rejection_index, diff.stale | diff.orphaned, noun="rejected item"
+            )
+            index["collected"] = REJECTION_COLLECT_JUDGED
+        finally:
+            collect_lock.release()
 
     # --- record_decision: the write half of the MCP server (Fork A) ---
 
@@ -3006,6 +5072,7 @@ class MitosSyncManager:
     def _validate_relation_target(
         self, relation: str, target: str, *,
         canonical_slugs: Optional[Dict[str, str]] = None,
+        canonical_ids: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, str]]:
         """Validates a typed relation's target is a unique, EXACT-match decision.
 
@@ -3022,6 +5089,9 @@ class MitosSyncManager:
                 node is already fetched here and its slug discarded — and the pause echo
                 prints stored spellings, never caller ones. Absent on the callers that
                 do not compose an echo.
+            canonical_ids: Optional casefolded-target -> node-id map, filled from the
+                same node: the id Phase A proved unique before the commit, which the
+                acknowledged path's post-commit review exempts by (7b, D3).
 
         Returns:
             None if valid, else a structured ``{error, code}`` dict.
@@ -3029,25 +5099,29 @@ class MitosSyncManager:
         ids = self.store.resolve_slug(target)
         if not ids:
             return _record_error("relation_target_not_found", relation=relation, target=target)
-        if len(ids) > 1:
+        if _ambiguous_target(ids):
             return _record_error("relation_target_ambiguous", relation=relation, target=target)
         node = self.store.get_node(ids[0])
         if not node or node.get("slug", "").casefold() != target.casefold():
             return _record_error("relation_target_not_found", relation=relation, target=target)
         if canonical_slugs is not None:
             canonical_slugs[target.casefold()] = node["slug"]
+        if canonical_ids is not None:
+            canonical_ids[target.casefold()] = node["id"]
         return None
 
     def _review_neighbors(self, entry: ParsedEntry, declared_targets: set, *,
                           gathered_index: Optional[Dict[str, Tuple[str, float]]] = None,
                           top_k: int = CONFLICT_TOP_K,
+                          gathering_sink: Optional[List[Gathering]] = None,
                           ) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
 
         Composes the Conflict sensor's candidate stages (the same discovery `mitos
         check` uses): :func:`gather_candidates` embeds the axiom in document space,
-        over-fetches one bounded KNN window, and keeps only live *decisions* — an
-        open question in the window is screened by kind, never crashed on — then
+        fills ``CONFLICT_OVERFETCH_LIMIT`` live *decisions* from one bounded KNN call
+        resolved by point id — an open question or a retired point in the fetch takes
+        no slot — then
         :func:`screen_candidates` drops declared/self, floors at
         ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``top_k``.
         Surfacing survivors BEFORE the write is the whole point: after the commit the
@@ -3065,8 +5139,8 @@ class MitosSyncManager:
             declared_targets: Casefolded slugs the entry already links to — its declared
                 relation targets plus their transitive mutation lineage — excluded so a
                 linked neighbour is not re-flagged.
-            gathered_index: Optional sink the caller passes to keep this call's *raw*
-                gathered set, ``{casefolded slug: (stored slug, score)}``. The pause
+            gathered_index: Optional sink the caller passes to keep this call's
+                gathered live set, ``{casefolded slug: (stored slug, score)}``. The pause
                 echo partitions the caller's declarations against the gathered
                 candidates and the floor — the primary sets (M8) — and the screened
                 return cannot answer for them: S4 drops a declared target *before* the
@@ -3076,10 +5150,16 @@ class MitosSyncManager:
                 string stay green.
             top_k: How many screened survivors to keep. The pause uses the default,
                 ``CONFLICT_TOP_K``, which is what it displays. The acknowledged path
-                (:meth:`_acknowledged_neighbors_field`) passes
-                ``CONFLICT_OVERFETCH_LIMIT``, the whole gather window, because an
-                acknowledgement covers every neighbour the gate would have held the
-                write for, not only the ones a pause would show.
+                (:meth:`_acknowledged_fields`) passes
+                ``CONFLICT_OVERFETCH_LIMIT``, the gather's 20 live candidates,
+                because an acknowledgement covers every neighbour the gate would have
+                held the write for, not only the ones a pause would show.
+            gathering_sink: Optional sink that receives the one
+                :class:`~mitos.conflict.Gathering` when the gather ran healthy, and
+                nothing otherwise (no providers, a typed ``Unavailable``, or a
+                raise). The caller words a cut from it; the record path's tombstones
+                read its retired hits. A sink for the same reason as
+                ``gathered_index``.
 
         Returns:
             A list of :func:`~mitos.conflict.candidate_payload` dicts for
@@ -3101,15 +5181,18 @@ class MitosSyncManager:
         )
         if isinstance(gathered, Unavailable):
             return gathered
+        # Filled only once the gather is known healthy, so a cut can never ride beside
+        # a review that could not run.
+        if gathering_sink is not None:
+            gathering_sink.append(gathered)
         if gathered_index is not None:
-            # Read the handle off the hydrated node, not off ``Candidate.slug``: the
-            # latter is the vector-store payload's spelling (they agree in production
-            # because the payload was written from the node, but they are two sources).
+            # The gather resolves by point id, so the node's slug is the one handle.
             gathered_index.update(
-                {c.node["slug"].casefold(): (c.node["slug"], c.score) for c in gathered}
+                {c.node["slug"].casefold(): (c.node["slug"], c.score)
+                 for c in gathered.live}
             )
         screened = screen_candidates(
-            gathered,
+            gathered.live,
             declared_targets=declared_targets,
             own_slug=entry.slug,
             floor=_NEIGHBOR_REVIEW_THRESHOLD,
@@ -3117,10 +5200,26 @@ class MitosSyncManager:
         )
         return [candidate_payload(c) for c in screened]
 
-    def _lineage_suppression_slugs(
-        self, mutation_target_slugs: List[Optional[str]]
-    ) -> set[str]:
-        """Casefolded slugs of the transitive mutation ancestors of declared targets (3b).
+    def _resolve_slug_typed(self, slug: str) -> List[str]:
+        """``GraphStore.resolve_slug`` with its raw ``sqlite3.Error`` typed (7a).
+
+        The pause's fail-open arm catches exactly ``DatabaseError``/``ValidationError``,
+        and ``resolve_slug`` raises the raw error, so every slug read the pause's review
+        makes goes through here.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        try:
+            return self.store.resolve_slug(slug)
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to resolve slug '{slug}': {exc}")
+
+    def _lineage_ancestors(
+        self, mutation_target_slugs: List[Optional[str]], *,
+        target_ids: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, List[Dict[str, str]]]:
+        """The transitive mutation ancestors of declared targets, per target (3b, 7a).
 
         Transitive-lineage near-duplicate suppression. When an author declares an
         ``amends``/``narrows``/``supersedes`` edge to the HEAD of a multi-link mutation
@@ -3129,11 +5228,14 @@ class MitosSyncManager:
         author has acknowledged the whole lineage, not just the node they happened to
         declare. This helper resolves each declared mutation target to its node id and
         walks :meth:`GraphStore.get_lineage` (the transitive ``supersedes`` ∪ ``amends``
-        ∪ ``narrows`` ancestor walk, Phase 3a) from it, returning every ancestor's
-        casefolded slug to merge into ``declared_targets`` — the suppression set
-        :meth:`_review_neighbors` passes to ``screen_candidates``, whose S4 stage drops
-        candidates by casefolded membership. Both sides casefold, matching that filter
-        exactly. Merging
+        ∪ ``narrows`` ancestor walk, Phase 3a) from it. :meth:`_review_declared` reads
+        the one walk twice: every ancestor's casefolded slug merges into
+        ``declared_targets`` — the suppression set :meth:`_review_neighbors` passes to
+        ``screen_candidates``, whose S4 stage drops candidates by casefolded membership
+        (both sides casefold, matching that filter exactly) — and every ancestor's
+        ``node_id`` joins the target's exemption ids for the tombstone partition, which
+        compares ids because a retired decision may share its slug with a live one
+        (7a). Merging
         into the set only ever *grows* suppression, so V1a's DIRECT suppression of all
         nine relation types is preserved by construction (must-not-regress, DoD #13b).
 
@@ -3151,12 +5253,16 @@ class MitosSyncManager:
         (R is *their* ancestor), so this walk does not — and must not — suppress them.
         Auto-suppressing them would mean "declaring ``amends R`` silences the gate for
         R's entire descendant cluster", hiding a GENUINE duplicate of one sibling behind
-        an unrelated declaration. The vision defers the cluster's ergonomics to a later
-        granular-acknowledge layer. The seam that layer would add — a SYMMETRIC
-        per-neighbour check, ``any(t_id in {a["node_id"] for a in
-        get_lineage(neighbour_id)} for t_id in declared_mutation_target_ids)`` gated
-        behind explicit per-neighbour acknowledgement — is named here so it is
-        discoverable, built later, never rediscovered as a "bug".
+        an unrelated declaration. The suppression stays exactly that. The symmetric
+        check is built as a note instead (7c): :meth:`_review_siblings` walks each
+        shown live neighbour's own lineage (:meth:`GraphStore.get_lineage_ids`) and
+        marks the neighbour ``descends_from_declared`` when that lineage holds a
+        declared target's own id. It differs from the seam once named here in two
+        ways, both because a note hides nothing: it matches the targets of all nine
+        declared relations, not only the mutation three, and it is shown, never
+        suppressing. It costs no read when nothing is declared. The per-neighbour
+        acknowledgement that seam was paired with stays unbuilt:
+        ``acknowledge_neighbors`` still acknowledges the whole draft's neighbours.
 
         Consumes ``get_lineage``'s loud-but-non-fatal partial-on-cycle tolerance as-is
         (Decision 5): over a corrupt graph the suppression degrades gracefully (it
@@ -3165,20 +5271,33 @@ class MitosSyncManager:
         helper adds no cycle handling of its own — that is the read-side "tolerate" half
         of 3a's one-walk-two-call-sites split.
 
+        ``get_lineage`` and ``resolve_slug`` raise a raw ``sqlite3.Error`` on a failed
+        read; both are typed as ``DatabaseError`` here, so the pause's fail-open arm
+        (which catches exactly ``DatabaseError``/``ValidationError``) owns them like
+        every other pause read.
+
         Args:
             mutation_target_slugs: The declared ``supersedes``/``amends``/``narrows``
                 target slugs; any element may be ``None`` or empty (skipped).
+            target_ids: Optional casefolded target → node id that Phase A validated
+                (7b). A target found here seeds its walk from that id, unresolved; the
+                rest resolve as before. The acknowledged path passes it, because after
+                the commit a slug may name more nodes than it did before.
 
         Returns:
-            The casefolded slugs of every transitive mutation ancestor of every
-            resolvable declared target; an empty set when no mutation edge was declared
-            (or no target resolves to exactly one node).
+            Casefolded target slug → its ancestors (``get_lineage``'s ``{node_id, slug,
+            kind}`` dicts), for every target that resolves to exactly one node; empty
+            when no mutation edge was declared.
+
+        Raises:
+            DatabaseError: If the lineage read fails.
         """
-        suppressed: set[str] = set()
+        ancestors: Dict[str, List[Dict[str, str]]] = {}
         for slug in mutation_target_slugs:
             if not slug or not slug.strip():
                 continue
-            ids = self.store.resolve_slug(slug)
+            pinned = (target_ids or {}).get(slug.casefold())
+            ids = [pinned] if pinned is not None else self._resolve_slug_typed(slug)
             # Each declared target was pre-validated unique-and-existing before the gate
             # runs (supersedes at the supersedes fast-fail, amends/narrows via
             # _validate_relation_target), so resolve_slug returns exactly one id on the
@@ -3186,18 +5305,96 @@ class MitosSyncManager:
             # a non-unique seed cannot meaningfully seed a single lineage walk.
             if len(ids) != 1:
                 continue
-            for ancestor in self.store.get_lineage(ids[0]):
-                suppressed.add(ancestor["slug"].casefold())
-        return suppressed
+            try:
+                walked = self.store.get_lineage(ids[0])
+            except sqlite3.Error as exc:
+                raise DatabaseError(f"Failed to read the lineage of '{slug}': {exc}")
+            ancestors.setdefault(slug.casefold(), []).extend(walked)
+        return ancestors
+
+    def _review_declared(self, supersedes: Optional[str], corrects: Optional[str],
+                         extra_relations: Dict[str, str], *,
+                         target_ids: Optional[Mapping[str, str]] = None,
+                         ) -> DeclaredReview:
+        """What a draft's declarations exempt on the pause, by slug and by id (7a).
+
+        One lineage walk (:meth:`_lineage_ancestors`) feeds the :class:`DeclaredReview`:
+        the live screen's suppression slugs, and each declared target's exemption ids
+        for the tombstone partition. The resolution loop before the walk also keeps
+        each target's own id (``direct_ids``, 7c), which the sibling note matches. It
+        reads ``self.store`` unconditionally and nothing else on the manager, because
+        the replay worker and Layer C's draft reader call it on a store-only shell; the
+        provider gate that keeps the graph-only fast path free of the walk is
+        :meth:`_review_declared_targets`'.
+
+        Ids, not slugs, carry the exemption: a retired decision may share its slug with
+        its live bearer, so a declaration of the live ``x`` must not clear the retired
+        ``x`` (constraint 8). Phase A has already refused any target that names no node
+        or several, so each target resolves to exactly one id here — possibly a
+        retired one (a draft may ``amends`` a uniquely-slugged retired decision), which
+        then exempts that decision itself. A target resolving otherwise (a replay shell
+        skips Phase A) contributes its slug and no id.
+
+        ``target_ids`` pins targets to the ids Phase A validated (7b, D3). The pause
+        passes none: before the commit each target resolves to exactly the id Phase A
+        saw. The acknowledged path runs after the commit, where a slug may name more
+        nodes than before (a reconcile that landed a same-slug node between this
+        write's commit and its read; ``record_decision`` itself never mints a slug a
+        node already carries), so it passes Phase A's ids and its exemptions cannot
+        move with the commit.
+
+        Args:
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, stripped, non-empty only.
+            target_ids: Optional casefolded target → validated node id; a target found
+                here takes that id unresolved, and seeds its lineage walk from it.
+
+        Returns:
+            The :class:`DeclaredReview`.
+
+        Raises:
+            DatabaseError: If a slug or lineage read fails.
+        """
+        direct = [t for raw in ([supersedes, corrects] + list(extra_relations.values()))
+                  for t in _split_relation_slugs(raw)]
+        slugs = {t.casefold() for t in direct}
+        ids_by_target: Dict[str, Set[str]] = {}
+        direct_ids: Dict[str, str] = {}
+        for target in direct:
+            pinned = (target_ids or {}).get(target.casefold())
+            ids = [pinned] if pinned is not None else self._resolve_slug_typed(target)
+            if len(ids) == 1:
+                ids_by_target.setdefault(target.casefold(), set()).add(ids[0])
+                direct_ids[target.casefold()] = ids[0]
+        lineage = self._lineage_ancestors(
+            _split_relation_slugs(supersedes)
+            + _split_relation_slugs(extra_relations.get("amends"))
+            + _split_relation_slugs(extra_relations.get("narrows")),
+            target_ids=target_ids,
+        )
+        for folded, ancestors in lineage.items():
+            for ancestor in ancestors:
+                slugs.add(ancestor["slug"].casefold())
+                ids_by_target.setdefault(folded, set()).add(ancestor["node_id"])
+        return DeclaredReview(
+            slugs=slugs,
+            ids_by_target=ids_by_target,
+            ids=set().union(*ids_by_target.values()) if ids_by_target else set(),
+            direct_ids=direct_ids,
+        )
 
     def _review_declared_targets(self, supersedes: Optional[str],
                                  corrects: Optional[str],
                                  extra_relations: Dict[str, str]) -> set[str]:
         """Builds the neighbour review's suppression set from the raw relation args.
 
-        The one source for both callers: the pre-commit pause and the acknowledged
-        path's post-commit gather (:meth:`_acknowledged_neighbors_field`). Two copies
-        would drift, and the first drift would name a neighbour the caller had linked.
+        The pause's no-provider branch reads it, and so does the replay worker's legacy
+        build. The acknowledged path's post-commit gather (:meth:`_acknowledged_fields`)
+        reads :meth:`_review_declared` directly since 7b, seeded with Phase A's target
+        ids, and its own early ``None`` answers the provider gate below. Every copy is
+        the one walk: two would drift, and the first drift would name a neighbour the
+        caller had linked.
         The set is every declared relation target, casefolded, plus the transitive
         mutation lineage of the ``supersedes``/``amends``/``narrows`` targets (3b).
         The lineage walk is skipped without providers: the gate is then a no-op
@@ -3219,73 +5416,459 @@ class MitosSyncManager:
             The casefolded slugs the review must not flag. Graph-store faults from the
             lineage walk propagate; each caller owns its disposition.
         """
-        declared = {
+        if self.embed_provider and self.vector_store:
+            return self._review_declared(supersedes, corrects, extra_relations).slugs
+        return {
             t.casefold()
             for raw in ([supersedes, corrects] + list(extra_relations.values()))
             for t in _split_relation_slugs(raw)
         }
-        if self.embed_provider and self.vector_store:
-            declared |= self._lineage_suppression_slugs(
-                _split_relation_slugs(supersedes)
-                + _split_relation_slugs(extra_relations.get("amends"))
-                + _split_relation_slugs(extra_relations.get("narrows"))
-            )
-        return declared
 
-    def _acknowledged_neighbors_field(self, entry: ParsedEntry,
-                                      supersedes: Optional[str],
-                                      corrects: Optional[str],
-                                      extra_relations: Dict[str, str],
-                                      ) -> Optional[List[str]]:
-        """Names the neighbours an acknowledged write went past, never raising (F10).
+    def _review_tombstones(self, gathering: Gathering, declared: DeclaredReview, *,
+                           shown_neighbors: Sequence[Mapping[str, Any]],
+                           bound: Optional[int] = CONFLICT_TOP_K,
+                           floor: Optional[float] = None,
+                           bare: bool = False) -> TombstoneReview:
+        """The pause's tombstone partition from one healthy gathering (7a, vision §4.9).
+
+        A pure consumer of the gather's retired partition plus at most three reads, all
+        in Phase A: it runs no gather and embeds nothing.
+
+        * **Membership.** ``gathering.retired`` (rank order, so closest first) at or
+          above the floor. When none is, nothing is read and the review is empty.
+        * **Exemption, before the bound, by node id** (D4). One
+          :meth:`~mitos.store.GraphStore.get_kill_chains` over every such hit. A hit
+          ``T`` is exempt when some declared target's ids (``declared.ids_by_target``)
+          meet ``{T.id} ∪ KillChain(T).reached``: the declared target is ``T`` or its
+          lineage holds ``T``, or ``T``'s forward kill chain reaches a declared target
+          or its lineage — the walk that covers ``corrects``, which ``get_lineage``
+          leaves out. Those targets are ``cleared_by``.
+        * **The bound.** The first ``bound`` non-exempt hits are shown, the rest
+          counted in ``omitted``. ``bound=None`` shows them all.
+        * **The entries.** Each is :func:`~mitos.display.retired_handle`'s handle (from
+          one :meth:`~mitos.store.GraphStore.get_modifiers_map` over the shown ids,
+          and the live ends of the walk already read, through
+          :func:`~mitos.store.live_ends_from_chains`), plus the hit node's whole
+          ``axiom`` (the agent must recognise what it re-treads), plus two facts over
+          its live successors (:func:`_live_successors`: its ``live_end`` when present,
+          else its ``superseded_by`` ∪ ``corrected_by``, which the live-end rule
+          guarantees are live then): ``successor_on_pause``, the successors among
+          ``shown_neighbors`` by casefolded slug (both sides live, and a live slug
+          names its one live bearer), present only when non-empty; and
+          ``successor_ambiguous: True`` when some successor's slug names several
+          nodes, by the validator's own predicate (:func:`_ambiguous_target`), so no
+          relation to that successor clears the tombstone. Present only when true.
+        * **Bare** (7b, D2). ``bare=True`` makes each entry the handle alone — no axiom,
+          no successor facts — and skips the per-successor slug reads with them. The
+          acknowledged receipt names what a landed write went past; it does not
+          re-open it. Membership, exemption and order do not read the flag.
+
+        Faults are not caught: a ``DatabaseError`` from any read propagates to the
+        pause's fail-open arm, which discards the live neighbours too (D3). A partly
+        read tombstone partition would pass for a whole one.
+
+        It reads ``self.store`` and nothing else on the manager, so the replay worker
+        and Layer C's draft reader call it on a store-only shell.
+
+        Args:
+            gathering: The review's healthy gathering.
+            declared: The draft's :class:`DeclaredReview`.
+            shown_neighbors: The live neighbours the pause shows (their ``slug``).
+            bound: How many tombstones to show; ``None`` for all.
+            floor: The tombstone floor; ``None`` reads ``_TOMBSTONE_FLOOR`` at call
+                time. The candidate sweep passes a lower floor to price a lowered one.
+            bare: Entries are the handle alone, and no slug is read.
+
+        Returns:
+            The :class:`TombstoneReview`.
+
+        Raises:
+            DatabaseError: If a kill-chain, stamp or slug read fails.
+        """
+        if floor is None:
+            floor = _TOMBSTONE_FLOOR
+        above = [hit for hit in gathering.retired if hit.score >= floor]
+        if not above:
+            return TombstoneReview(shown=[], omitted=0, cleared_by=set())
+        chains, chain_slugs = self.store.get_kill_chains([hit.node["id"] for hit in above])
+        kept = []
+        cleared_by: Set[str] = set()
+        for hit in above:
+            node_id = hit.node["id"]
+            reach = {node_id, *chains[node_id].reached}
+            clearing = {target for target, ids in declared.ids_by_target.items()
+                        if ids & reach}
+            if clearing:
+                cleared_by |= clearing
+                continue
+            kept.append(hit)
+        shown_hits = kept if bound is None else kept[:bound]
+        if not shown_hits:
+            return TombstoneReview(shown=[], omitted=0, cleared_by=cleared_by)
+        shown_ids = [hit.node["id"] for hit in shown_hits]
+        live_ends = live_ends_from_chains({i: chains[i] for i in shown_ids}, chain_slugs)
+        stamps = self.store.get_modifiers_map(shown_ids)
+        on_pause = {n["slug"].casefold() for n in shown_neighbors}
+        ambiguity: Dict[str, bool] = {}
+        shown: List[Dict[str, Any]] = []
+        for hit in shown_hits:
+            entry = retired_handle(hit.node, score=hit.score, stamps=stamps,
+                                   live_ends=live_ends)
+            if bare:
+                shown.append(entry)
+                continue
+            entry["axiom"] = hit.node["core_axiom"]
+            successors = _live_successors(entry)
+            beside = [s for s in successors if s.casefold() in on_pause]
+            if beside:
+                entry["successor_on_pause"] = beside
+            for slug in successors:
+                if slug not in ambiguity:
+                    ambiguity[slug] = _ambiguous_target(self._resolve_slug_typed(slug))
+            if any(ambiguity[slug] for slug in successors):
+                entry["successor_ambiguous"] = True
+            shown.append(entry)
+        return TombstoneReview(shown=shown, omitted=len(kept) - len(shown_hits),
+                               cleared_by=cleared_by)
+
+    def _review_siblings(self, gathering: Gathering, declared: DeclaredReview, *,
+                         shown_neighbors: Sequence[Mapping[str, Any]],
+                         declared_by_relation: Mapping[str, Optional[str]],
+                         canonical_slugs: Mapping[str, str]) -> Dict[str, List[str]]:
+        """Which shown neighbours descend from a declared target: the sibling note (7c).
+
+        A live neighbour whose own mutation lineage (``supersedes`` ∪ ``amends`` ∪
+        ``narrows``, walked from the neighbour by
+        :meth:`~mitos.store.GraphStore.get_lineage_ids`) holds a declared target's own
+        id (``declared.direct_ids``) descends from that target; the pause says so
+        (vision §4.9). The targets of all nine declared relations count. The match is
+        the target's own id, never its lineage: a neighbour that shares an ancestor
+        with the target is its cousin, not its descendant. The note shows and never
+        suppresses: the neighbour still pauses the draft.
+
+        One batched read over the shown neighbours' ids, and none when the draft
+        declares no target that resolved or no neighbour is shown. A neighbour's id is
+        its gathered live candidate's, joined by casefolded slug (a live slug names
+        its one live bearer; ``record_decision`` refuses a second, so the first in
+        gather order is kept if one ever appears out of band).
+
+        Faults are not caught: a ``DatabaseError`` propagates to the pause's fail-open
+        arm, which discards the whole pause (one fault domain, 7a D3), so an absent
+        note never stands beside an unread lineage. It reads ``self.store`` and
+        nothing else on the manager, because the replay worker calls the pause on a
+        store-and-providers shell.
+
+        Args:
+            gathering: The review's healthy gathering (its ``live`` candidates).
+            declared: The draft's :class:`DeclaredReview`.
+            shown_neighbors: The live neighbours the pause shows (their ``slug``).
+            declared_by_relation: Relation name → the caller's raw argument, in the
+                echo's render order; it orders and spells the names.
+            canonical_slugs: Casefolded declared target → stored slug (the echo's
+                naming rule, falling back to the declared spelling).
+
+        Returns:
+            Casefolded neighbour slug → the declared targets it descends from, in
+            declaration order, each once; only neighbours with at least one.
+
+        Raises:
+            DatabaseError: If the lineage read fails.
+        """
+        targets: List[Tuple[str, str]] = []     # (target's own id, its name)
+        named: Set[str] = set()
+        for raw in declared_by_relation.values():
+            for target in _split_relation_slugs(raw):
+                folded = target.casefold()
+                target_id = declared.direct_ids.get(folded)
+                if target_id is None or target_id in named:
+                    continue
+                named.add(target_id)
+                targets.append((target_id, canonical_slugs.get(folded, target)))
+        if not targets or not shown_neighbors:
+            return {}
+        live_ids: Dict[str, str] = {}
+        for candidate in gathering.live:
+            live_ids.setdefault(candidate.node["slug"].casefold(), candidate.node["id"])
+        seeds = [live_ids[n["slug"].casefold()] for n in shown_neighbors
+                 if n["slug"].casefold() in live_ids]
+        if not seeds:
+            return {}
+        lineage = self.store.get_lineage_ids(seeds)
+        notes: Dict[str, List[str]] = {}
+        for neighbor in shown_neighbors:
+            folded = neighbor["slug"].casefold()
+            if folded not in live_ids:
+                continue
+            reach = set(lineage[live_ids[folded]])
+            names = [name for target_id, name in targets if target_id in reach]
+            if names:
+                notes[folded] = names
+        return notes
+
+    def _review_pause(self, entry: ParsedEntry, supersedes: Optional[str],
+                      corrects: Optional[str], extra_relations: Dict[str, str], *,
+                      canonical_slugs: Dict[str, str],
+                      own_id: Optional[str] = None) -> PauseReview:
+        """The pre-commit near-duplicate review, both partitions (P4; 7a).
+
+        Still Phase A, so a pause writes nothing. One gather
+        (:meth:`_review_neighbors`, screened to the gather's whole live window so both
+        counts come from one list, D5) feeds the live partition, cut to
+        ``CONFLICT_TOP_K``, and the tombstone partition (:meth:`_review_tombstones`, over
+        the same gathering's retired hits); one lineage walk (:meth:`_review_declared`)
+        feeds the live screen's suppression and the tombstones' exemption. A third
+        read (:meth:`_review_siblings`, 7c) marks each shown live neighbour that
+        descends from a declared target with ``descends_from_declared``; it shows and
+        never suppresses. The pause returns when either partition holds something.
+
+        Fail-open, one fault domain (D3): a ``DatabaseError``/``ValidationError`` from
+        any read — the gather's, the lineage walk's, the kill-chain, stamp or slug reads
+        of the tombstones, the sibling note's lineage read — discards both partitions
+        and yields the ``neighbor_review_unavailable`` notice, so an absent tombstone
+        never reads as checked-clean; a typed embed or vector-store ``Unavailable``
+        words its cause the same way. Anything else is a real bug and propagates.
+
+        The stamp label read (8a) sits **outside** that domain, after it, and only when
+        a pause will be returned: the map is no partition — it labels what the
+        partitions already show — so a fault there costs the map alone
+        (``stamp_labels_unread`` and one message clause), never the pause.
+
+        The record path and the replay worker (a store-and-providers shell) call it, so
+        the replay prices the shipped pause and not a copy of it. The label read uses
+        ``self.store`` only.
+
+        Args:
+            entry: The parsed draft.
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, stripped, non-empty only.
+            canonical_slugs: Casefolded declared target → stored slug, from Phase A's
+                validation loops (the echo prints stored spellings).
+            own_id: The draft's own node id. Never in the graph on the record path (the
+                ``exists`` gate answers first), so dropping it from the retired hits is
+                a no-op there; a replayed draft's node may exist, retired, and is never
+                its own tombstone.
+
+        Returns:
+            The :class:`PauseReview`.
+        """
+        review_unavailable: Optional[str] = None
+        neighbors: List[Dict[str, Any]] = []
+        tombs = TombstoneReview(shown=[], omitted=0, cleared_by=set())
+        # Casefolded shown-neighbour slug → the declared targets it descends from.
+        siblings: Dict[str, List[str]] = {}
+        # The caller's own declarations, per relation, for the pause echo — built
+        # BESIDE the declared review below, which folds the relation name away. Purely
+        # additive: nothing that Phase B reads moves in here.
+        # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
+        # why that matters — this review is skipped under acknowledge_neighbors while
+        # Phase B still writes edges from the raw relation args, so relocating any
+        # normalization into it drops declared edges when both flags travel together,
+        # with every other row green.
+        declared_by_relation: Dict[str, Optional[str]] = {
+            "supersedes": supersedes, "corrects": corrects, **extra_relations,
+        }
+        # This call's raw gathered set, filled by _review_neighbors. Primary-set input to
+        # the partition (M8); empty when the sweep never ran.
+        gathered_index: Dict[str, Tuple[str, float]] = {}
+        # The gathering itself, when the review ran healthy: the cut, the full-review
+        # sentence and the tombstones read it. Empty when it never ran or could not.
+        gatherings: List[Gathering] = []
+        try:
+            # Declared targets plus their transitive mutation lineage (3b): by naming a
+            # chain head the author has acknowledged the whole lineage. Without
+            # providers the gate cannot run, and the declared set stays the direct
+            # targets with no walk (the graph-only fast path).
+            declared: Optional[DeclaredReview] = None
+            if self.embed_provider and self.vector_store:
+                declared = self._review_declared(supersedes, corrects, extra_relations)
+                declared_targets = declared.slugs
+            else:
+                declared_targets = self._review_declared_targets(
+                    supersedes, corrects, extra_relations)
+            reviewed = self._review_neighbors(entry, declared_targets,
+                                              gathered_index=gathered_index,
+                                              top_k=CONFLICT_OVERFETCH_LIMIT,
+                                              gathering_sink=gatherings)
+            if not isinstance(reviewed, Unavailable) and gatherings and declared is not None:
+                gathering = gatherings[0]
+                if own_id is not None:
+                    gathering = dataclasses.replace(
+                        gathering,
+                        retired=[h for h in gathering.retired if h.node["id"] != own_id])
+                tombs = self._review_tombstones(
+                    gathering, declared, shown_neighbors=reviewed[:CONFLICT_TOP_K])
+                siblings = self._review_siblings(
+                    gathering, declared, shown_neighbors=reviewed[:CONFLICT_TOP_K],
+                    declared_by_relation=declared_by_relation,
+                    canonical_slugs=canonical_slugs)
+        except (DatabaseError, ValidationError) as exc:
+            # A graph-store fault during the pause read (the gather's node reads, the
+            # lineage walk, a tombstone read). Fail open — a fault this severe fails
+            # Phase B anyway, where commit-arbitration belongs; a pre-commit crash never
+            # does. Both partitions are discarded: a partly read pause would pass for a
+            # whole one.
+            review_unavailable = _review_unavailable_notice("graph read failed")
+            gatherings = []
+            # A read after the tombstones (the sibling note) can fault with the
+            # tombstones already read; reset them, or a tombstone-only pause would
+            # pass for a whole one.
+            tombs = TombstoneReview(shown=[], omitted=0, cleared_by=set())
+            siblings = {}
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Neighbor review skipped for '{entry.slug}': {exc}",
+                  file=sys.stderr)
+        else:
+            if isinstance(reviewed, Unavailable):
+                # Embed/vector-store degradation, typed by the gather. The reason words
+                # the notice; `.detail` is logging-only, never rendered.
+                review_unavailable = _review_unavailable_notice(
+                    _REVIEW_UNAVAILABLE_CAUSES.get(
+                        reviewed.reason, reviewed.reason.value.replace("_", " ")
+                    )
+                )
+            else:
+                neighbors = reviewed
+        gathering = gatherings[0] if gatherings else None
+        # The cut statement and the full-review sentence, only beside a review that ran:
+        # a review that could not run already says so, and the two never co-occur.
+        cut = full = None
+        if review_unavailable is None and gathering is not None:
+            cut = _review_cut_notice(gathering, _NEIGHBOR_REVIEW_THRESHOLD,
+                                     tombstone_floor=_TOMBSTONE_FLOOR)
+            full = _review_full_notice(gathering, _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR)
+        # The sibling note rides a copy of its neighbour, never the entry in place.
+        shown = [{**n, "descends_from_declared": siblings[n["slug"].casefold()]}
+                 if n["slug"].casefold() in siblings else n
+                 for n in neighbors[:CONFLICT_TOP_K]]
+        if not shown and not tombs.shown:
+            return PauseReview(pause=None, unavailable=review_unavailable, cut=cut)
+        # The declared-edge echo (A2). mitos is stateless across calls, so a pause on a
+        # different node cannot say "since your last attempt" — and a caller that
+        # cannot tell whether its declaration registered mints a second, false edge
+        # into the gold source. The one thing that answers it is what this call already
+        # computed and threw away. A declaration that cleared a tombstone resolved part
+        # of the pause, so it is never group two (D9).
+        echo = _declared_echo(declared_by_relation, canonical_slugs, gathered_index,
+                              _NEIGHBOR_REVIEW_THRESHOLD, cleared_by=tombs.cleared_by)
+        pause: Dict[str, Any] = {
+            "status": "needs_review",
+            "code": "similar_decision_exists",
+            "slug": entry.slug,
+            # Present on every pause, `[]` on a tombstone-only one: consumers index it.
+            "neighbors": shown,
+        }
+        if len(neighbors) > len(shown):
+            pause["neighbors_omitted"] = len(neighbors) - len(shown)
+        if tombs.shown:
+            pause["tombstones"] = tombs.shown
+        if tombs.omitted:
+            pause["tombstones_omitted"] = tombs.omitted
+        # The stamp labels, read after the review's fault domain (8a D5): a fault here
+        # costs the map alone. Added before the message is composed, which reads them.
+        pause.update(pause_labels(self.store, neighbors=shown,
+                                  tombstones=tombs.shown).envelope_keys())
+        pause.update(echo)
+        pause = {
+            **{k: pause[k] for k in ("status", "code", "slug", "neighbors")},
+            **{k: pause[k] for k in ("neighbors_omitted", "tombstones", "tombstones_omitted",
+                                     "stamp_labels", "stamp_labels_unread")
+               if k in pause},
+            "message": _pause_message(pause),
+            "draft_digest": _draft_digest(entry),
+            **echo,
+            **({"neighbor_review_full": full} if full else {}),
+            **({"neighbor_review_cut": cut} if cut else {}),
+        }
+        return PauseReview(pause=pause, unavailable=None, cut=None)
+
+    def _acknowledged_fields(self, entry: ParsedEntry,
+                             supersedes: Optional[str],
+                             corrects: Optional[str],
+                             extra_relations: Dict[str, str],
+                             *,
+                             target_ids: Optional[Mapping[str, str]] = None,
+                             gathering_sink: Optional[List[Gathering]] = None,
+                             ) -> AcknowledgedReview:
+        """Names what an acknowledged write went past, never raising (F10; 7b).
 
         ``acknowledge_neighbors=True`` skips the pause, and mitos holds nothing between
         calls, so a pause cleared on a re-send and a flag passed blind on the first
-        call look the same. This lists the neighbours for both. It re-runs the pause's
-        own gather after the commit and the embed, so the axiom's vector is already in
-        the embedding cache and the gather adds one vector query, no embedding call.
-        The list is not cut to the pause's ``CONFLICT_TOP_K``: an acknowledgement
-        covers every neighbour the gate would have held the write for, bounded only by
-        the gather window (``CONFLICT_OVERFETCH_LIMIT``). The new node's own vector is
-        in that window, and the own-slug screen drops it.
+        call look the same. This lists what the gate would have held the write for, for
+        both: the live neighbours (``acknowledged_neighbors``) and the tombstones
+        (``acknowledged_tombstones``). It re-runs the pause's own gather after the
+        commit and the embed, so the axiom's vector is already in the embedding cache
+        and the gather adds one vector query, no embedding call. Neither list is cut to
+        the pause's ``CONFLICT_TOP_K``: an acknowledgement disarms the gate for the
+        whole draft, so it covers everything the gather read — 20 live candidates
+        (``CONFLICT_OVERFETCH_LIMIT``) and the retired hits beside them. The new node's
+        own vector is in that fetch and holds one of the 20, and the own-slug screen
+        drops it.
+
+        Both lists read one :meth:`_review_declared` (one lineage walk), seeded with
+        the target ids Phase A validated (``target_ids``), so neither list's
+        exemptions move with the commit: the decision this write superseded or
+        corrected, now retired and the closest hit by construction, and its lineage stay
+        exempt as they were on the pause (D3). The tombstones are 7a's own
+        :meth:`_review_tombstones` over the gathering's retired partition, bare and
+        uncut (D1, D2).
 
         Called after the commit and outside the lock, like :meth:`_audit_debt_fields`.
-        ``None`` means nothing is claimed: no embedding provider or vector store (where
+        Two fault domains, one per key (D4). Both are ``None`` when the gather could not
+        be trusted: no embedding provider or vector store (where
         :meth:`_review_neighbors` would answer a healthy ``[]`` for a gather that never
-        ran), a typed :class:`Unavailable`, or any exception, which also writes one
-        stderr warning. The write has landed, so nothing here may escape (§7).
+        ran), the collection-absent latch, a typed :class:`Unavailable`, or any
+        exception from the declared review or the gather. A fault in the tombstone
+        reads alone, after a healthy gather, makes only ``tombstones`` ``None``. Each
+        fault writes one stderr warning. The write has landed, so nothing here may
+        escape (§7).
 
         Args:
             entry: The committed entry.
             supersedes: The raw ``supersedes`` argument.
             corrects: The raw ``corrects`` argument.
             extra_relations: The seven non-kill relations, as the pause reads them.
+            target_ids: Casefolded declared target → the node id Phase A validated.
+            gathering_sink: Receives the re-run gathering, so the caller can word its
+                cut; a local list is used when ``None``.
 
         Returns:
-            The neighbours' stored slugs, most similar first; ``[]`` when the gather
-            ran and found none; ``None`` when it could not run.
+            The :class:`AcknowledgedReview`.
         """
         if not self.embed_provider or not self.vector_store:
-            return None
+            return AcknowledgedReview(neighbors=None, tombstones=None)
         # Step 8 met a missing collection it could not create: the gather would meet
         # it too, and with the new node live `missing_index_is_a_gap` says True, so it
         # would answer Unavailable. Same None, one round trip fewer. A first write
         # (may_create) never sets the latch, so a fresh workspace still gathers.
         if self._collection_absent:
-            return None
+            return AcknowledgedReview(neighbors=None, tombstones=None)
+        sink: List[Gathering] = gathering_sink if gathering_sink is not None else []
         try:
-            declared = self._review_declared_targets(supersedes, corrects,
-                                                     extra_relations)
-            reviewed = self._review_neighbors(entry, declared,
-                                              top_k=CONFLICT_OVERFETCH_LIMIT)
+            declared = self._review_declared(supersedes, corrects, extra_relations,
+                                             target_ids=target_ids)
+            reviewed = self._review_neighbors(entry, declared.slugs,
+                                              top_k=CONFLICT_OVERFETCH_LIMIT,
+                                              gathering_sink=sink)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Acknowledged-neighbour read failed for '{entry.slug}': "
                   f"{str(e)}", file=sys.stderr)
-            return None
+            return AcknowledgedReview(neighbors=None, tombstones=None)
         if isinstance(reviewed, Unavailable):
-            return None
-        return [n["slug"] for n in reviewed]
+            return AcknowledgedReview(neighbors=None, tombstones=None)
+        neighbors = [n["slug"] for n in reviewed]
+        if not sink:
+            # A healthy answer with no gathering: nothing was gathered to read.
+            return AcknowledgedReview(neighbors=neighbors, tombstones=None)
+        try:
+            tombs = self._review_tombstones(sink[0], declared, shown_neighbors=[],
+                                            bound=None, bare=True)
+        except Exception as e:
+            print(f"[Warning] Acknowledged-tombstone read failed for '{entry.slug}': "
+                  f"{str(e)}", file=sys.stderr)
+            return AcknowledgedReview(neighbors=neighbors, tombstones=None)
+        return AcknowledgedReview(neighbors=neighbors, tombstones=tombs.shown)
 
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'corrected'/'drifted')."""
@@ -3415,6 +5998,92 @@ class MitosSyncManager:
                 entry["target_topic"] = None
             degraded.append(entry)
         return degraded
+
+    def _exists_receipt(self, entry: ParsedEntry, existing: Dict[str, Any],
+                        node_id: str, *, slug: str, state: str) -> Dict[str, Any]:
+        """Composes the ``exists`` receipt, for gate 3 and its TOCTOU twin alike (7b).
+
+        One composer, so the two returns cannot drift. ``state`` is read once by the
+        caller and passed in; nothing here reads it again, so the top-level ``state``
+        and the note come from one snapshot. A live node's receipt (``active`` /
+        ``drifted``) is the receipt as it always was: the same keys and
+        :data:`_EXISTS_NO_OP_NOTE`. A retired node's adds its handle keys after
+        ``state`` (:meth:`_exists_handle_keys`) and carries a note composed from them
+        (:func:`_retired_exists_note`), which names where the current word lives and
+        never a relation the commit would refuse (vision §4.9, P3).
+
+        Args:
+            entry: The parsed entry this call built.
+            existing: The committed node (``get_node``).
+            node_id: The node's id.
+            slug: The receipt's ``slug`` (gate 3 echoes the stored slug, the twin the
+                entry's; a pre-existing difference, left as it was).
+            state: The node's computed state, read once by the caller.
+
+        Returns:
+            The receipt dict.
+        """
+        receipt: Dict[str, Any] = {"slug": slug, "id": node_id, "state": state}
+        note = _EXISTS_NO_OP_NOTE
+        if state not in LIVE_STATES:
+            keys = self._exists_handle_keys(existing, node_id, state)
+            receipt.update(keys)
+            note = _retired_exists_note(existing["slug"], node_id, state, keys)
+        receipt.update({
+            "embedding": self._embedding_status(node_id),
+            "status": "exists",
+            # `path` stays: it points at where the existing entry LIVES, which is
+            # the useful answer to "already recorded — so where is it?" (#5b).
+            # What was wrong is that the renderer labelled it `Written:` under a
+            # `Recorded ✓` headline, so a re-record aimed at correcting commentary
+            # — or at restoring a source block on a graph-only node — read as a
+            # successful write while nothing had changed. The claim moves to
+            # no_op_reason; the pointer stays.
+            "path": self.config.decisions_file,
+            "no_op_reason": note,
+            **self._exists_receipt_extras(entry, existing, node_id),
+        })
+        return receipt
+
+    def _exists_handle_keys(self, existing: Dict[str, Any], node_id: str,
+                            state: str) -> Dict[str, Any]:
+        """A retired node's handle keys for its ``exists`` receipt, never raising (7b).
+
+        The §4.4 handle (:func:`~mitos.display.retired_handle`, with no score: an
+        ``exists`` is not a ranked hit) from one kill-chain walk and one stamp read, then
+        ``successor_ambiguous`` over its live successors (:func:`_live_successors`) by
+        the validator's own predicate. Flat on the receipt, because they are the stamps
+        every decision-read surface carries. One fault domain: any exception from those
+        reads makes all four keys ``None``, ``superseded_by`` included — a handle that
+        kept its stamps but lost its live end could name a dead hop as the place to go.
+
+        Args:
+            existing: The committed node.
+            node_id: Its id.
+            state: Its computed state.
+
+        Returns:
+            ``superseded_by`` / ``corrected_by`` when held, ``live_end`` when an
+            immediate successor is retired, ``successor_ambiguous: True`` when some live
+            successor's slug names several nodes; or all four ``None`` on a fault.
+        """
+        try:
+            chains, chain_slugs = self.store.get_kill_chains([node_id])
+            live_ends = live_ends_from_chains(chains, chain_slugs)
+            stamps = self.store.get_modifiers_map([node_id])
+            handle = retired_handle({**existing, "computed_state": state}, score=None,
+                                    stamps=stamps, live_ends=live_ends)
+            keys = {k: handle[k] for k in ("superseded_by", "corrected_by", "live_end")
+                    if k in handle}
+            if any(_ambiguous_target(self._resolve_slug_typed(s))
+                   for s in _live_successors(handle)):
+                keys["successor_ambiguous"] = True
+            return keys
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Retired-handle read failed for '{existing.get('slug')}': "
+                  f"{str(e)}", file=sys.stderr)
+            return dict.fromkeys(_EXISTS_HANDLE_KEYS)
 
     def _exists_receipt_extras(
         self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
@@ -4129,7 +6798,14 @@ class MitosSyncManager:
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
-            "created"|"exists"); on the "created" path it also carries
+            "created"|"exists"); an "exists" receipt whose node is retired also carries
+            that node's handle keys after ``state`` (:meth:`_exists_receipt`, 7b):
+            ``superseded_by`` / ``corrected_by`` when held, ``live_end`` when an
+            immediate successor is retired, ``successor_ambiguous: true`` when a live
+            successor's slug names two decisions — all four ``None`` when the handle
+            could not be read — and a ``no_op_reason`` naming where its current word
+            lives and never a relation the commit would refuse (a live node's receipt
+            is unchanged); on the "created" path it also carries
             ``edges_created`` (the edges the commit actually wired, read back
             from the store and not echoed from the input args, each ``{kind,
             target, target_state, target_stamps}`` plus the target's whole
@@ -4162,18 +6838,45 @@ class MitosSyncManager:
             check's outcome, :func:`~mitos.check_notice.compose_check_notice`),
             present only while a judge key is set and that outcome is not
             ``no_new_findings``; plus, only when ``acknowledge_neighbors`` was
-            passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_neighbors_field`):
+            passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_fields`):
             the stored slugs of every unlinked live decision at or above the floor
             that the write went past, most similar first, ``[]`` when there were
-            none, or ``None`` when the gather could not run; OR, when a highly-similar unreferenced decision exists and
+            none, or ``None`` when the gather could not run; and beside it
+            ``acknowledged_tombstones``: the bare retired handles (``slug`` / ``id`` /
+            ``state`` / ``score`` / successor stamps / ``live_end``; no axiom) of every
+            non-exempt retired decision at or above ``_TOMBSTONE_FLOOR`` the write went
+            past, closest first and uncut, ``[]`` when there were none, or ``None`` when
+            the gather or the tombstone reads could not run; OR, when a highly-similar
+            unreferenced live decision or retired decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message, draft_digest}`` pause
-            that wrote NOTHING — ``draft_digest`` (:func:`_draft_digest`) is what a
-            re-send passes back to be compared with this draft;
+            that wrote NOTHING (:meth:`_review_pause`) — ``draft_digest``
+            (:func:`_draft_digest`) is what a re-send passes back to be compared with
+            this draft;
             each ``neighbors`` element is an enriched, modifier-stamped decision-read
             payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
             ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
-            ``narrowed_by`` stamps) the authoring agent judges tenability from. That
+            ``narrowed_by`` stamps) the authoring agent judges tenability from, at most
+            ``CONFLICT_TOP_K`` and ``[]`` on a tombstone-only pause; a neighbour whose
+            own mutation lineage reaches a target this draft declares also carries
+            ``descends_from_declared`` (7c, :meth:`_review_siblings`): those targets'
+            slugs, in declaration order. The pause's second
+            partition, ``tombstones`` (7a), lists the retired decisions the draft sits at
+            or above ``_TOMBSTONE_FLOOR`` to, closest first, at most ``CONFLICT_TOP_K``,
+            exempt ones dropped first (:meth:`_review_tombstones`): each a retired handle
+            (:func:`~mitos.display.retired_handle`: ``slug`` / ``id`` / ``state`` /
+            ``score`` / successor stamps / ``live_end``) plus its whole ``axiom`` and, when
+            they hold, ``successor_on_pause`` and ``successor_ambiguous: true``. Counts
+            ride beside them only when non-zero: ``neighbors_omitted`` and
+            ``tombstones_omitted``; ``neighbor_review_full`` says, when the gather's live
+            fill ended full above the lower floor, that both counts cover what it read;
+            ``neighbor_review_cut`` says the gather was cut. ``stamp_labels`` (8a) maps
+            each live decision a neighbour's ``amended_by``/``narrowed_by`` or a
+            tombstone's live successor names, and no shown neighbour already is, to the
+            first clause of its axiom (``stamp_labels.cut_label``);
+            ``stamp_labels_unread: true`` replaces it when that read faulted, which
+            costs the map alone. Every one of these keys,
+            ``descends_from_declared`` included, is absent when computed and empty. That
             pause also echoes the caller's own declared relation targets, partitioned
             by :func:`_declared_echo` and present only when non-empty: ``declared``
             (every target it typed, canonical spellings) and
@@ -4326,17 +7029,23 @@ class MitosSyncManager:
         # whose stored spelling is computed nowhere else — and it costs a dict write on
         # a node already fetched.
         canonical_slugs: Dict[str, str] = {}
+        # Beside it, the resolved node's id under the same key: what this validation
+        # proved unique before the commit, which the acknowledged path's post-commit
+        # review exempts by, so a slug that names more nodes after the commit cannot
+        # move its exemptions (7b, D3).
+        canonical_ids: Dict[str, str] = {}
         supersedes_slugs = _split_relation_slugs(supersedes)
         for _sup in supersedes_slugs:
             ids = self.store.resolve_slug(_sup)
             if not ids:
                 return _record_error("supersedes_not_found", supersedes=_sup)
-            if len(ids) > 1:
+            if _ambiguous_target(ids):
                 return _record_error("supersedes_ambiguous", supersedes=_sup)
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != _sup.casefold():
                 return _record_error("supersedes_not_found", supersedes=_sup)
             canonical_slugs[_sup.casefold()] = target["slug"]
+            canonical_ids[_sup.casefold()] = target["id"]
         if supersedes_slugs:
             entry.supersedes = supersedes_slugs  # List[str] shape (V1b multi-valued)
 
@@ -4348,12 +7057,13 @@ class MitosSyncManager:
             ids = self.store.resolve_slug(_cor)
             if not ids:
                 return _record_error("corrects_not_found", corrects=_cor)
-            if len(ids) > 1:
+            if _ambiguous_target(ids):
                 return _record_error("corrects_ambiguous", corrects=_cor)
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != _cor.casefold():
                 return _record_error("corrects_not_found", corrects=_cor)
             canonical_slugs[_cor.casefold()] = target["slug"]
+            canonical_ids[_cor.casefold()] = target["id"]
         if corrects_slugs:
             entry.corrects = corrects_slugs  # List[str] shape (V1b multi-valued)
 
@@ -4365,7 +7075,8 @@ class MitosSyncManager:
             _targets = _split_relation_slugs(_raw)
             for _t in _targets:
                 err = self._validate_relation_target(
-                    _name, _t, canonical_slugs=canonical_slugs)
+                    _name, _t, canonical_slugs=canonical_slugs,
+                    canonical_ids=canonical_ids)
                 if err:
                     return err
             if _targets:
@@ -4394,23 +7105,9 @@ class MitosSyncManager:
             self.store.note_source_reencounter(
                 node_id, existing["source"], entry.source or "user"
             )
-            return {
-                "slug": existing["slug"],
-                "id": node_id,
-                "state": self._node_state(node_id),
-                "embedding": self._embedding_status(node_id),
-                "status": "exists",
-                # `path` stays: it points at where the existing entry LIVES, which is
-                # the useful answer to "already recorded — so where is it?" (#5b).
-                # What was wrong is that the renderer labelled it `Written:` under a
-                # `Recorded ✓` headline, so a re-record aimed at correcting commentary
-                # — or at restoring a source block on a graph-only node — read as a
-                # successful write while nothing had changed. The claim moves to
-                # no_op_reason; the pointer stays.
-                "path": self.config.decisions_file,
-                "no_op_reason": _EXISTS_NO_OP_NOTE,
-                **self._exists_receipt_extras(entry, existing, node_id),
-            }
+            state = self._node_state(node_id)
+            return self._exists_receipt(entry, existing, node_id,
+                                        slug=existing["slug"], state=state)
 
         # Slug-collision fast-fail (exact match only).
         coll_id, _coll_node = self._exact_slug_node(entry.slug)
@@ -4418,101 +7115,25 @@ class MitosSyncManager:
             return _record_error("slug_collision", slug=entry.slug)
 
         # Near-duplicate review (P4) — still Phase A, so a pause writes NOTHING
-        # (buffer byte-for-byte unchanged). The neighbours payload is a stamped
-        # decision-read surface (candidate_payload) the agent judges from. Surfacing
-        # BEFORE commit is the point: after commit the author can no longer point a
-        # relation at it (a re-record is a no-op). Offline-safe
-        # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
-        # The record surface fails OPEN on any pause-read fault: the check degrading
-        # must never block the commit, but "couldn't check" must not read as "checked,
+        # (buffer byte-for-byte unchanged). Two partitions: the live neighbours, a
+        # stamped decision-read surface (candidate_payload) the agent judges from, and
+        # the tombstones, retired decisions the draft sits closer to than their floor
+        # (7a). Surfacing BEFORE commit is the point: after commit the author can no
+        # longer point a relation at either (a re-record is a no-op). Offline-safe (no
+        # embeddings → no pause) and bypassable with acknowledge_neighbors=True. The
+        # record surface fails OPEN on any pause-read fault: the check degrading must
+        # never block the commit, but "couldn't check" must not read as "checked,
         # clean" either — the threaded notice lands on the created receipt (step 10).
         review_unavailable: Optional[str] = None
+        # The near-dup review's cut statement, threaded to the pause or the created
+        # receipt; absent when not cut.
+        review_cut: Optional[str] = None
         if not acknowledge_neighbors:
-            neighbors: List[Dict[str, Any]] = []
-            # The caller's own declarations, per relation, for the pause echo — built
-            # BESIDE the declared-targets set below (_review_declared_targets), which
-            # folds the relation name away. Purely additive: nothing that Phase B reads moves in here.
-            # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
-            # why that matters — this whole block is skipped under acknowledge_neighbors
-            # while Phase B still writes edges from the raw relation args, so relocating
-            # any normalization into it drops declared edges when both flags travel
-            # together, with every other row green.
-            declared_by_relation: Dict[str, Optional[str]] = {
-                "supersedes": supersedes, "corrects": corrects, **extra_relations,
-            }
-            # This call's raw gathered set, filled by _review_neighbors. Primary-set
-            # input to the partition (M8); empty when the sweep never ran.
-            gathered_index: Dict[str, Tuple[str, float]] = {}
-            try:
-                # Declared targets plus their transitive mutation lineage (3b): by
-                # naming a chain head the author has acknowledged the whole lineage.
-                # One source with the acknowledged path's post-commit gather.
-                declared_targets = self._review_declared_targets(
-                    supersedes, corrects, extra_relations)
-                reviewed = self._review_neighbors(entry, declared_targets,
-                                                  gathered_index=gathered_index)
-            except (DatabaseError, ValidationError) as exc:
-                # A graph-store fault during the pause read (gather's node reads or the
-                # lineage walk). Fail open — a fault this severe fails Phase B anyway,
-                # where commit-arbitration belongs; a pre-commit crash never does.
-                # Exactly these two classes: anything else is a real bug and propagates.
-                review_unavailable = _review_unavailable_notice("graph read failed")
-                # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
-                print(f"[Warning] Neighbor review skipped for '{entry.slug}': {exc}",
-                      file=sys.stderr)
-            else:
-                if isinstance(reviewed, Unavailable):
-                    # Embed/vector-store degradation, typed by the gather. The reason
-                    # words the notice; `.detail` is logging-only, never rendered.
-                    review_unavailable = _review_unavailable_notice(
-                        _REVIEW_UNAVAILABLE_CAUSES.get(
-                            reviewed.reason, reviewed.reason.value.replace("_", " ")
-                        )
-                    )
-                else:
-                    neighbors = reviewed
-            if neighbors:
-                # The declared-edge echo (A2). mitos is stateless across calls, so a
-                # pause on a different node cannot say "since your last attempt" — and
-                # a caller that cannot tell whether its declaration registered mints a
-                # second, false edge into the gold source. The one thing that answers
-                # it is what this call already computed and threw away.
-                echo = _declared_echo(declared_by_relation, canonical_slugs,
-                                      gathered_index, _NEIGHBOR_REVIEW_THRESHOLD)
-                # Ahead of the closing sentence, so the commitment retraction still
-                # closes the body.
-                echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(echo))
-                # B9's dereference sentence only where it can apply: a neighbour that
-                # carries a stamp. On an unstamped set it sent the caller to chase a
-                # field no neighbour has.
-                stamp_clause = (
-                    "If you go on to supersede or amend a neighbour, an "
-                    "amended_by/narrowed_by stamp on it means it has moved on — "
-                    "dereference that slug before linking. "
-                    if any(n.get("amended_by") or n.get("narrowed_by") for n in neighbors)
-                    else "")
-                return {
-                    "status": "needs_review",
-                    "code": "similar_decision_exists",
-                    "slug": entry.slug,
-                    "neighbors": neighbors,
-                    "message": (
-                        f"Paused: '{entry.slug}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
-                        f"similar to {len(neighbors)} existing decision(s) you did not "
-                        "reference. Judge each neighbour from its axiom, "
-                        "rejected_paths, scope, and modifier stamps, then re-record "
-                        "with that judgment: a relation arg "
-                        f"({'/'.join(_PAUSE_RESOLVING_RELATIONS)}) pointing at any "
-                        "neighbour this decision genuinely relates to, "
-                        "acknowledge_neighbors=True for neighbours that stand "
-                        "independently alongside it — or both at once for a mixed "
-                        f"set. {stamp_clause}"
-                        f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} {echo_prose}"
-                        "Nothing was written."
-                    ),
-                    "draft_digest": _draft_digest(entry),
-                    **echo,
-                }
+            review = self._review_pause(entry, supersedes, corrects, extra_relations,
+                                        canonical_slugs=canonical_slugs, own_id=node_id)
+            if review.pause is not None:
+                return review.pause
+            review_unavailable, review_cut = review.unavailable, review.cut
 
         # === Phase B — the only writes, fully serialised under one lock ===
         try:
@@ -4531,17 +7152,10 @@ class MitosSyncManager:
                     self.store.note_source_reencounter(
                         node_id, existing["source"], entry.source or "user"
                     )
-                    return {
-                        "slug": entry.slug,
-                        "id": node_id,
-                        "state": self._node_state(node_id),
-                        "embedding": self._embedding_status(node_id),
-                        "status": "exists",
-                        # See the gate-3 twin above: the path points, it does not claim.
-                        "path": self.config.decisions_file,
-                        "no_op_reason": _EXISTS_NO_OP_NOTE,
-                        **self._exists_receipt_extras(entry, existing, node_id),
-                    }
+                    # One composer with gate 3, and one state read per return.
+                    state = self._node_state(node_id)
+                    return self._exists_receipt(entry, existing, node_id,
+                                                slug=entry.slug, state=state)
                 coll_id, _coll_node = self._exact_slug_node(entry.slug)
                 if coll_id and coll_id != node_id:
                     return _record_error("slug_collision", slug=entry.slug)
@@ -4656,13 +7270,23 @@ class MitosSyncManager:
         #     as 9b; None on a keyless workspace or a healthy record.
         check_notice = self._check_notice_field()
 
-        # 9d. Under acknowledge_neighbors, the neighbours this write went past (F10):
-        #     the pause's gather re-run after the embed, so it hits the embedding
-        #     cache. Same never-raising shape as 9b/9c; None when it could not run.
-        acknowledged: Optional[List[str]] = None
+        # 9d. Under acknowledge_neighbors, the neighbours and the tombstones this write
+        #     went past (F10; 7b): the pause's gather re-run after the embed, so it hits
+        #     the embedding cache, exempting by the target ids Phase A validated. Same
+        #     never-raising shape as 9b/9c; each list None when it could not be read.
+        acknowledged = AcknowledgedReview(neighbors=None, tombstones=None)
         if acknowledge_neighbors:
-            acknowledged = self._acknowledged_neighbors_field(
-                entry, supersedes, corrects, extra_relations)
+            acknowledged_gatherings: List[Gathering] = []
+            acknowledged = self._acknowledged_fields(
+                entry, supersedes, corrects, extra_relations,
+                target_ids=canonical_ids, gathering_sink=acknowledged_gatherings)
+            # The re-run gather's cut, only when the live list it fills was produced: a
+            # `None` list already says the read could not be trusted. A tombstone-only
+            # fault keeps it, because the gather that was cut did run.
+            if acknowledged.neighbors is not None and acknowledged_gatherings:
+                review_cut = _review_cut_notice(acknowledged_gatherings[0],
+                                                _NEIGHBOR_REVIEW_THRESHOLD,
+                                                tombstone_floor=_TOMBSTONE_FLOOR)
 
         # 9e. The edges this write wired, each naming what it hit (B4). Same
         #     never-raising shape as 9b/9c/9d, so the literal below holds a value
@@ -4713,6 +7337,11 @@ class MitosSyncManager:
         # (never on clean-empty, unconfigured, or acknowledged-past records).
         if review_unavailable:
             result["neighbor_review_unavailable"] = review_unavailable
+        # The review ran over less than it should have: its gather was cut above the
+        # pause's floor (pre-commit, or the acknowledged path's re-run). Absent when the
+        # case did not arise; never beside `neighbor_review_unavailable`.
+        if review_cut:
+            result["neighbor_review_cut"] = review_cut
         # Debounced, presentation-only: a one-line nudge naming the over-ceiling files,
         # their ceilings and its own once-a-day cadence, and no command — it is shared
         # by both surfaces (MCP returns it verbatim; CLI text prints it after the
@@ -4730,5 +7359,6 @@ class MitosSyncManager:
         # Keyed on the flag, not the value: None ("could not look") and [] ("looked,
         # none") are both answers, and the key's absence means the flag was not passed.
         if acknowledge_neighbors:
-            result["acknowledged_neighbors"] = acknowledged
+            result["acknowledged_neighbors"] = acknowledged.neighbors
+            result["acknowledged_tombstones"] = acknowledged.tombstones
         return result

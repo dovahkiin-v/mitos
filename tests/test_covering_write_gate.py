@@ -9,7 +9,9 @@ answer is *no*:
   path, and an injected ``embed_fn=`` callback into ``replay.commit_quarantine_fixpoint``.
   The third is the one a test plan forgets, and nothing else exercises it.
 * ``drain_pending_embeddings`` — declaring from the ``embedding_seed`` marker, refusing as
-  a whole rather than per row, and clearing the marker when the outbox empties.
+  a whole rather than per row, and spending the marker once its walk has attempted every
+  row with the collection present, or the outbox is empty (``tests/test_outbox_drain.py``
+  pins the walk and the spend rule in full).
 * ``MitosProseImporter._best_effort_embed`` — the same graph gate, and the one site that
   *adds* a defer path rather than reusing one.
 * ``reconcile_embeddings`` — stamping the marker so its own drain is a covering write.
@@ -25,7 +27,7 @@ Run under ``./venv/bin/python -m pytest`` (PATTERNS — bare ``python`` lacks de
 """
 
 import os
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Sequence, Set
 
 import pytest
 
@@ -51,6 +53,7 @@ class _RecordingVector:
         self.created = False
         self.declarations: List[bool] = []
         self.landed: List[str] = []
+        self.deleted: List[str] = []
 
     def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any],
                *, may_create: bool) -> None:
@@ -64,7 +67,8 @@ class _RecordingVector:
             self.created = True
         self.landed.append(point_id)
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         return []
 
     def list_point_ids(self, page_size: int = 256) -> Set[str]:
@@ -74,6 +78,14 @@ class _RecordingVector:
                 collection="mitos-tmp-fake",
             )
         return set()
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        if self.absent and not self.created:
+            raise CollectionMissingError(
+                "Qdrant collection 'mitos-tmp-fake' does not exist",
+                collection="mitos-tmp-fake",
+            )
+        self.deleted.extend(point_ids)
 
 
 class _FakeEmbed:
@@ -139,7 +151,7 @@ def _outbox_slugs(store: GraphStore) -> Set[str]:
 def test_a_fresh_projects_first_record_declares_covering(tmp_path) -> None:
     """Success criterion 2: the carve-out survives, and it is a real create.
 
-    The one node being written IS the whole active set, so there is nothing this write
+    The one node being written IS the whole expected set, so there is nothing this write
     leaves unindexed and nothing for absence to protect.
     """
     config = _workspace(tmp_path)
@@ -235,7 +247,7 @@ def test_the_latch_is_per_manager_and_never_read_by_the_drain(tmp_path) -> None:
     manager._best_effort_embed(delta, entry)
     assert manager._collection_absent is True
 
-    # A prior command bounded the outbox to the active set; the drain is covering.
+    # A prior command bounded the outbox to the expected set; the drain is covering.
     manager.store.stamp_embedding_seed("rebuild")
     manager.drain_pending_embeddings()
 
@@ -262,10 +274,12 @@ def test_the_fixpoint_retry_path_takes_the_same_defer_branch(tmp_path, capsys) -
     manager = _manager(config, vector)
 
     # A quarantined entry whose target now exists, so the retry pass commits it. The
-    # edge is ``amends`` rather than ``supersedes`` on purpose: a kill-edge would retire
-    # ``existing`` in the same transaction, leaving the new node as the whole active set
-    # and (correctly) declaring covering — which would test the carve-out instead of the
-    # defer branch this row is about.
+    # edge is ``amends`` rather than ``supersedes`` on purpose: before 3b a kill-edge
+    # would retire ``existing`` in the same transaction, leaving the new node as the
+    # whole active set and declaring covering — which would test the carve-out instead
+    # of the defer branch this row is about. The gate keys on the decision index's
+    # expected set since 3b, which keeps a retired decision, so either edge now defers;
+    # ``amends`` keeps the row independent of that.
     forward = _entry("late-arrival", "An axiom that could not commit first time.")
     forward.amends = ["existing"]
     committed, _passes, residual = commit_quarantine_fixpoint(
@@ -293,7 +307,8 @@ class _AbsenceAwareVector(_RecordingVector):
     whether the **first** record's write created the collection.
     """
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         if self.absent and not self.created:
             raise CollectionMissingError(
                 "Qdrant collection 'mitos-tmp-fake' does not exist",
@@ -322,7 +337,7 @@ def test_the_honest_notice_still_fires_on_the_second_record(
     """
     monkeypatch.setattr(
         GraphStore,
-        "has_active_node_other_than",
+        "decision_index_expects_node_other_than",
         lambda self, node_id: not gate_forced_open,
     )
 
@@ -426,15 +441,16 @@ def test_a_marked_drain_creates_and_clears_the_marker(tmp_path) -> None:
     assert vector.created is True
     assert len(vector.landed) == 3
     assert manager.store.get_pending_embeddings() == []
-    assert manager.store.embedding_seed() is None  # cleared on drain-to-empty
+    assert manager.store.embedding_seed() is None  # spent: walk completed, collection present
 
 
-def test_a_drain_that_makes_no_progress_retains_the_marker(tmp_path) -> None:
+def test_a_drain_stopped_by_a_provider_outage_retains_the_marker(tmp_path) -> None:
     """Success criterion 9, second half: rows remain, so the claim still holds.
 
-    The zero-resolving progress guard exists for a dead embedding provider. Clearing the
-    marker there would punish an outage by making the *next* drain non-covering — the heal
-    would then defer forever, with nothing naming why.
+    A provider outage (here a 429, which the classifier reads as ``quota``) stops the
+    drain at its first row. Spending the marker there would punish an outage by making
+    the *next* drain non-covering — the heal would then defer forever, with nothing
+    naming why.
     """
     config = _workspace(tmp_path)
     store = GraphStore(config.db_path)
@@ -477,6 +493,12 @@ def test_a_refused_drain_retains_the_marker_it_never_consumed(tmp_path) -> None:
                 collection="mitos-tmp-fake",
             )
 
+        def delete_points(self, point_ids: Sequence[str]) -> None:
+            raise CollectionMissingError(
+                "Qdrant collection 'mitos-tmp-fake' does not exist",
+                collection="mitos-tmp-fake",
+            )
+
     vector = _AlwaysAbsentVector()
     manager = _manager(config, vector)
     manager.store.stamp_embedding_seed("rebuild")
@@ -491,7 +513,7 @@ def test_a_refused_drain_retains_the_marker_it_never_consumed(tmp_path) -> None:
 def test_an_already_empty_outbox_clears_a_standing_marker(tmp_path) -> None:
     """The marker's claim is about the outbox, so an empty outbox spends it.
 
-    Reached when a project's active set was empty at ``rebuild`` time: the prune stamps
+    Reached when a project's expected set was empty at ``rebuild`` time: the prune stamps
     over a queue that is already empty. Leaving the marker armed indefinitely would make
     it a standing creation licence rather than a record of pending coverage.
     """
@@ -509,8 +531,8 @@ def test_an_already_empty_outbox_clears_a_standing_marker(tmp_path) -> None:
 def test_the_marker_never_authorizes_an_inline_write(tmp_path) -> None:
     """Gotcha 1: ``rebuild`` → ``record`` (no sync) must create nothing.
 
-    The marker's whole safety rests on having exactly one consumer. If a ``record``
-    consulted it after a ``rebuild``, the first record into a swept project would mint a
+    The marker's whole safety rests on exactly one consumer acting on it (``mitos
+    status`` only prints it). If a ``record`` consulted it after a ``rebuild``, the first record into a swept project would mint a
     one-point collection — the precise hazard this phase closes, reintroduced through its
     own mechanism.
     """
@@ -536,7 +558,7 @@ def test_the_marker_never_authorizes_an_inline_write(tmp_path) -> None:
 # reconcile — stamps so its own drain covers
 # --------------------------------------------------------------------------- #
 
-def test_reconcile_against_an_absent_collection_creates_the_whole_active_set(
+def test_reconcile_against_an_absent_collection_creates_the_whole_expected_set(
     tmp_path,
 ) -> None:
     """The heal in one pass, and the stamp is what makes its drain a covering write.
@@ -555,7 +577,10 @@ def test_reconcile_against_an_absent_collection_creates_the_whole_active_set(
 
     result = manager.reconcile_embeddings()
 
-    assert result == {"active": 3, "present": 0, "enqueued": 3}
+    assert {k: result[k] for k in ("active", "present", "enqueued")} == {
+        "active": 3, "present": 0, "enqueued": 3}
+    assert result["expected"] == 3 and result["written"] == 3
+    assert result["left_queued"] == 0 and result["drain_stop"] is None
     assert vector.created is True
     assert set(vector.landed) == set(ids)
     assert manager.store.get_pending_embeddings() == []
@@ -572,7 +597,8 @@ def test_a_deferred_record_is_reconciled_leaving_no_orphan_outbox_row(
     that matters is the whole one: a record defers and keeps its row, the operator runs
     ``reconcile``, and afterwards the index holds every active node exactly once and the
     outbox is empty — no orphan row, no duplicate point, no second embedding paid for the
-    node that deferred.
+    node that deferred. Since 3b "every active node" reads "every node the decision index
+    expects"; this graph holds no retired decision, so the two sets coincide here.
 
     The same read that made record 2's notice fire is the operation ``check``'s
     fail-closed precondition keys on (1b re-keyed it off store construction), so this row
@@ -599,10 +625,12 @@ def test_a_deferred_record_is_reconciled_leaving_no_orphan_outbox_row(
 
     result = manager.reconcile_embeddings()
 
-    assert result == {"active": 2, "present": 0, "enqueued": 2}
+    assert {k: result[k] for k in ("active", "present", "enqueued")} == {
+        "active": 2, "present": 0, "enqueued": 2}
+    assert result["expected"] == 2 and result["written"] == 2 and result["left_queued"] == 0
     assert vector.created is True
-    # Every active node indexed exactly once — the deferred node was not double-written.
-    assert sorted(vector.landed) == sorted(manager.store.get_active_node_ids())
+    # Every expected node indexed exactly once — the deferred node was not double-written.
+    assert sorted(vector.landed) == sorted(manager.store.get_decision_index_expected_ids())
     assert len(vector.landed) == len(set(vector.landed))
     assert manager.store.get_pending_embeddings() == []
     assert manager.store.embedding_seed() is None
@@ -627,7 +655,11 @@ def test_reconcile_stamps_nothing_when_the_index_is_already_complete(tmp_path) -
     vector = _CompleteVector()
     manager = _manager(config, vector)
 
-    assert manager.reconcile_embeddings() == {"active": 1, "present": 1, "enqueued": 0}
+    result = manager.reconcile_embeddings()
+    assert {k: result[k] for k in ("active", "present", "enqueued")} == {
+        "active": 1, "present": 1, "enqueued": 0}
+    assert result["expected_present"] == 1 and result["written"] == 0
+    assert result["drain_stop"] is None
     assert vector.declarations == []
     assert manager.store.embedding_seed() is None
 
@@ -710,7 +742,7 @@ def test_forcing_the_gate_to_a_constant_reds_a_different_set_of_rows(
     forced ``False`` the fresh project would not.
     """
     monkeypatch.setattr(
-        GraphStore, "has_active_node_other_than", lambda self, node_id: not forced
+        GraphStore, "decision_index_expects_node_other_than", lambda self, node_id: not forced
     )
 
     # Fresh project.

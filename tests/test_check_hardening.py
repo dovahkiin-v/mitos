@@ -93,6 +93,8 @@ _CORPUS_JSON_KEYS = {
     "findings_new", "findings_known", "departed", "degradations",
     "judgment_failure_reasons", "judgment_failed_batches", "coverage_exclusions",
     "index_backlog_transient", "summary_row_written", "attempt_unrecorded",
+    # 2d: healthy sweeps whose gather was cut above the floor — always present.
+    "gathers_cut",
     "project", "collection", "workspace",
 }
 
@@ -262,6 +264,11 @@ class _WriteSpyStore:
         "add_pending_embedding",
         "remove_pending_embedding",
         "increment_pending_attempts",
+        # The rejection backlog and its marker (recall-confidence 4a).
+        "clear_rejection_backlog_row",
+        "note_rejection_backlog_failure",
+        "stamp_rejection_seed",
+        "clear_rejection_seed",
     })
 
     def __init__(self, inner: GraphStore) -> None:

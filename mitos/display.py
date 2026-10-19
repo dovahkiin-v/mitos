@@ -55,9 +55,11 @@ def clamp_limit(limit: Optional[int]) -> int:
     ``None`` (the flag was omitted) resolves to the default working top-k of 5.
     Any explicit value is clamped to ``[1, RANKED_LIMIT_CEILING]`` — silently and
     calmly (P9), never an error wall: a request below 1 clamps up to 1, a request
-    above the ceiling clamps down to it. The resolved value SETS the top-k passed
-    to ``vector_store.query(limit=…)`` — it is not a ``min(default, N)`` truncation,
-    so ``limit=20`` genuinely deepens recall past the default.
+    above the ceiling clamps down to it. The resolved value SETS the ranked
+    window: the shared walk's ``limit`` (``retrieval_walk.walk_ranked``), which
+    fills that many live decisions from one vector call at the over-fetch bound.
+    It is not a ``min(default, N)`` truncation, so ``limit=20`` genuinely deepens
+    recall past the default.
 
     Args:
         limit: The caller's requested top-k, or ``None`` to take the default.
@@ -151,38 +153,139 @@ def oneline_payload(node: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
-    """Builds the all-superseded blackout recovery note (the P3 vector text).
+def retired_handle(node: Mapping[str, Any], *, score: Optional[float],
+                   stamps: Mapping[str, Mapping[str, List[str]]],
+                   live_ends: Mapping[str, List[str]]) -> Dict[str, Any]:
+    """Shapes a retired decision's handle — the one constructor, shared CLI⇄MCP.
 
-    When ranked recall retrieved precedents but every one was superseded-filtered,
-    the surface would otherwise read as a true semantic *miss* — a false-novelty
-    signal that costs the agent an expensive re-derivation of a contradiction the
-    graveyard already settled. This note turns that dead-end into a vector: it names
-    the retired handles (and their live successors, when known) and points at the
-    command that reads the retired history. Calm, one short block (P9).
+    Every ``retired_partition`` entry and every ``all_superseded`` entry is built
+    here: ``{"slug", "id", "state", "score"}``, plus ``superseded_by`` /
+    ``corrected_by`` when the stamp map carries them for the node, plus ``live_end``
+    when ``live_ends`` carries the node's id. Everything comes from the node the walk
+    resolved by point id — never from a slug lookup — so a retired decision that
+    shares its slug with a live decision is described as itself (its ``id`` reads
+    it whole by handle), and a renamed one under its current slug.
+
+    ``superseded_by`` / ``corrected_by`` are write facts: the **immediate** killer,
+    which on a chain may itself be retired. ``live_end`` is present exactly when an
+    immediate successor is retired, and names where the chain's current word lives
+    (``[]`` when the chain reaches no live decision). When the stamp or live-end
+    read faulted both maps are empty and every successor key is omitted; the
+    envelope's ``stamps_unread`` says so. Store-free: the maps are passed in.
+
+    ``score`` is required with no default, so a ranked caller that forgot its score is
+    a ``TypeError``. A handle that is not a ranked hit (a retired node's ``exists``
+    receipt, 7b) passes ``None`` deliberately, and the ``score`` key is then omitted.
 
     Args:
-        retired_handles: The filtered-out handles, each a dict with ``slug`` and
-            optionally ``superseded_by`` (the live successor slugs).
+        node: The resolved node; reads ``id``, ``slug`` and ``computed_state``.
+        score: The hit's similarity score, or ``None`` for a handle that is no hit.
+        stamps: Node id → modifier stamps, as the walk returned them.
+        live_ends: Node id → live-end slugs, as the walk returned them.
 
     Returns:
-        The blackout note string.
+        The handle dict.
     """
-    n = len(retired_handles)
-    parts: List[str] = []
-    for h in retired_handles:
-        successors = h.get("superseded_by")
+    handle: Dict[str, Any] = {
+        "slug": node["slug"],
+        "id": node["id"],
+        "state": node["computed_state"],
+    }
+    if score is not None:
+        handle["score"] = score
+    node_stamps = stamps.get(node["id"], {})
+    for key in ("superseded_by", "corrected_by"):
+        successors = node_stamps.get(key)
         if successors:
-            parts.append(f"{h['slug']} (→ {', '.join(successors)})")
+            handle[key] = list(successors)
+    # Membership, not truthiness: `[]` is a stated fact (no live end reached).
+    if node["id"] in live_ends:
+        handle["live_end"] = list(live_ends[node["id"]])
+    return handle
+
+
+def rejection_matches_payload(rejections: Any, *, window_ids: Sequence[str],
+                              owners_whole: bool,
+                              stamps: Mapping[str, Mapping[str, List[str]]],
+                              live_ends: Mapping[str, List[str]],
+                              whole_owners: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Shapes a ranked answer's rejection matches — the one constructor, shared CLI⇄MCP.
+
+    Every match carries ``slug``, ``id`` and ``state`` (its owner's), ``score``,
+    ``ordinal`` and ``item`` (the whole matched item, at every depth: it is what the
+    search found), then ``letter``, which says where the owner's reasoning sits:
+
+    * ``"here"`` — a live owner outside the window, on its best (first) match: the
+      owner's Letter follows (``axiom``, ``scope``, then ``rejected_paths`` unless
+      ``owners_whole`` is False), through :func:`letter_payload`, so the key set is
+      the Letter's own;
+    * ``"section"`` — that owner's later matches, which add nothing: the ``here``
+      match above carries the Letter;
+    * ``"window"`` — a live owner already in the window, which adds ``rank`` (its
+      1-based window rank) and no Letter;
+    * ``"retired"`` — a retired owner, which adds :func:`retired_handle`'s successor
+      keys (``superseded_by`` / ``corrected_by``, ``live_end``) and never a Letter.
+
+    So no decision's Letter appears twice in one envelope. A live owner's modifier
+    stamps follow (a match hands a reader a decision's state). Store-free: the walk's
+    maps are passed in.
+
+    Args:
+        rejections: The walk's ``RejectionWalk`` (duck-typed); reads ``matches``.
+        window_ids: The window's node ids, in rank order.
+        owners_whole: Whether a ``here`` owner keeps its ``rejected_paths`` (the
+            depth the caller set for the window's last rank;
+            ``recall.rejection_owners_whole``).
+        stamps: Node id → modifier stamps, as the walk returned them.
+        live_ends: Node id → live-end slugs, as the walk returned them.
+        whole_owners: How many ``here`` owners keep ``rejected_paths``, counted in
+            first-appearance order (the field-scoped lookup's ``full_top``, which
+            counts owners); later ``here`` owners are axiom-only. None keeps every
+            ``here`` owner at ``owners_whole``'s depth (the section). A retired
+            owner is never counted: it carries a handle, not a Letter.
+
+    Returns:
+        One dict per match, in the section's (score) order.
+    """
+    rank_of = {node_id: rank for rank, node_id in enumerate(window_ids, start=1)}
+    lettered = set()
+    out: List[Dict[str, Any]] = []
+    for match in rejections.matches:
+        owner = match.owner
+        payload: Dict[str, Any] = {
+            "slug": owner["slug"],
+            "id": owner["id"],
+            "state": owner["computed_state"],
+            "score": match.score,
+            "ordinal": match.ordinal,
+            "item": match.item,
+        }
+        if not match.live:
+            payload["letter"] = "retired"
+            handle = retired_handle(owner, score=match.score, stamps=stamps,
+                                    live_ends=live_ends)
+            for key, value in handle.items():
+                if key not in payload:
+                    payload[key] = value
+            out.append(payload)
+            continue
+        if owner["id"] in rank_of:
+            payload["letter"] = "window"
+            payload["rank"] = rank_of[owner["id"]]
+        elif owner["id"] in lettered:
+            payload["letter"] = "section"
         else:
-            parts.append(str(h["slug"]))
-    noun, verb = ("match", "is") if n == 1 else ("matches", "are")
-    return (
-        f"All {n} nearest {noun} {verb} superseded — no active precedent on "
-        f"this claim, but it was settled before. Retired: {'; '.join(parts)}. "
-        f"Read the retired history with: mitos list --state all "
-        f"(or list_decisions(state=\"all\"))."
-    )
+            whole = owners_whole and (whole_owners is None
+                                      or len(lettered) < whole_owners)
+            lettered.add(owner["id"])
+            payload["letter"] = "here"
+            for key, value in letter_payload(owner, brief=not whole).items():
+                if key not in payload:
+                    payload[key] = value
+        for key, slugs in stamps.get(owner["id"], {}).items():
+            payload[key] = list(slugs)
+        out.append(payload)
+    return out
 
 
 def node_handles(
@@ -315,10 +418,10 @@ def letter_payload(
     ``state`` / ``depth_mode`` already occupy that slot at every routed site).
 
     Returns an **un-stamped** core: modifier-stamping
-    (``superseded_by``/``amended_by``/…) is the caller's job via the
-    ``GraphStore.get_modifiers(...)`` seam — never folded in here. This keeps the
-    helper a pure dict→dict Tier-1 leaf (no ``store`` coupling) and preserves the
-    callers' batch (``get_modifiers_map``) vs per-node stamping paths. ``brief``
+    (``superseded_by``/``amended_by``/…) is the caller's job — the ranked reads
+    stamp from the walk's one batched ``get_modifiers_map`` read, other readers
+    through ``GraphStore.get_modifiers(...)`` — never folded in here. This keeps the
+    helper a pure dict→dict Tier-1 leaf (no ``store`` coupling). ``brief``
     governs only the ``rejected_paths`` key inside this helper; because stamping
     happens in the caller *after* this returns, ``brief`` can never drop a
     modifier stamp.

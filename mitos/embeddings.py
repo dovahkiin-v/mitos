@@ -8,9 +8,56 @@ import sqlite3
 import json
 import hashlib
 import os
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Sequence, Tuple
 from mitos.models import get_embedding_model_id
 from mitos.errors import EmbeddingError
+
+# The asymmetric prefix every document embedding is sent with. One spelling for
+# the two senders (the cached ``get_embedding`` and the uncached
+# ``embed_documents``); ``rejections.DOCUMENT_PREFIX_BYTES`` derives the item-part
+# bound from its byte length, and ``tests/test_rejections.py`` tripwires the bytes
+# each path actually sends.
+DOCUMENT_PREFIX = "search_document: "
+
+# The batch bounds of one ``embed_content`` call: at most this many texts, and at
+# most this many UTF-8 bytes of PREFIXED text. ``fit_batch`` and ``embed_documents``
+# both read them at call time, so the batches the one batched path sends are within
+# the bounds literally.
+EMBED_BATCH_MAX_TEXTS = 100
+EMBED_BATCH_MAX_BYTES = 40_000
+
+
+def _prefixed_bytes(text: str) -> int:
+    """Returns the UTF-8 byte length of ``text`` as sent, with the document prefix."""
+    return len((DOCUMENT_PREFIX + text).encode("utf-8"))
+
+
+def fit_batch(texts: Sequence[str]) -> int:
+    """Counts how many leading texts fit one uncached embedding call.
+
+    Pure. A text fits while the batch holds at most ``EMBED_BATCH_MAX_TEXTS``
+    texts and at most ``EMBED_BATCH_MAX_BYTES`` prefixed UTF-8 bytes in total.
+    Non-empty input always yields at least 1, so a caller walking a long list
+    always progresses; that rule is for progress only and is not a guard — a
+    single text over the byte bound is still refused by ``embed_documents``.
+
+    Args:
+        texts: The unprefixed texts, in the order they would be sent.
+
+    Returns:
+        The length of the longest leading run that fits (0 for empty input).
+    """
+    count = 0
+    total = 0
+    for text in texts:
+        size = _prefixed_bytes(text)
+        if count >= EMBED_BATCH_MAX_TEXTS or total + size > EMBED_BATCH_MAX_BYTES:
+            break
+        count += 1
+        total += size
+    if count == 0 and texts:
+        return 1
+    return count
 
 class EmbeddingCache:
     """SQLite-backed persistent cache for text embeddings."""
@@ -153,7 +200,7 @@ class GeminiEmbeddingProvider:
             The embedding vector.
         """
         # Apply asymmetric prefixing
-        prefix = "search_query: " if is_query else "search_document: "
+        prefix = "search_query: " if is_query else DOCUMENT_PREFIX
         prefixed_text = prefix + text
         
         content_hash = self.compute_content_hash(prefixed_text)
@@ -188,81 +235,86 @@ class GeminiEmbeddingProvider:
         except Exception as e:
             raise EmbeddingError(f"Gemini embedding API call failed: {str(e)}") from e
 
-    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Gets embeddings for a batch of documents, utilizing token-aware bounds.
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Embeds documents in exactly one provider call, never touching the cache.
+
+        The rejection index's embedding path. It neither reads nor writes
+        ``self.cache`` and never moves ``hits``/``misses`` (they describe the
+        cache): an item's point id derives from its text, so the index's own
+        presence answer is its cache (ADR
+        ``rejection-index-embeddings-bypass-the-shared-embedding-cache``).
+
+        The bounds are checked absolutely, before any call, so "one call within
+        the declared bounds" holds for every caller: more than
+        ``EMBED_BATCH_MAX_TEXTS`` texts, or more than ``EMBED_BATCH_MAX_BYTES``
+        prefixed UTF-8 bytes in total (a single oversized text included), is a
+        caller's programming error. ``fit_batch`` sizes a batch that passes.
 
         Args:
-            texts: List of text blocks.
+            texts: The unprefixed document texts; each is sent with
+                ``DOCUMENT_PREFIX``.
 
         Returns:
-            List of embedding vectors.
+            One non-empty vector per text, in input order. Empty input returns
+            ``[]`` with no call.
+
+        Raises:
+            ValueError: If the batch exceeds either bound.
+            EmbeddingError: If the call fails (chained from the SDK exception,
+                so ``provider_cause`` can classify it) or the answer is
+                malformed: no embeddings, a count other than ``len(texts)``, or
+                an element whose ``values`` is missing or empty.
         """
-        results: List[Optional[List[float]]] = [None] * len(texts)
-        miss_indices = []
-        miss_texts = []
+        if not texts:
+            return []
+        if len(texts) > EMBED_BATCH_MAX_TEXTS:
+            raise ValueError(
+                f"embed_documents takes at most {EMBED_BATCH_MAX_TEXTS} texts per "
+                f"call, got {len(texts)}"
+            )
+        total = sum(_prefixed_bytes(t) for t in texts)
+        if total > EMBED_BATCH_MAX_BYTES:
+            raise ValueError(
+                f"embed_documents takes at most {EMBED_BATCH_MAX_BYTES} prefixed "
+                f"UTF-8 bytes per call, got {total}"
+            )
+        # One ``Content`` per text, never a list of strings: measured 2026-10-17
+        # (google-genai 2.8.0, gemini-embedding-2), a list of N strings is read as
+        # ONE content of N parts and answers ONE embedding, while N ``Content``
+        # answer N, each identical to the single-text call. The answer check below
+        # is what caught it; ``tests/test_rejection_inline_live.py`` pins it live.
+        # Imported here, not at module scope, for the reason ``__init__`` gives.
+        from google.genai import types
 
-        # 1. Resolve cache hits first
-        for idx, text in enumerate(texts):
-            prefix = "search_document: "
-            prefixed_text = prefix + text
-            content_hash = self.compute_content_hash(prefixed_text)
-            
-            cached_vector = self.cache.get(content_hash)
-            if cached_vector is not None:
-                self.hits += 1
-                results[idx] = cached_vector
-            else:
-                self.misses += 1
-                miss_indices.append(idx)
-                # Keep prefixed text for bulk API call
-                miss_texts.append(prefixed_text)
-
-        # 2. Process cache misses in token-aware batches
-        if miss_texts:
-            max_batch_count = 100
-            max_batch_chars = 40000  # ~10,000 tokens
-            
-            current_batch = []
-            current_batch_chars = 0
-            batches = []
-            
-            for prefixed_t in miss_texts:
-                if len(current_batch) >= max_batch_count or (current_batch_chars + len(prefixed_t)) > max_batch_chars:
-                    batches.append(current_batch)
-                    current_batch = [prefixed_t]
-                    current_batch_chars = len(prefixed_t)
-                else:
-                    current_batch.append(prefixed_t)
-                    current_batch_chars += len(prefixed_t)
-            if current_batch:
-                batches.append(current_batch)
-
-            # 3. Call bulk API for each batch and populate results/cache
-            processed_count = 0
-            for batch in batches:
-                try:
-                    response = self.client.models.embed_content(
-                        model=self.model_id,
-                        contents=batch
-                    )
-                    
-                    if not response.embeddings:
-                        raise EmbeddingError("Gemini API returned empty embeddings in batch call")
-                    
-                    for i, emb in enumerate(response.embeddings):
-                        vector = emb.values
-                        # Store in results at original index
-                        orig_idx = miss_indices[processed_count + i]
-                        results[orig_idx] = vector
-                        
-                        # Cache the result
-                        text_item = batch[i]
-                        content_hash = self.compute_content_hash(text_item)
-                        self.cache.set(content_hash, vector)
-                        
-                    processed_count += len(batch)
-                except Exception as e:
-                    raise EmbeddingError(f"Batch embedding API call failed: {str(e)}") from e
-
-        # Filter out any None values (should be none)
-        return [r for r in results if r is not None]
+        contents = [
+            types.Content(parts=[types.Part(text=DOCUMENT_PREFIX + t)]) for t in texts
+        ]
+        # The try wraps the SDK call alone, so the malformed-answer errors below
+        # are raised once, never re-wrapped and chained to themselves.
+        try:
+            response = self.client.models.embed_content(
+                model=self.model_id,
+                contents=contents,
+            )
+        except Exception as e:
+            raise EmbeddingError(
+                f"Gemini embedding API call failed: {str(e)}"
+            ) from e
+        # Malformed-answer messages stay constant (no counts, no text):
+        # ``provider_cause`` matches "429" anywhere in a message, so an
+        # interpolated number could misclassify this as quota.
+        embeddings = getattr(response, "embeddings", None)
+        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+            raise EmbeddingError(
+                "Gemini API returned a document embedding list that does not "
+                "match the batch"
+            )
+        vectors: List[List[float]] = []
+        for emb in embeddings:
+            values = getattr(emb, "values", None)
+            if not isinstance(values, list) or not values:
+                raise EmbeddingError(
+                    "Gemini API returned a document embedding with no values"
+                )
+            vectors.append(values)
+        return vectors

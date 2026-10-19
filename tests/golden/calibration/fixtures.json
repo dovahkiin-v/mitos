@@ -1,0 +1,1045 @@
+{
+  "_doc": {
+    "what": "Layer C's labelled fixtures. Each records similarity values for one class, in the embedding space its threshold compares. Validated by _calibration_record.load_fixtures; item refs resolved by _calibration_harness.resolve_item_refs.",
+    "shape": {
+      "id": "unique kebab-case",
+      "class": "one of: bullseye, handle-words, family-neighbour, off-axis, rejection-target, retired-precedent",
+      "form": "query (embedded as a query, read through MCP surface_decisions) or draft (embedded as a document, read through conflict.gather_candidates); the space follows from the form and is never authored",
+      "text": "the query or draft axiom",
+      "targets": "Harbor slugs, possibly empty (an off-axis query has no right answer). On rejection-target: the item owner, plus any live decision that adopted the same option",
+      "negatives": "Harbor slugs recorded as hard negatives; empty on rejection-target, whose negatives are negative_items",
+      "measure": "target (each target's value), top_live (the top live hit's value, the band's input) or item (each target item's value in the per-item rejection shape; rejection-target only, and that class only with it)",
+      "exclude": "optional: slugs flagged as the draft's own node and left out of every margin",
+      "target_items": "rejection-target only, non-empty: [{owner, option}], owner a Harbor slug, option a case-sensitive prefix of exactly one of the owner's items (its text without the (N) marker)",
+      "negative_items": "rejection-target only, non-empty: [{owner, option, kind}], the hard negatives the rejection-match floor must keep out of a section. kind is generic (do nothing, defer, status quo) or vocabulary (another decision's non-generic item, rejected for another question, naming a different mechanism from the one the query proposes while sharing its subject words). Never a target's own item, and never an elsewhere-does-not-carry case, which stays a target under its form",
+      "rejection_form": "rejection-target only: own-question, elsewhere-carries or elsewhere-does-not-carry (the owner's reason carries over, or not; never a hard negative either way)",
+      "notes": "one line: why this label holds"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "bullseye-rate-limit-per-minute",
+      "class": "bullseye",
+      "form": "query",
+      "text": "How many API requests can a single account make per minute?",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "api-rate-limit settles exactly this: 600 requests per minute per account"
+    },
+    {
+      "id": "bullseye-backup-cadence",
+      "class": "bullseye",
+      "form": "query",
+      "text": "How often is the metadata database backed up, and how much history is kept?",
+      "targets": [
+        "harbor-backup-nightly"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "backup-nightly answers both halves (nightly, 14 days); the open question it resolves is never live"
+    },
+    {
+      "id": "bullseye-log-line-format",
+      "class": "bullseye",
+      "form": "query",
+      "text": "What format do Harbor's log lines use?",
+      "targets": [
+        "harbor-structured-logging"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "structured-logging is the format decision; otel amends it but decides the pipeline, not the format"
+    },
+    {
+      "id": "bullseye-api-version-selection",
+      "class": "bullseye",
+      "form": "query",
+      "text": "How do clients choose which version of the HTTP API they call?",
+      "targets": [
+        "harbor-api-versioning"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "api-versioning: a leading path segment"
+    },
+    {
+      "id": "bullseye-blob-bytes-location",
+      "class": "bullseye",
+      "form": "query",
+      "text": "Where does Harbor put the bytes of uploaded files?",
+      "targets": [
+        "harbor-blobs-on-s3"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "blobs-on-s3 decides where payloads live; sqlite holds metadata, not bytes"
+    },
+    {
+      "id": "bullseye-premium-throttling",
+      "class": "bullseye",
+      "form": "query",
+      "text": "Are premium tenants throttled by the per-account request cap?",
+      "targets": [
+        "harbor-premium-exempt-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "premium-exempt-rate-limit answers it directly (exempt)"
+    },
+    {
+      "id": "bullseye-key-rotation-period",
+      "class": "bullseye",
+      "form": "query",
+      "text": "How often are the blob encryption keys rotated?",
+      "targets": [
+        "harbor-blob-key-rotation-quarterly"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "blob-key-rotation-quarterly: every quarter"
+    },
+    {
+      "id": "bullseye-lithuanian-data-residency",
+      "class": "bullseye",
+      "form": "query",
+      "text": "Ar Lietuvos naudotojų duomenys saugomi tik Lietuvoje esančiuose serveriuose?",
+      "targets": [
+        "harbor-duomenu-saugojimas-lietuvoje"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "Lithuanian (P9); paraphrases the Lithuania-only decision; its live EU-wide sibling disagrees and is not the answer asked for"
+    },
+    {
+      "id": "bullseye-draft-rate-limit",
+      "class": "bullseye",
+      "form": "draft",
+      "text": "Each Harbor account may send at most 600 API requests in any one minute.",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "a paraphrase of api-rate-limit's axiom: the duplicate side of the pause floor"
+    },
+    {
+      "id": "bullseye-draft-json-logs",
+      "class": "bullseye",
+      "form": "draft",
+      "text": "Harbor's logs are JSON objects, written one per line.",
+      "targets": [
+        "harbor-structured-logging"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "a paraphrase of structured-logging's axiom"
+    },
+    {
+      "id": "bullseye-draft-webhook-retries",
+      "class": "bullseye",
+      "form": "draft",
+      "text": "Harbor retries tenant webhook notifications until each one is delivered at least once.",
+      "targets": [
+        "harbor-webhook-delivery"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "a paraphrase of webhook-delivery's axiom"
+    },
+    {
+      "id": "bullseye-draft-object-store",
+      "class": "bullseye",
+      "form": "draft",
+      "text": "Uploaded file contents are kept in an S3-compatible object store.",
+      "targets": [
+        "harbor-blobs-on-s3"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "a paraphrase of blobs-on-s3's axiom"
+    },
+    {
+      "id": "handle-words-api-rate-limit",
+      "class": "handle-words",
+      "form": "query",
+      "text": "harbor api rate limit",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "the target slug's own words with the hyphens dropped"
+    },
+    {
+      "id": "handle-words-backup-nightly",
+      "class": "handle-words",
+      "form": "query",
+      "text": "harbor backup nightly",
+      "targets": [
+        "harbor-backup-nightly"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "the target slug's own words with the hyphens dropped"
+    },
+    {
+      "id": "handle-words-webhook-delivery",
+      "class": "handle-words",
+      "form": "query",
+      "text": "harbor webhook delivery",
+      "targets": [
+        "harbor-webhook-delivery"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "the target slug's own words with the hyphens dropped"
+    },
+    {
+      "id": "handle-words-blobs-on-s3",
+      "class": "handle-words",
+      "form": "query",
+      "text": "harbor blobs on s3",
+      "targets": [
+        "harbor-blobs-on-s3"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "the target slug's own words with the hyphens dropped"
+    },
+    {
+      "id": "handle-words-structured-logging",
+      "class": "handle-words",
+      "form": "query",
+      "text": "harbor structured logging",
+      "targets": [
+        "harbor-structured-logging"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "the target slug's own words with the hyphens dropped"
+    },
+    {
+      "id": "handle-words-api-versioning",
+      "class": "handle-words",
+      "form": "query",
+      "text": "harbor api versioning",
+      "targets": [
+        "harbor-api-versioning"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "the target slug's own words with the hyphens dropped"
+    },
+    {
+      "id": "family-neighbour-concurrent-uploads",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "How many uploads can one account run at the same time?",
+      "targets": [],
+      "negatives": [
+        "harbor-api-rate-limit"
+      ],
+      "measure": "top_live",
+      "notes": "api-rate-limit caps requests per minute, not concurrency; no decision answers it"
+    },
+    {
+      "id": "family-neighbour-tls-rotation",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "How often does Harbor rotate its TLS certificates?",
+      "targets": [],
+      "negatives": [
+        "harbor-blob-key-rotation-quarterly"
+      ],
+      "measure": "top_live",
+      "notes": "key-rotation rotates blob encryption keys, not TLS certificates"
+    },
+    {
+      "id": "family-neighbour-disk-alerts",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "Which alerts fire when Harbor's disk is nearly full?",
+      "targets": [],
+      "negatives": [
+        "harbor-prometheus-metrics"
+      ],
+      "measure": "top_live",
+      "notes": "prometheus-metrics exposes metrics and says nothing about alerting"
+    },
+    {
+      "id": "family-neighbour-log-levels",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "Which log levels does Harbor emit in production?",
+      "targets": [],
+      "negatives": [
+        "harbor-structured-logging"
+      ],
+      "measure": "top_live",
+      "notes": "structured-logging fixes the log format, not which levels are written"
+    },
+    {
+      "id": "family-neighbour-api-deprecation",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "How long is an old API version supported after a new one ships?",
+      "targets": [],
+      "negatives": [
+        "harbor-api-versioning"
+      ],
+      "measure": "top_live",
+      "notes": "api-versioning chooses the path segment and is silent on deprecation"
+    },
+    {
+      "id": "family-neighbour-webhook-authenticity",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "How do tenants verify that a webhook call really came from Harbor?",
+      "targets": [],
+      "negatives": [
+        "harbor-webhook-delivery"
+      ],
+      "measure": "top_live",
+      "notes": "webhook-delivery is about retry guarantees, not about proving the sender"
+    },
+    {
+      "id": "family-neighbour-restore-drills",
+      "class": "family-neighbour",
+      "form": "query",
+      "text": "How often does the team test restoring a backup?",
+      "targets": [],
+      "negatives": [
+        "harbor-backup-nightly"
+      ],
+      "measure": "top_live",
+      "notes": "backup-nightly sets how often backups are taken, not whether restores are rehearsed"
+    },
+    {
+      "id": "family-neighbour-draft-session-revocation",
+      "class": "family-neighbour",
+      "form": "draft",
+      "text": "Harbor revokes every session token of a user when that user changes their password.",
+      "targets": [],
+      "negatives": [
+        "harbor-auth-jwt-v1",
+        "harbor-auth-jwt-v2"
+      ],
+      "measure": "top_live",
+      "notes": "extends auth-sessions-v3 without duplicating it; the retired JWT pair is the nearby graveyard"
+    },
+    {
+      "id": "family-neighbour-draft-idle-session-expiry",
+      "class": "family-neighbour",
+      "form": "draft",
+      "text": "Harbor expires a session token after 30 minutes without a request.",
+      "targets": [],
+      "negatives": [
+        "harbor-auth-jwt-v1",
+        "harbor-auth-jwt-v2"
+      ],
+      "measure": "top_live",
+      "notes": "a session-lifetime rule beside auth-sessions-v3; not a return to stateless JWTs"
+    },
+    {
+      "id": "family-neighbour-draft-upload-size-cap",
+      "class": "family-neighbour",
+      "form": "draft",
+      "text": "Uploads through the HTTPS API are limited to 5 GB per file.",
+      "targets": [],
+      "negatives": [
+        "harbor-legacy-ftp-gateway"
+      ],
+      "measure": "top_live",
+      "notes": "a rule on the HTTPS upload path drop-ftp-gateway kept; not a return to FTP"
+    },
+    {
+      "id": "family-neighbour-draft-resumable-uploads",
+      "class": "family-neighbour",
+      "form": "draft",
+      "text": "Harbor's HTTPS upload endpoint lets a client resume an interrupted transfer.",
+      "targets": [],
+      "negatives": [
+        "harbor-legacy-ftp-gateway"
+      ],
+      "measure": "top_live",
+      "notes": "beside drop-ftp-gateway; adds to the HTTPS path, re-treads nothing retired"
+    },
+    {
+      "id": "family-neighbour-draft-retry-queue-metric",
+      "class": "family-neighbour",
+      "form": "draft",
+      "text": "Harbor exposes the depth of its webhook retry queue as a Prometheus metric.",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "beside prometheus-metrics and webhook-delivery, duplicating neither; no retired neighbour"
+    },
+    {
+      "id": "off-axis-inline-preview",
+      "class": "off-axis",
+      "form": "query",
+      "text": "Which file types can the Harbor web app preview inline?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "Harbor vocabulary (files, web app); no decision covers previews"
+    },
+    {
+      "id": "off-axis-on-call",
+      "class": "off-axis",
+      "form": "query",
+      "text": "Who is on call for Harbor this weekend?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "an operations roster question, not a design decision"
+    },
+    {
+      "id": "off-axis-premium-price",
+      "class": "off-axis",
+      "form": "query",
+      "text": "What does the premium Harbor plan cost per seat?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "shares 'premium' with the rate-limit exemption; pricing is not decided anywhere"
+    },
+    {
+      "id": "off-axis-sdk-languages",
+      "class": "off-axis",
+      "form": "query",
+      "text": "Which languages is the Harbor client SDK available in?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "client and API vocabulary; no decision covers the SDK"
+    },
+    {
+      "id": "off-axis-shared-folder-invite",
+      "class": "off-axis",
+      "form": "query",
+      "text": "How do I invite a colleague to a shared Harbor folder?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "tenant and file vocabulary; sharing is never decided"
+    },
+    {
+      "id": "off-axis-dashboard-theme",
+      "class": "off-axis",
+      "form": "query",
+      "text": "What colour theme does the Harbor dashboard use in dark mode?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "a UI question with Harbor's name in it"
+    },
+    {
+      "id": "off-axis-bluetooth-sync",
+      "class": "off-axis",
+      "form": "query",
+      "text": "Can Harbor sync photos from my phone over Bluetooth?",
+      "targets": [],
+      "negatives": [],
+      "measure": "top_live",
+      "notes": "shares 'sync' with the concurrent-edit decisions; device transport is never decided"
+    },
+    {
+      "id": "retired-ftp-legacy-uploads",
+      "class": "retired-precedent",
+      "form": "query",
+      "text": "Can legacy clients upload files to Harbor over FTP?",
+      "targets": [
+        "harbor-legacy-ftp-gateway"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "legacy-ftp-gateway answered yes and was corrected; drop-ftp-gateway is its live successor, not a negative"
+    },
+    {
+      "id": "retired-jwt-authentication",
+      "class": "retired-precedent",
+      "form": "query",
+      "text": "Does Harbor authenticate API calls with JSON Web Tokens?",
+      "targets": [
+        "harbor-auth-jwt-v1",
+        "harbor-auth-jwt-v2"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "both JWT decisions answered yes before sessions-v3 superseded the chain"
+    },
+    {
+      "id": "retired-jwt-tenant-claim",
+      "class": "retired-precedent",
+      "form": "query",
+      "text": "Do Harbor's API tokens carry the tenant as a claim?",
+      "targets": [
+        "harbor-auth-jwt-v2"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "jwt-v2 put a tenant claim in the token; superseded by sessions-v3"
+    },
+    {
+      "id": "retired-jwt-short-lived",
+      "class": "retired-precedent",
+      "form": "query",
+      "text": "Are Harbor's access tokens short-lived JWTs?",
+      "targets": [
+        "harbor-auth-jwt-v2"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "jwt-v2's axiom, asked as a question"
+    },
+    {
+      "id": "retired-ftp-scanner-uploads",
+      "class": "retired-precedent",
+      "form": "query",
+      "text": "How do the pilot customers' document scanners send files to Harbor?",
+      "targets": [
+        "harbor-legacy-ftp-gateway"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "legacy-ftp-gateway was the scanners' path in; corrected since"
+    },
+    {
+      "id": "retired-draft-signed-jwt",
+      "class": "retired-precedent",
+      "form": "draft",
+      "text": "Harbor will verify every API request using a signed JSON Web Token.",
+      "targets": [
+        "harbor-auth-jwt-v1"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "re-treads jwt-v1 in other words"
+    },
+    {
+      "id": "retired-draft-jwt-tenant-expiry",
+      "class": "retired-precedent",
+      "form": "draft",
+      "text": "API access tokens are JWTs that expire within minutes and name the tenant they belong to.",
+      "targets": [
+        "harbor-auth-jwt-v2"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "re-treads jwt-v2 in other words"
+    },
+    {
+      "id": "retired-draft-stateless-bearer",
+      "class": "retired-precedent",
+      "form": "draft",
+      "text": "Harbor issues stateless bearer JWTs to authenticate API clients.",
+      "targets": [
+        "harbor-auth-jwt-v1",
+        "harbor-auth-jwt-v2"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "re-treads the JWT chain's shared ground"
+    },
+    {
+      "id": "retired-draft-ftp-endpoint",
+      "class": "retired-precedent",
+      "form": "draft",
+      "text": "Harbor keeps an FTP endpoint so older scanners can still upload files.",
+      "targets": [
+        "harbor-legacy-ftp-gateway"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "re-treads legacy-ftp-gateway"
+    },
+    {
+      "id": "retired-draft-ftp-older-clients",
+      "class": "retired-precedent",
+      "form": "draft",
+      "text": "Older clients that cannot speak HTTPS upload their files to Harbor over FTP.",
+      "targets": [
+        "harbor-legacy-ftp-gateway"
+      ],
+      "negatives": [],
+      "measure": "target",
+      "notes": "re-treads legacy-ftp-gateway from the client side"
+    },
+    {
+      "id": "rejection-own-postgres",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should Harbor keep its file metadata in Postgres instead?",
+      "targets": [
+        "harbor-storage-is-sqlite"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "re-proposes the option storage-is-sqlite rejected, for the question sqlite settled",
+      "target_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Postgres"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-blobs-on-s3",
+          "option": "Blobs in SQLite",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "own-question"
+    },
+    {
+      "id": "rejection-own-per-ip-limit",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should the request limit be counted per client IP address rather than per account?",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "re-proposes per-IP limits, which api-rate-limit rejected for its own question",
+      "target_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Per-IP"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-premium-exempt-rate-limit",
+          "option": "A higher fixed ceiling",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "own-question"
+    },
+    {
+      "id": "rejection-own-continuous-backup",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Could Harbor back up the metadata database continuously instead of once a night?",
+      "targets": [
+        "harbor-backup-nightly"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "re-proposes continuous backup for the cadence backup-nightly settled",
+      "target_items": [
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Continuous backup"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-blob-encryption-at-rest",
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-blobs-on-s3",
+          "option": "Blobs in SQLite",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "own-question"
+    },
+    {
+      "id": "rejection-own-fire-and-forget",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should Harbor send each webhook notification once and not retry it?",
+      "targets": [
+        "harbor-webhook-delivery"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "re-proposes fire-and-forget for the delivery question webhook-delivery settled",
+      "target_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Fire-and-forget"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-observability-otel",
+          "option": "Defer",
+          "kind": "generic"
+        }
+      ],
+      "rejection_form": "own-question"
+    },
+    {
+      "id": "rejection-own-last-write-wins",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "When two clients edit the same file at once, should Harbor simply keep whichever write arrives last?",
+      "targets": [
+        "harbor-sync-crdt-merge",
+        "harbor-sync-last-write-wins"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "owner: sync-crdt-merge rejected last-write-wins; adopter: the live sync-last-write-wins decided it",
+      "target_items": [
+        {
+          "owner": "harbor-sync-crdt-merge",
+          "option": "Last-write-wins"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-sync-last-write-wins",
+          "option": "CRDT merge",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "own-question"
+    },
+    {
+      "id": "rejection-own-immediate-delete",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should deleting a file purge it at once, with no way to recover it?",
+      "targets": [
+        "harbor-delete-is-soft-30d",
+        "harbor-delete-is-immediate-hard"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "owner: delete-is-soft-30d rejected immediate hard delete; adopter: the live delete-is-immediate-hard decided it",
+      "target_items": [
+        {
+          "owner": "harbor-delete-is-soft-30d",
+          "option": "Immediate hard delete"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-delete-is-immediate-hard",
+          "option": "A grace period",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "own-question"
+    },
+    {
+      "id": "rejection-carries-postgres-queue",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should the webhook retry queue be stored in a Postgres database?",
+      "targets": [
+        "harbor-storage-is-sqlite"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "Postgres met for the queue on the same single node: sqlite's operational-weight reason carries over",
+      "target_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Postgres"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Tenant polling",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-carries"
+    },
+    {
+      "id": "rejection-carries-audit-fire-and-forget",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Can audit events be sent to the log collector fire-and-forget?",
+      "targets": [
+        "harbor-webhook-delivery"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "a transient collector outage would silently drop audit events: webhook-delivery's reason carries over",
+      "target_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Fire-and-forget"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-observability-otel",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-structured-logging",
+          "option": "Free-text logs",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-carries"
+    },
+    {
+      "id": "rejection-carries-shared-signing-key",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should every tenant's API session tokens be signed with one shared key?",
+      "targets": [
+        "harbor-blob-encryption-at-rest"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "one leaked key exposes everything and rotation touches everything: blob-encryption's reason carries over",
+      "target_items": [
+        {
+          "owner": "harbor-blob-encryption-at-rest",
+          "option": "One master key"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-blob-encryption-at-rest",
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-auth-sessions-v3",
+          "option": "Sticking with stateless JWTs",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-carries"
+    },
+    {
+      "id": "rejection-carries-per-ip-bandwidth",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should upload bandwidth be capped per client IP address?",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "tenants behind one NAT would share one bandwidth budget: api-rate-limit's reason carries over",
+      "target_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Per-IP"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-premium-exempt-rate-limit",
+          "option": "A higher fixed ceiling",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-carries"
+    },
+    {
+      "id": "rejection-not-carry-postgres-warehouse",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should the company's analytics warehouse, which spans every region, run on Postgres?",
+      "targets": [
+        "harbor-storage-is-sqlite"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "sqlite's reason was a single-node service; a multi-region warehouse is not one, so it does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Postgres"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Do nothing",
+          "kind": "generic"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    },
+    {
+      "id": "rejection-not-carry-newsletter",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should the monthly marketing newsletter be sent fire-and-forget?",
+      "targets": [
+        "harbor-webhook-delivery"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "a dropped newsletter costs nothing like a dropped change notification, so the reason does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Fire-and-forget"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Defer",
+          "kind": "generic"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    },
+    {
+      "id": "rejection-not-carry-json-fixtures",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Should the read-only test fixtures be kept as flat JSON files on disk?",
+      "targets": [
+        "harbor-storage-is-sqlite"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "read-only fixtures have no multi-record writes for a crash to corrupt, so sqlite's reason does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Flat JSON files"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-storage-is-sqlite",
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-config-yaml",
+          "option": "Environment variables only",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    },
+    {
+      "id": "rejection-not-carry-batch-ip-throttle",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Our nightly export job runs alone on one machine with a fixed address. Should its API throttle key on that IP?",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "per-IP was rejected because tenants behind one NAT would share a budget; a single internal job has no tenants to share one, so the reason does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Per-IP"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-premium-exempt-rate-limit",
+          "option": "A higher fixed ceiling",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    },
+    {
+      "id": "rejection-not-carry-load-test-purge",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "In the throwaway load-test environment, should deleted test files be purged at once instead of kept around?",
+      "targets": [
+        "harbor-delete-is-soft-30d"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "immediate hard delete was rejected because one mistaken call loses a customer's data; synthetic load-test files belong to no customer, so the reason does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-delete-is-soft-30d",
+          "option": "Immediate hard delete"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-delete-is-immediate-hard",
+          "option": "A grace period",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    }
+  ]
+}

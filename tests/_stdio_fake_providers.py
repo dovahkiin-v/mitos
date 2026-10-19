@@ -1,4 +1,4 @@
-"""Launches ``mitos serve`` with only its two provider constructors bound to fakes.
+"""Launches ``mitos serve`` with only its three provider constructors bound to fakes.
 
 A stdio row that walks the receipts needs a server that embeds and ranks, and
 constraint 15 says every row this vision adds runs offline: no key, no Qdrant. A
@@ -10,13 +10,18 @@ gets out of the way:
    interpreter, exactly as ``mcp_harness.SERVE_ARGS`` relies on);
 2. rebinds ``GeminiEmbeddingProvider`` and ``QdrantVectorStore`` at the two
    construct sites the MCP path reaches — ``mitos.mcp_server``
-   (``get_workspace_components``) and ``mitos.sync`` (``MitosSyncManager``). Both
-   modules did ``from … import`` at their own scope, so rebinding the defining
-   modules would change nothing. The other two construct sites are left alone on
-   purpose: ``mitos.importer`` (the import verb) and ``mitos.cli``'s
-   ``_build_check_substrate`` (the check verb) are not reachable from a tool;
+   (``get_workspace_components``) and ``mitos.sync`` (``MitosSyncManager``) — and
+   the third constructor, ``QdrantRejectionIndex``, at the two MCP-reachable sites
+   that build one: ``mitos.sync`` (the record and amend tools' inline rejection
+   leg) and ``mitos.mcp_server`` (the ranked reads' ``_ranked_rejection_index``,
+   since 5a). Both share one process-lifetime fake per collection, so a read
+   searches what a record wrote. Both modules did ``from … import`` at their own scope, so
+   rebinding the defining modules would change nothing. The other two construct
+   sites are left alone on purpose: ``mitos.importer`` (the import verb) and
+   ``mitos.cli``'s ``_build_check_substrate`` (the check verb) are not reachable
+   from a tool;
 3. sets ``sys.argv`` to ``mitos serve`` and calls the same ``cli.main()`` that
-   ``python -m mitos.cli serve`` runs. Everything above the two constructors — the
+   ``python -m mitos.cli serve`` runs. Everything above the three constructors — the
    FastMCP subclass, the tool bodies, the payload assembly — is the branch's code.
 
 Launch it with ``mitos_server(cwd=…, env=…, args=(str(LAUNCHER),))``. ADR
@@ -30,11 +35,25 @@ answer anything else loudly: an ``UNIMPLEMENTED`` line on stderr as well as the
 raise, because production may swallow the raise. A row asserts that line absent.
 
 ``MITOS_FAKE_EMBED_FAULT`` (``auth``, ``quota``, ``transient`` or ``unknown``)
-makes every ``get_embedding`` call fail the way the Gemini SDK does: an
+makes every ``get_embedding`` and ``embed_documents`` call fail the way the Gemini
+SDK does: an
 ``EmbeddingError`` carrying a provider body, chained from an SDK-shaped error with
 the matching typed fields. The fault fires in the call, never the constructor: a
 constructor raise is swallowed at the construct site, and the read would then
 report no provider at all instead of the classified cause.
+
+``MITOS_FAKE_PROVIDERS=embed`` selects the **embed-only** mode (recall-confidence 9b,
+ADR ``a-walk-across-a-covering-verb-rebinds-only-the-embedder-and-keeps-real-qdrant``):
+only ``GeminiEmbeddingProvider`` is rebound — at ``mitos.mcp_server``, ``mitos.sync``
+and ``mitos.cli`` (the check verb's site; harmless) — and both Qdrant collections stay
+real, because a covering verb (``reconcile``) runs in its own process and process-lifetime
+fakes cannot carry its state to the server. Vectors are ``mitos.models.EMBEDDING_DIM``
+wide, the width a real collection is created at. Any arguments after the script name
+pass through to ``cli.main()`` (``init``, ``record``, ``reconcile``, ``status``; none
+means ``serve``), and one identity line names the mode, ``mitos.__file__`` and
+``sys.executable``, so a row can prove the child ran this checkout through this
+interpreter. With the name absent, nothing above changes: the default bind, its
+marker and its 1024-wide vectors are today's.
 """
 
 from __future__ import annotations
@@ -45,13 +64,26 @@ import os
 import re
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: The environment name that selects a provider fault for the whole child.
 FAULT_ENV = "MITOS_FAKE_EMBED_FAULT"
 
 #: Written to stderr once both sites are bound; a row reads it back.
 BOUND_MARKER = "[fake-providers] bound at mitos.mcp_server and mitos.sync"
+
+#: The environment name that selects the launcher's mode; absent means the default.
+MODE_ENV = "MITOS_FAKE_PROVIDERS"
+
+#: The one non-default mode: the embedder alone is fake, Qdrant is real.
+EMBED_MODE = "embed"
+
+#: Written to stderr once the embed-only mode has bound its sites.
+EMBED_BOUND_MARKER = ("[fake-providers] embed-only: GeminiEmbeddingProvider bound at "
+                      "mitos.mcp_server, mitos.sync and mitos.cli; Qdrant is real")
+
+#: Prefixes the embed mode's identity line: ``<marker> mode=… mitos=… python=…``.
+IDENTITY_MARKER = "[fake-providers] identity"
 
 #: Prefixes the line a fake writes when production calls something it lacks.
 UNIMPLEMENTED_MARKER = "[fake-providers] UNIMPLEMENTED"
@@ -74,24 +106,26 @@ DIMENSION = 1024
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
-def fake_vector(text: str) -> List[float]:
+def fake_vector(text: str, width: int = DIMENSION) -> List[float]:
     """Embeds text as a normalised, hashed bag of lower-cased tokens.
 
     Deterministic across processes (sha256, never ``hash()``), so the test that
     chooses fixture texts and the child that embeds them agree on every score.
     Axioms that share most of their words score high; unrelated ones score low.
+    Two processes agree only at the same ``width``: the token's bucket is its hash
+    modulo the width.
 
     Args:
         text: The text to embed.
+        width: The vector's width; the embed-only mode passes ``EMBEDDING_DIM``.
 
     Returns:
-        A unit vector of :data:`DIMENSION` floats (all zeros for a text with no
-        tokens).
+        A unit vector of ``width`` floats (all zeros for a text with no tokens).
     """
-    vector = [0.0] * DIMENSION
+    vector = [0.0] * width
     for token, count in Counter(_TOKEN.findall(text.lower())).items():
         index = int.from_bytes(hashlib.sha256(token.encode()).digest()[:4], "big")
-        vector[index % DIMENSION] += count
+        vector[index % width] += count
     norm = math.sqrt(sum(value * value for value in vector))
     return [value / norm for value in vector] if norm else vector
 
@@ -128,19 +162,31 @@ class FakeEmbeddingProvider:
                  model_id: Optional[str] = None) -> None:
         self.cache_path = cache_path
         self.model_id = model_id
+        self._width = _mode_width()
         self._fault = os.environ.get(FAULT_ENV) or None
         if self._fault is not None and self._fault not in FAULT_FIELDS:
             raise SystemExit(f"{FAULT_ENV}={self._fault!r} is not one of {sorted(FAULT_FIELDS)}")
 
+    def _raise_fault(self) -> None:
+        from mitos.errors import EmbeddingError
+
+        body = f'{FAULT_BODY_SENTINEL} {{"error": {{"message": "planted {self._fault}"}}}}'
+        raise EmbeddingError(f"Gemini embedding API call failed: {body}") from _SdkLikeError(
+            body, **FAULT_FIELDS[self._fault])
+
     def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
         """Returns the fake vector for ``text``, or raises the planted fault."""
         if self._fault is not None:
-            from mitos.errors import EmbeddingError
+            self._raise_fault()
+        return fake_vector(text, self._width)
 
-            body = f'{FAULT_BODY_SENTINEL} {{"error": {{"message": "planted {self._fault}"}}}}'
-            raise EmbeddingError(f"Gemini embedding API call failed: {body}") from _SdkLikeError(
-                body, **FAULT_FIELDS[self._fault])
-        return fake_vector(text)
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Returns one fake vector per text (uncached), or raises the planted fault."""
+        if not texts:
+            return []
+        if self._fault is not None:
+            self._raise_fault()
+        return [fake_vector(text, self._width) for text in texts]
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -175,29 +221,53 @@ class FakeVectorStore:
             self._collections[self.collection] = {}
         self._collections[self.collection][point_id] = (list(vector), dict(payload))
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        """Returns the nearest points in the real client's shape, best first."""
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
+        """Returns the nearest points in the real client's shape, best first.
+
+        A point is stored under its node id (``upsert``'s ``point_id`` is the node
+        id), so each hit's ``point_id`` is ``hash_to_uuid(node id)``, exactly what
+        Qdrant returns for a mitos write; the hit is built by the shared canned-hit
+        leaf, which also projects ``with_payload=False`` to ``{point_id, score}``.
+        """
         from mitos.errors import CollectionMissingError
+
+        from _point_hits import PAYLOAD_DEFAULTS, point_hit, project_hit
 
         points = self._collections.get(self.collection)
         if points is None:
             raise CollectionMissingError(
                 f"collection {self.collection!r} is missing", collection=self.collection)
         ranked = sorted(
-            ((cosine(vector, stored), payload) for stored, payload in points.values()),
-            key=lambda pair: pair[0], reverse=True,
+            ((cosine(vector, stored), node_id, payload)
+             for node_id, (stored, payload) in points.items()),
+            key=lambda triple: triple[0], reverse=True,
         )
         return [
-            {
-                "slug": payload.get("slug"),
-                "scope": payload.get("scope", []),
-                "state": payload.get("state"),
-                "kind": payload.get("kind"),
-                "embedding_text": payload.get("embedding_text"),
-                "score": score,
-            }
-            for score, payload in ranked[:limit]
+            project_hit(
+                point_hit(node_id, score, **{k: payload[k] for k in PAYLOAD_DEFAULTS
+                                             if k in payload}),
+                with_payload,
+            )
+            for score, node_id, payload in ranked[:limit]
         ]
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes the points whose listed id is among ``point_ids``.
+
+        Points are stored under their node id, so a listed id matches its
+        ``hash_to_uuid`` image, never the node id itself.
+        """
+        from mitos.errors import CollectionMissingError
+        from mitos.vector_store import hash_to_uuid
+
+        points = self._collections.get(self.collection)
+        if points is None:
+            raise CollectionMissingError(
+                f"collection {self.collection!r} is missing", collection=self.collection)
+        doomed = set(point_ids)
+        for node_id in [nid for nid in points if hash_to_uuid(nid) in doomed]:
+            del points[node_id]
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -205,23 +275,99 @@ class FakeVectorStore:
         raise _unimplemented("FakeVectorStore", name)
 
 
+def _rejection_index_class() -> type:
+    """Builds the rejection-index fake: the shared double, loud on anything else.
+
+    Imported lazily so the module's import (by the rows that read its markers)
+    stays light.
+    """
+    from _rejection_index_double import FakeRejectionIndex
+
+    class LoudRejectionIndex(FakeRejectionIndex):
+        def __getattr__(self, name: str) -> Any:
+            if name.startswith("__"):
+                raise AttributeError(name)
+            raise _unimplemented("FakeRejectionIndex", name)
+
+        def list_point_owners(self, page_size: int = 256) -> Dict[str, Optional[str]]:
+            # Only a drain under the seed marker lists owners, and MCP never drains.
+            raise _unimplemented("FakeRejectionIndex", "list_point_owners")
+
+    return LoudRejectionIndex
+
+
+#: Process-lifetime rejection indexes, one per collection name: every tool call
+#: constructs a fresh manager, so the points must outlive the instance, as
+#: ``FakeVectorStore``'s do.
+_REJECTION_INDEXES: Dict[str, Any] = {}
+
+
+def fake_rejection_index(qdrant_url: str, collection_name: str) -> Any:
+    """Stands in for ``QdrantRejectionIndex(url, name)``, keyed by collection."""
+    index = _REJECTION_INDEXES.get(collection_name)
+    if index is None:
+        index = _rejection_index_class()()
+        _REJECTION_INDEXES[collection_name] = index
+    return index
+
+
+def _mode() -> Optional[str]:
+    """The launcher's mode from this process's environment; refuses an unknown one."""
+    mode = os.environ.get(MODE_ENV) or None
+    if mode is not None and mode != EMBED_MODE:
+        raise SystemExit(f"{MODE_ENV}={mode!r} is not {EMBED_MODE!r} (or unset)")
+    return mode
+
+
+def _mode_width() -> int:
+    """The fake vector width the mode selects: a real collection's in embed mode."""
+    if _mode() == EMBED_MODE:
+        from mitos.models import EMBEDDING_DIM
+
+        return EMBEDDING_DIM
+    return DIMENSION
+
+
+def bind_embed_only() -> None:
+    """Rebinds ``GeminiEmbeddingProvider`` alone; the Qdrant clients stay real."""
+    import mitos
+    import mitos.cli
+    import mitos.mcp_server
+    import mitos.sync
+
+    for module in (mitos.mcp_server, mitos.sync, mitos.cli):
+        module.GeminiEmbeddingProvider = FakeEmbeddingProvider
+    print(EMBED_BOUND_MARKER, file=sys.stderr, flush=True)
+    print(f"{IDENTITY_MARKER} mode={EMBED_MODE} mitos={mitos.__file__} "
+          f"python={sys.executable}", file=sys.stderr, flush=True)
+
+
 def bind() -> None:
-    """Rebinds both constructors at both MCP-reachable construct sites."""
+    """Rebinds the three constructors at their MCP-reachable construct sites."""
     import mitos.mcp_server
     import mitos.sync
 
     for module in (mitos.mcp_server, mitos.sync):
         module.GeminiEmbeddingProvider = FakeEmbeddingProvider
         module.QdrantVectorStore = FakeVectorStore
+    mitos.sync.QdrantRejectionIndex = fake_rejection_index
+    mitos.mcp_server.QdrantRejectionIndex = fake_rejection_index
     print(BOUND_MARKER, file=sys.stderr, flush=True)
 
 
 def main() -> None:
-    """Binds the fakes, then enters the ``mitos serve`` path ``-m mitos.cli`` takes."""
-    bind()
+    """Binds the fakes, then enters ``cli.main()`` as ``-m mitos.cli`` does.
+
+    With no arguments the verb is ``serve``; any arguments pass through, and the
+    exit status is ``cli.main()``'s.
+    """
+    if _mode() == EMBED_MODE:
+        bind_embed_only()
+    else:
+        bind()
     from mitos.cli import main as cli_main
 
-    sys.argv = ["mitos", "serve"]
+    sys.argv = ["mitos", *(sys.argv[1:] or ["serve"])]
     cli_main()
 
 

@@ -5,6 +5,7 @@ initialization, sync, ambient capture, querying, list, render, import, and
 MCP serving.
 """
 
+import contextlib
 import sys
 import os
 import re
@@ -21,7 +22,9 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Callable, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple
+from typing import (
+    Callable, FrozenSet, List, Mapping, NamedTuple, Optional, Dict, Any, Sequence, Set, Tuple,
+)
 
 from mitos import __version__
 from mitos import amend
@@ -35,7 +38,6 @@ from mitos.shell_quote import shell_arg, shell_flag
 from mitos.display import (
     RANKED_LIMIT_CEILING,
     apply_stdout_text_safety,
-    blackout_note,
     clamp_limit,
     dumps_display,
     handle_text,
@@ -45,6 +47,8 @@ from mitos.display import (
     oneline_payload,
     order_scope_counts,
     projects_payload,
+    rejection_matches_payload,
+    retired_handle,
     scope_report,
     truncate_words,
     resolve_display_ensure_ascii,
@@ -66,11 +70,12 @@ from mitos.errors import (
     TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
     TARGET_REGISTERED_UNREACHABLE, TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
-from mitos.divergence import (RELATIONSHIP_FIELDS, _corpus_files, corpus_graph_divergence,
+from mitos.divergence import (RELATIONSHIP_FIELDS, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
 from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
-from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
+from mitos.vector_store import (scroll_point_ids, hash_to_uuid, partition_points,
+                                QdrantRejectionIndex, QdrantVectorStore)
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import (
     AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
@@ -89,23 +94,46 @@ from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, load_format_spec, parse_entry_stream,
                           read_text_or_none)
-from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
+from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
+                            ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
 from mitos.migrations import is_pre_v1a_schema
-from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
+from mitos.store import (GraphStore, LIVE_STATES, MODIFIER_EDGE_KEYS,
+                         REJECTION_BACKLOG_FAILURE_TOLERANCE, open_connection)
+from mitos.rejections import (diff_rejection_index, expected_rejection_points, point_items,
+                              render_rejected_item, render_rejected_paths)
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
-from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.recall import (assess_query_recall, assess_surface_recall,
-                          corpus_provenance, missing_graph_is_a_gap,
-                          missing_graph_note, missing_index_is_a_gap,
-                          provenance_line, scope_filter_recovery,
-                          count_withheld, window_lever, withheld_clause)
+from mitos.degraded import (DumpSection, dump_section, lexical_envelope,
+                             lexical_rejection_envelope, scope_dump)
+from mitos.lexical import degraded_reason_from_error
+from mitos.recall import (OVERRIDE_BLACKOUT, OVERRIDE_UNBUILT, RANKED_EDGE_MARGIN,
+                          RANKED_TOP_CLUSTER_MARGIN, RetiredPartition, WEAK_MEANING,
+                          compose_ranked, corpus_provenance, missing_graph_is_a_gap,
+                          missing_index_is_a_gap,
+                          missing_rejection_index_is_a_gap,
+                          provenance_line, REJECTION_MATCH_FLOOR,
+                          LOOKUP_FIELDS, REJECTION_LOOKUP_OVER_BUDGET_REASON,
+                          REJECTION_SECTION_BOUND, lookup_field_fault,
+                          oq_scan_fault_clause, rejection_lookup,
+                          rejection_lookup_gap_reason, rejection_section,
+                          retired_partition, scope_counts_fault_clause,
+                          scope_filter_recovery, count_withheld,
+                          stamp_labels_unread_clause)
+from mitos.stamp_labels import list_labels, match_labels, ranked_labels
+from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
+                                  WalkContractError, walk_ranked,
+                                  walk_rejection_lookup)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
+                        _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR,
+                        _floor_text, _live_successors,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
                         EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
-                        ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
+                        ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK,
+                        REJECTION_COLLECT_HELD, REJECTION_COLLECT_UNAVAILABLE,
+                        REJECTION_COLLECT_UNBUILT, REJECTION_COLLECT_UNREAD,
+                        rejection_drain_report)
+from mitos.provider_cause import describe_embed_failure
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, estimate_tokens, overflow_report
 from mitos.importer import MitosProseImporter
@@ -450,8 +478,9 @@ def _inert_pin_note(config: MitosConfig, *, offer_deletion: bool = False) -> Opt
 #: statement of fact plus the named heal, never a diagnosis: `init` must work on a
 #: fresh, service-less machine, so it makes NO network call and therefore cannot
 #: know whether the new collection is actually empty. `mitos reconcile` ships today
-#: (it re-embeds the active set against whatever collection is in force), so the
-#: pointer names a capability this release has, not one a later phase brings.
+#: (it embeds every decision the index is missing, against whatever collection is in
+#: force), so the pointer names a capability this release has, not one a later phase
+#: brings.
 _COLLECTION_CARRY_OVER_POINTER = (
     "If this workspace's vectors were built under the old name, "
     "`mitos reconcile` rebuilds them here."
@@ -538,15 +567,16 @@ def _skill_md_text(format_spec_content: str) -> str:
         "Every answer echoes the corpus it acted on: `project · collection · workspace`. Read that line. Now that a call *can* reach another project, the echo is what makes a mis-aimed one visible instead of silently plausible.\n\n"
         "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
-        "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only.\n"
-        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
+        "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Write `rejected_paths` one rejected option per line, as `(N) <option>: REJECTED — <reason>`, so each option is found and shown on its own; the comma prose of the format spec's sample above still parses, as one option. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+        f"- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over. Phrase the query by the mechanism and subject, not by the conclusion you are about to reach: phrasing moves the score. Its `confidence` rates this ranking: under `weak`, {WEAK_MEANING}, so read the hits; a `top_cluster` above 1 in `band_evidence` means the order inside it does not say which one answers. A ranking cannot show that nothing covers this claim: read the scope whole with `list_decisions(scope=…)`, or `list_decisions(scope=…, oneline=True)` for one line per decision. A hit stamped `amended_by` / `narrowed_by` has moved on, and a retired handle's `live_end` names where its current word lives: the answer's `stamp_labels` gives each live decision those stamps name its axiom's first clause, so you see what it moved to before you dereference it.\n"
+        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup of a pointed claim. On the tool an exact slug returns that decision whole; on the CLI, read a slug with `mitos show -p . -- <slug>`. Its confidence band rates this ranking, as `surface_decisions`' does; for the precedent question, ask `surface_decisions` with the claim you are about to commit to. Before you propose an option, ask whether it was already rejected: `field=\"rejected_paths\"` (CLI `--field rejected_paths`) ranks the rejected options alone, each with its decision's reason. That ranking cannot show that no rejected option covers this claim; `list_decisions(scope=…)` keeps each decision's `rejected_paths`.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
         "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
         "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
         "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector. A registration whose workspace no longer exists is hidden and counted in `hidden_missing`.\n"
         "- `unregister_project` (CLI: `mitos unregister <name>`) — remove one registration that should not be there (a throwaway or test workspace). Routing only: the workspace itself is untouched. It takes `name`, not `project`.\n\n"
+        "A `record_decision` receipt may also carry `rotation`: older settled entries the call moved to an archive, with its own `outcome`; a failed rotation leaves the write standing. A debounced `scope_overflow` is a health nudge about the corpus, not about the decision just recorded.\n\n"
         "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
         "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
         "- sets a pattern future work must follow, or\n"
@@ -554,9 +584,11 @@ def _skill_md_text(format_spec_content: str) -> str:
         "- is structural or costly to reverse, or\n"
         "- reverses or supersedes a prior decision, or\n"
         "- has cross-cutting blast radius (touches many areas).\n"
-        "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
+        "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if no hit answers it and it clears the bar, record it.\n\n"
         "## Linking decisions\n"
         "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
+        "A record that sits close to a decision it does not reference pauses (`needs_review`; nothing is written), in two partitions. `neighbors` are live decisions: relate to the ones this decision bears on, and pass `acknowledge_neighbors` as true for the ones it stands apart from. A neighbour carrying `descends_from_declared` descends from a decision this draft declares, named in that key; the declaration does not clear it, so judge it like any other neighbour. `tombstones` are retired decisions, each with its axiom and where its current word lives (`superseded_by` / `corrected_by`, or `live_end` when the chain runs through another retired decision). A retired decision is never a relation target, so for a tombstone the draft does not re-tread, relate to its live successor (a deliberate reversal is a `supersedes` of the successor) or acknowledge it. A tombstone marked `successor_ambiguous` has a successor whose slug two decisions carry, and `record_decision` refuses that slug as a relation target, so acknowledge it. The usual case is a same-slug supersession, where the slug reads the live decision and the id reads the retired one. A relation still clears it when the draft's declarations reach the tombstone another way: for example `amends`, `narrows` or `supersedes` naming a decision descended from its successor, or, for a tombstone with several successors, any relation to one whose slug names a single decision. The pause's `stamp_labels` gives the first clause of each live decision a neighbour's stamp or a tombstone's successor names.\n"
+        "An acknowledged write's receipt names what the acknowledgement went past: `acknowledged_neighbors` (the live slugs) and `acknowledged_tombstones` (the retired handles, each with its id and successors). A re-record whose axiom and mechanisms are a retired decision's answers `exists` with that decision's successors: relate a new decision to those, never to its slug, and repair its commentary with `amend_commentary` by its id.\n"
     )
 
 
@@ -806,7 +838,8 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
     Args:
         config: The resolved workspace config.
         auto_accept: ``--yes``.
-        embed_only: ``--embed-only`` — drains the outbox and runs no sync.
+        embed_only: ``--embed-only`` — drains the decision outbox, then the
+            rejection backlog, and runs no sync.
         verbose: ``--verbose``.
         repair_targets: ``--reconcile-entry`` handles, already split. ``None``
             means the flag was absent; ``[]`` means it was supplied and named
@@ -829,7 +862,7 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             sys.stdout.flush()
             _echo_corpus(config, file=sys.stderr)
             print("--reconcile-entry needs a full sync: --embed-only drains the "
-                  "pending embeddings queue and reads no buffer entries. Re-run "
+                  "embedding queues and reads no buffer entries. Re-run "
                   "without --embed-only.", file=sys.stderr)
             sys.exit(1)
         if not repair_targets:
@@ -845,13 +878,24 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         sys.stdout.flush()
         _echo_corpus(config, file=sys.stderr)
         print("--full shows a full sync's divergence report: --embed-only drains the "
-              "pending embeddings queue and reads no buffer entries. Re-run without "
+              "embedding queues and reads no buffer entries. Re-run without "
               "--embed-only.", file=sys.stderr)
         sys.exit(1)
     manager = MitosSyncManager(config)
     shortfall: List[str] = []
     if embed_only:
-        manager.drain_pending_embeddings()
+        # Both drains, in sync's order, each in a try of its own: a fault in one
+        # never stops the other, and neither changes this verb's exit.
+        try:
+            manager.drain_pending_embeddings()
+        except Exception as e:
+            print(f"[Warning] Outbox queue drain failed: {describe_embed_failure(e)}",
+                  file=sys.stderr)
+        try:
+            manager.drain_rejection_backlog()
+        except Exception as e:
+            print(f"[Warning] Rejection backlog drain failed: "
+                  f"{describe_embed_failure(e)}", file=sys.stderr)
     else:
         try:
             shortfall = manager.perform_sync(
@@ -883,31 +927,163 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         sys.exit(1)
 
 
+def _unbuilt_reconcile_refusal(config: MitosConfig) -> str:
+    """Words ``reconcile``'s refusal over an unbuilt graph, naming the heal it is not.
+
+    Composed once here rather than borrowed from ``recall.missing_graph_note``: that
+    sentence explains an *empty read answer*, and this verb refuses instead.
+
+    Args:
+        config: The active workspace config (its ``project`` names the selector).
+
+    Returns:
+        The one-line refusal.
+    """
+    return (
+        "Not reconciled: the markdown corpus (`decisions.md` and `decisions/archive/`) "
+        "holds entries but the graph holds no nodes, so no point was judged and "
+        "nothing was deleted — run "
+        f"`mitos rebuild {shell_flag('-p', config.project)}` to build the graph from "
+        "the corpus."
+    )
+
+
+def _reconcile_rejection_index_lines(
+    index: Dict[str, Any], config: MitosConfig, *, attempted: bool
+) -> List[str]:
+    """Words ``reconcile``'s ``rejection_index`` object for the text surface.
+
+    One summary line once the index was measured, a ``Rejection index collected:``
+    line when anything was deleted or failed, and one line naming the rerun for
+    ``held``, ``unread`` and (when the index was attempted at all) ``unavailable``.
+    ``unbuilt`` adds nothing when the unbuilt refusal speaks for it; over a
+    zero-node graph whose corpus is empty (no refusal) it adds the "not judged"
+    line the decision side prints. No line interpolates a count that was not
+    computed.
+
+    Args:
+        index: ``reconcile_embeddings()["rejection_index"]``.
+        config: The workspace config (for the selectored rerun).
+        attempted: Whether a provider, a vector store and a rejection index were
+            all present; without them the index is silently not reconciled.
+
+    Returns:
+        The lines to print.
+    """
+    rerun = f"`mitos reconcile {shell_flag('-p', config.project)}`"
+    lines: List[str] = []
+    expected = index["expected_items"]
+    missing = index["missing_items"]
+    if expected is not None and missing is not None:
+        if expected == 0:
+            lines.append("Rejection index: no decision states a rejected item.")
+        elif missing:
+            lines.append(
+                f"Rejection index: {expected} item(s) of {index['expected_owners']} "
+                f"decision(s) expected, {missing} missing — {index['owners_queued']} "
+                f"decision(s) newly queued for the drain."
+            )
+        else:
+            lines.append(
+                f"Rejection index: {expected} item(s) of {index['expected_owners']} "
+                f"decision(s) expected, all present."
+            )
+    if index["deleted"] or index["delete_failed"]:
+        line = (
+            f"Rejection index collected: {index['deleted']} stale or orphaned item(s) "
+            f"deleted"
+        )
+        if index["delete_failed"]:
+            line += (
+                f", {index['delete_failed']} could not be deleted — Qdrant refused or "
+                f"did not confirm; {rerun} again retries them"
+            )
+        lines.append(line + ".")
+    collected = index["collected"]
+    if collected == REJECTION_COLLECT_HELD:
+        lines.append(
+            f"Rejection index not collected — a drain held the rejection backlog's lock; "
+            f"{rerun} again collects it."
+        )
+    elif collected == REJECTION_COLLECT_UNREAD:
+        lines.append(
+            f"Rejection index not collected — the graph could not be read, so nothing "
+            f"was deleted from it; {rerun} again collects it."
+        )
+    elif collected == REJECTION_COLLECT_UNAVAILABLE and attempted:
+        lines.append(
+            f"Rejection index not reconciled in full this run (see the warning above); "
+            f"{rerun} again retries it."
+        )
+    elif collected == REJECTION_COLLECT_UNBUILT and index["present_items"]:
+        # Reached only when the unbuilt refusal did not speak (a zero-node graph over
+        # an empty corpus): the decision side's "not judged" line, for this index.
+        lines.append(
+            f"{index['present_items']} rejected item(s) not judged — the graph holds no "
+            f"nodes; reconcile deletes items only over a built graph."
+        )
+    return lines
+
+
 def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
-    """Re-embeds active nodes missing from Qdrant, healing a direct vector wipe.
+    """Embeds every node the decision index is missing, and deletes node-less points.
 
     The one-command heal for the gap ``sync`` cannot reach: a bare Qdrant wipe
     (``curl -X DELETE`` of the collection, no ``rebuild``/``cutover``) leaves the
     graph populated, Qdrant empty, and the outbox empty — so ``sync`` drains
-    nothing. Reconcile diffs the ACTIVE node set against Qdrant's actual point
-    ids, enqueues the missing nodes, and drains. Idempotent.
+    nothing. Reconcile diffs the decision index's expected set — every decision,
+    live or retired, plus the active open questions — against Qdrant's actual
+    point ids, enqueues the missing nodes, and drains. Then it collects: a point
+    whose node is no longer in the graph is deleted by its listed id, while a
+    retired node's point is history and kept. Collection runs over a built graph
+    only (:meth:`MitosSyncManager.reconcile_embeddings` has the guard and why).
+    It also builds and collects the rejection index: it queues every decision
+    lacking a rejected item's point, stamps the rejection seed marker, drains, and
+    deletes the items no decision states any more (``rejection_index`` in
+    ``--json``; its lines here). Rejected items bypass the embedding cache, so a
+    first build pays one embedding per item. Nothing in that block moves the exit
+    code. Idempotent.
+
+    Over an **unbuilt** graph — the corpus holds entries, the graph holds no node,
+    the clone without its gitignored ``*.sqlite`` — reconcile is not the heal: it
+    deletes nothing, and refuses on stderr naming ``mitos rebuild``, in place of the
+    summary. ``--json`` still prints exactly one object, carrying
+    ``graph_unbuilt: true``.
+
+    The exit contract: **1** when the next actor needs a different act — Qdrant
+    down, or an unbuilt graph (``rebuild``); **0** when re-running ``reconcile``
+    completes the heal — rows left queued (``left_queued``) or node-less points
+    whose delete failed (``delete_failed``), each with its own line. A keyless or
+    provider-down workspace with a built graph still exits 0 after its stderr
+    warning: keyless is not another act.
 
     Args:
         config: The active workspace config.
         as_json: Whether to emit the result as a JSON object.
 
     Returns:
-        Process exit code (0 on success, 1 if Qdrant is down). An absent
-        or failing embedding provider is reported as a warning and still exits 0.
+        Process exit code.
     """
     manager = MitosSyncManager(config)
-    # Ahead of the call, not ahead of the report: `reconcile_embeddings` writes its
-    # own provider-down line (to stderr, since 5c) before returning, so an echo
-    # placed beside the report below would not be the leading line the reader sees.
-    if not as_json:
+    # The echo rides the response's stream, per exit: the summary answers on stdout
+    # and the unbuilt refusal on stderr. It leads the call rather than the report:
+    # the drain prints progress to stdout during the call, and `reconcile_embeddings`
+    # writes its provider-down line (stderr) before returning. Asked here with the
+    # predicate the manager answers `graph_unbuilt` with; an unbuilt graph has an
+    # empty expected set, so nothing drains before the refusal.
+    echoed = False
+    if not as_json and not manager.is_graph_unbuilt():
         _echo_corpus(config)
+        echoed = True
     try:
-        result = manager.reconcile_embeddings()
+        if as_json:
+            # stdout carries exactly one JSON object; the drain's progress lines are
+            # diagnostics, so they go to stderr. Routed here, at the boundary, like the
+            # provider-down line inside the call.
+            with contextlib.redirect_stdout(sys.stderr):
+                result = manager.reconcile_embeddings()
+        else:
+            result = manager.reconcile_embeddings()
     except VectorStoreError as e:
         msg = f"Reconcile unavailable — Qdrant down: {str(e)}"
         if as_json:
@@ -920,12 +1096,70 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
 
     if as_json:
         print(json.dumps({**result, **corpus_provenance(config)}))
-    else:
+        return 1 if result["graph_unbuilt"] else 0
+
+    if result["graph_unbuilt"]:
+        sys.stdout.flush()
+        _echo_corpus(config, file=sys.stderr)
+        print(_unbuilt_reconcile_refusal(config), file=sys.stderr)
+        return 1
+    if not echoed:
+        _echo_corpus(config)
+    # `present` is not "already indexed": it counts retired and orphan points too.
+    # What was already indexed is the expected set's share, `expected_present`.
+    print(
+        f"Reconciled: {result['expected']} node(s) the decision index should hold "
+        f"({result['active']} active), {result['expected_present']} already indexed, "
+        f"{result['enqueued']} enqueued, {result['written']} embedded."
+    )
+    if result["left_queued"]:
         print(
-            f"Reconciled: {result['active']} active node(s), "
-            f"{result['present']} point(s) already indexed, "
-            f"{result['enqueued']} re-embedded."
+            f"{result['left_queued']} embedding row(s) still queued — "
+            f"`mitos sync {shell_flag('-p', config.project)}` retries them once the "
+            f"embedding provider and Qdrant answer."
         )
+    # The rejection drain's summary, rendered here and not by the drain (which
+    # reconcile runs with report=False), so it prints once.
+    for line in rejection_drain_report(result["rejection_drain"]):
+        print(line)
+    rejection_attempted = (
+        manager.embed_provider is not None and manager.vector_store is not None
+        and manager.rejection_index is not None
+    )
+    for line in _reconcile_rejection_index_lines(
+        result["rejection_index"], config, attempted=rejection_attempted
+    ):
+        print(line)
+    if result["deleted"] or result["delete_failed"]:
+        line = f"Collected: {result['deleted']} node-less point(s) deleted"
+        if result["delete_failed"]:
+            line += (
+                f", {result['delete_failed']} could not be deleted — Qdrant refused or "
+                f"did not confirm; `mitos reconcile {shell_flag('-p', config.project)}` "
+                f"again retries them"
+            )
+        print(line + ".")
+    if result["retired_node_points"]:
+        print(
+            f"{result['retired_node_points']} point(s) of retired nodes kept as history."
+        )
+    if result["nodeless_points"] is None and result["present"]:
+        # Not judged with points listed: a graph holding no nodes (the guard) or a
+        # graph read that faulted (already warned on stderr). Told apart by one count.
+        try:
+            node_count: Optional[int] = manager.store.graph_fingerprint()[0]
+        except Exception:
+            node_count = None
+        if node_count == 0:
+            print(
+                f"{result['present']} point(s) not judged — the graph holds no nodes; "
+                "reconcile deletes points only over a built graph."
+            )
+        else:
+            print(
+                f"{result['present']} point(s) not judged — the graph could not be "
+                "read; nothing was deleted."
+            )
     return 0
 
 
@@ -980,59 +1214,6 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
         print(f"Failed to append captured entry: {str(e)}")
 
 
-def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
-    """Builds a retired-handle pointer for a superseded-filtered ranked match.
-
-    A match dropped by the active-view filter (``get_node_by_slug`` → ``None`` or a
-    non-``active``/``drifted`` computed state) is not noise — it is a genuine retired
-    handle the agent can chase (V1-D16: a vector-store slug always resolves to *some*
-    node; nodes are never deleted). This returns ``{"slug", "state"}`` — and, when the
-    graph knows it, the live successor under ``superseded_by`` — so the blackout vector
-    hands the agent a pointer, not a payload. The state is read authoritatively from the
-    *computed* ``get_node_state`` (the vector payload's ``state`` is stale-at-embed-time
-    and absent under test), via the state-agnostic ``resolve_slug``.
-
-    Calm degradation (P9): if the slug fails to resolve at all, returns ``None`` (the
-    caller omits it) rather than crash; if the state read fails, falls back to
-    ``"superseded"``.
-
-    Args:
-        store: The graph store to resolve the slug and read state/modifiers from.
-        slug: The slug of the superseded-filtered match.
-
-    Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve or names
-        no decision (a superseded open question is not a retired precedent).
-    """
-    try:
-        node_ids = store.resolve_slug(slug)
-    except Exception:
-        return None
-    if not node_ids:
-        return None
-    # A retired open question is not a retired precedent: only a slug that names a
-    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
-    # never keeps a mixed handle).
-    try:
-        if "decision" not in store.resolve_slug_kinds(slug):
-            return None
-    except Exception:
-        return None
-    node_id = node_ids[0]
-    try:
-        state = store.get_node_state(node_id)
-    except Exception:
-        state = "superseded"
-    handle: Dict[str, Any] = {"slug": slug, "state": state}
-    try:
-        successors = store.get_modifiers(node_id).get("superseded_by")
-        if successors:
-            handle["superseded_by"] = successors
-    except Exception:
-        pass
-    return handle
-
-
 def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
     """Says whether the hit at 1-based ``rank`` among returned decisions is thinned.
 
@@ -1041,19 +1222,47 @@ def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
     return full_top is not None and rank > full_top
 
 
+def _ranked_rejection_index(config: MitosConfig) -> Optional[QdrantRejectionIndex]:
+    """The ranked reads' rejection index; constructs, never connects.
+
+    Built here rather than reused from ``manager.rejection_index``: the offline
+    conftest refuses that seam for the write path, and binds this one (D5).
+
+    Returns:
+        The index, or None on a construction fault (the section then says
+        ``unavailable``).
+    """
+    try:
+        return QdrantRejectionIndex(config.qdrant_url, config.rejection_collection)
+    except Exception:
+        return None
+
+
+def _rejection_leg(config: MitosConfig) -> Optional[RejectionLeg]:
+    """Builds the ranked reads' rejection leg, or None when the seam built no index."""
+    index = _ranked_rejection_index(config)
+    if index is None:
+        return None
+    return RejectionLeg(index=index, items_of=point_items, floor=REJECTION_MATCH_FLOOR,
+                        bound=REJECTION_SECTION_BOUND)
+
+
 def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            store: Optional[GraphStore], as_json: bool,
                            full_top: Optional[int], limit: Optional[int],
                            open_questions: Optional[List[Dict[str, Any]]] = None,
-                           check_notice: Optional[Dict[str, Any]] = None) -> None:
-    """Runs the deterministic lexical fallback and renders it on the CLI.
+                           check_notice: Optional[Dict[str, Any]] = None,
+                           scan_faults: Sequence[str] = ()) -> None:
+    """Renders the lexical degraded envelope on the CLI.
 
     The shared degraded exit for ``surface``/``query`` (ADR
     ``read-verbs-degrade-to-lexical-decisions-md-fallback``): one calm header
     naming the cause, then a term-match over the markdown corpus (buffer plus
-    archives) — never the raw provider blob, never the clean-empty header. Exit
-    code stays 0 (deliberate: the JSON ``degraded`` marker + changed header
-    already disambiguate).
+    archives) — never the raw provider blob, never the clean-empty header. A
+    renderer only: ``degraded.lexical_envelope`` composes every key and clause,
+    the same call ``mcp_server._lexical_degraded_response`` encodes. Exit code
+    stays 0 (deliberate: the JSON ``degraded`` marker + changed header already
+    disambiguate).
 
     Args:
         config: The active workspace configuration (supplies the corpus files).
@@ -1065,30 +1274,22 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
             none — the verb's ``--brief``). A thinned answer says so by
             ``rejected_paths_withheld`` and a note clause, on both encodings.
-        limit: Max matches; None ⇒ the lexical default.
+        limit: Max matches, the raw ``--limit``: the leaf clamps it as the ranked
+            reads do (None ⇒ 5, any value ⇒ ``[1, RANKED_LIMIT_CEILING]``).
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
         check_notice: The standing check notice ``cmd_surface`` composed: the key
             on JSON, the line plus its recovery clause last on text. None
             (``cmd_query`` always) means omitted.
+        scan_faults: ``recall.oq_scan_fault_clause`` when ``cmd_surface``'s scoped
+            open-question scan raised (WIRING_LEDGER entry-005); empty otherwise.
     """
-    envelope = lexical_fallback(
-        query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, full_top=full_top,
+    # Composed before the `as_json` split, so the printed note and the envelope's agree.
+    envelope = lexical_envelope(
+        query, config=config, surface="cli", reason=reason, store=store,
+        limit=limit, full_top=full_top, open_questions=open_questions,
+        check_notice=check_notice, scan_faults=scan_faults,
     )
-    envelope["query"] = query
-    envelope.update(corpus_provenance(config))
-    # Before the `as_json` split, so the printed note and the envelope's agree.
-    withheld = count_withheld(envelope["matches"])
-    if withheld:
-        envelope["note"] = (
-            f"{envelope['note']} {withheld_clause(withheld, surface='cli', config=config)}"
-        )
-        envelope["rejected_paths_withheld"] = withheld
-    if open_questions is not None:
-        envelope["open_questions"] = open_questions
-    if check_notice is not None:
-        envelope["check_notice"] = check_notice
     if as_json:
         _emit_json(envelope)
         return
@@ -1101,18 +1302,24 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         if marker:
             print(f"   {marker}")
         if "rejected_paths" in d:
-            print(f"   Rejected: {d['rejected_paths']}")
+            print(render_rejected_paths(d["rejected_paths"], "   Rejected: "))
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    _print_lexical_section(envelope.get("rejection_matches", []))
     for oq in envelope.get("open_questions", []):
         print(f"[open question in scope] {oq['topic']}")
+        marker = _modifier_marker(oq)
+        if marker:
+            print(f"   {marker}")
+    _print_stamp_labels(config, envelope)
     _print_check_notice(config, check_notice)
 
 
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
               as_json: bool = False, brief: bool = False,
-              limit: Optional[int] = None, full_top: Optional[int] = None) -> None:
+              limit: Optional[int] = None, full_top: Optional[int] = None,
+              field: Optional[str] = None) -> None:
     """Queries the vector store semantically for similar decisions — the CLI twin
     of the MCP ``query_decisions`` tool's *ranked* branch.
 
@@ -1140,6 +1347,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             ``min(default, N)`` truncation.
         full_top: Keep ``rejected_paths`` on ranks 1..N among the returned
             decisions only; None ⇒ every rank whole.
+        field: ``"rejected_paths"`` asks the field-scoped lookup instead — the
+            rejection index alone, ranked by item (:func:`_cmd_query_rejections`);
+            ``limit`` then counts items and ``full_top`` owners. None ⇒ the
+            decision ranking. Any other value is refused (argparse's ``choices``
+            refuses it first on the command line).
     """
     # One effective depth value from here down: `brief` is `full_top=0`.
     if brief:
@@ -1154,6 +1366,17 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             _emit_json({"error": msg, **corpus_provenance(config)}, indent=None)
             return
         raise ValueError(msg)
+    # The same refusal as the depth fault's, on both encodings, for direct callers.
+    field_fault = lookup_field_fault(field)
+    if field_fault:
+        if as_json:
+            _emit_json({"error": field_fault, **corpus_provenance(config)}, indent=None)
+            return
+        raise ValueError(field_fault)
+    if field is not None:
+        _cmd_query_rejections(config, query_text, as_json=as_json, limit=limit,
+                              full_top=full_top)
+        return
 
     # No standing check notice on any exit of this verb, deliberately (vision §4.3):
     # `surface` is the read put before a write and carries it; a second telemetry
@@ -1182,68 +1405,24 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
 
     store = manager.store
     top_k = clamp_limit(limit)
-    # Initialized BEFORE the `try` for the reason the CollectionMissingError arm's own
-    # comment gives below: that arm constructs the empty result rather than falling
-    # through, so a `top_score` bound inside the loop would be an unbound local on
-    # exactly the state (empty graph + absent collection) nobody reaches by hand.
-    # `lever` for the same reason: that arm falls through to the assessment below.
-    top_score: Optional[float] = None
-    lever = None
+    walk = None
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
-        raw_matches = manager.vector_store.query(q_vector, limit=top_k)
-        # `raw_matches`, not `matches`: the lever reads retrieval depth, and
-        # `matches` below is the surfaced list.
-        lever = window_lever(points=len(raw_matches), limit=top_k,
-                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
-
-        # Filter superseded first, then stamp + Letter — mirrors the ranked loop in
-        # mcp_server.query_decisions byte-for-byte (T4 parity). A superseded-not-reused
-        # slug is dropped at the active-view get_node_by_slug → None step, closing the
-        # M3 leak where a superseded node would otherwise read as live. Each dropped
-        # match is a retired handle the blackout vector points the agent at.
-        matches = []
-        retired: List[Dict[str, Any]] = []
-        for m in raw_matches:
-            node = store.get_node_by_slug(m["slug"])
-            if not node:
-                handle = _retired_handle(store, m["slug"])
-                if handle:
-                    retired.append(handle)
-                continue
-            if node["kind"] != "decision":
-                # An open question: never embedding-ranked (C4), not retired —
-                # skipped before the band sees its score.
-                continue
-            node_state = store.get_node_state(node["id"])
-            if node_state not in ("active", "drifted"):
-                handle = _retired_handle(store, m["slug"])
-                if handle:
-                    retired.append(handle)
-                continue
-            # Rank among the decisions returned, at append time — never the index
-            # into `raw_matches`, whose skipped entries consume no rank.
-            match = letter_payload(
-                node,
-                brief=_rank_thinned(len(matches) + 1, full_top),
-                extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
-            )
-            match.update(store.get_modifiers(node["id"]))
-            matches.append(match)
-            # Off the SURFACED list, after the append — never off `raw_matches`,
-            # which still holds the superseded and unresolvable nodes this loop
-            # just dropped. A band read off the raw return rates a match the
-            # caller never saw.
-            if top_score is None or m["score"] > top_score:
-                top_score = m["score"]
+        # The shared identity walk — the same call mcp_server.query_decisions makes
+        # (T4 parity by construction): one vector call at the over-fetch bound,
+        # every hit resolved by its point id (never its payload slug), the window
+        # filled with live decisions, the stamps read in one batch.
+        walk = walk_ranked(q_vector, vector_store=manager.vector_store, graph=store,
+                           limit=top_k, rejections=_rejection_leg(config), light=True)
+    except WalkContractError:
+        # A wrong store or vector double: loud, never "recall degraded".
+        raise
     except CollectionMissingError as e:
-        # I8 — an absent collection over an EMPTY active set IS the empty index, and
+        # I8 — an absent collection over a graph whose decision index expects NOTHING
+        # (no decision, no live open question) IS the empty index, and
         # a fresh project must not read as broken; over a populated graph it is a
         # real hole and the degraded header names it plus `mitos reconcile`.
-        # The empty result is constructed HERE, not fallen through to: `matches` and
-        # `retired` are assigned inside the `try`, after the query that raised, so a
-        # bare fall-through would hit an unbound local — on exactly the state (empty
-        # graph + absent collection) nobody reaches by hand.
+        # Otherwise `walk` stays None and the empty result is built below.
         if missing_index_is_a_gap(store):
             _emit_lexical_degraded(
                 config, query_text, reason=degraded_reason_from_error(
@@ -1251,8 +1430,6 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                 store=store, as_json=as_json, full_top=full_top, limit=limit,
             )
             return
-        matches = []
-        retired = []
     except Exception as e:
         # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
         # provider blob — one calm cause line + the deterministic fallback.
@@ -1263,71 +1440,83 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         )
         return
 
-    # Blackout: retrieval returned matches but every one was superseded-filtered
-    # (displayed == 0, retrieved > 0). That is NOT a true miss — surfacing it as one
-    # makes the agent assume novelty and re-derive a settled contradiction. Emit the
-    # retired handles + a distinct note instead. `retired` is non-empty only when the
-    # filter dropped something, so `not matches and retired` is exactly the blackout.
-    blackout = not matches and bool(retired)
+    # Composition, outside the `try`: pure shaping over what the walk returned, so
+    # a defect here is loud rather than posing as degraded recall.
+    matches: List[Dict[str, Any]] = []
+    # Bound before the walk's block: the healthy-empty CollectionMissingError arm
+    # reaches the composer with no walk.
+    part = RetiredPartition([], 0, False)
+    handles: List[Dict[str, Any]] = []
+    # The rejection section; composed only when the walk ran (the healthy-empty
+    # CollectionMissingError arm reaches here with none).
+    section = None
+    if walk is not None:
+        for rank, hit in enumerate(walk.window, start=1):
+            match = letter_payload(
+                hit.node,
+                brief=_rank_thinned(rank, full_top),
+                extras={"state": hit.node["computed_state"], "score": hit.score,
+                        "depth_mode": "letter"},
+            )
+            for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
+                match[key] = list(slugs)
+            matches.append(match)
+        # The retired decisions this ranking passed, closest first, bounded at
+        # `limit` (zero live: the blackout's handles). One constructor for both keys.
+        part = retired_partition(walk)
+        handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
+                                  live_ends=walk.live_ends)
+                   for h in part.shown]
+        # The rejection section, composed once (recall) — the same call
+        # mcp_server.query_decisions makes.
+        section = rejection_section(
+            walk, full_top=full_top,
+            gap=lambda: missing_rejection_index_is_a_gap(store),
+            shape=rejection_matches_payload, surface="cli", config=config,
+        )
 
-    # W31 — the unbuilt graph. Unlike its I8 sibling this one is consulted on the
-    # ORDINARY empty path rather than inside an `except`: an empty graph raises
-    # nothing, it simply answers empty, which is precisely why the answer is
-    # indistinguishable from "no precedent" without it. Mutually exclusive with
-    # `blackout` by construction (a retired handle is a node, and this fires only
-    # over a graph with none), so the two can never contradict each other.
-    unbuilt = not matches and missing_graph_is_a_gap(
-        store, config, corpus_scan=corpus_holds_entries
+    # The stamp labels (8a), one batched read for the whole answer — the same call
+    # mcp_server.query_decisions makes. None on the healthy-empty arm: nothing named.
+    labels = ranked_labels(store, window=matches, handles=handles,
+                           matches=section.matches if section is not None else [])
+
+    # The band in the `query` register — it describes how this lookup's ranking did,
+    # never what the corpus holds — its evidence and the note, composed once for both
+    # encodings and both arms (a walk, or the healthy-empty arm's none). The blackout
+    # (zero live, retired handles passed) and the unbuilt graph (W31: an empty graph
+    # raises nothing, it answers empty) are the composer's overrides, at one
+    # precedence: the unbuilt note stands alone, for every key the graph supplies.
+    composed = compose_ranked(
+        walk, register="query", surface="cli", config=config, handles=handles,
+        part=part, section=section,
+        unbuilt=lambda: missing_graph_is_a_gap(store, config,
+                                               corpus_scan=corpus_holds_entries),
+        top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scan_faults=(), labels=labels,
     )
 
-    # The confidence band, in the `query` register: it describes how this lookup's
-    # ranking did, never what the corpus holds. One call serves both encodings.
-    # `assess_query_recall` never returns None, so there is no `is not None` guard
-    # here — copying `cmd_surface`'s would be a branch that can never be False.
-    confidence, note = assess_query_recall(
-        top_score=top_score,
-        result_count=len(matches),
-        config=config,
-        surface="cli",
-        lever=lever,
-    )
-    # A thinned answer says so, on both encodings: the clause joins the local note
-    # the text render prints and the envelope carries. The blackout and unbuilt
-    # overrides below need zero matches, so neither can co-occur with a count.
-    withheld = count_withheld(matches)
-    if withheld:
-        note = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
-
-    # Build the per-match list once, then branch the two renderings over it.
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
         envelope.update(corpus_provenance(config))
-        # Band note FIRST, then the overrides reassign it — the precedence is
-        # confidence note < blackout < unbuilt, and it is the NOTE that yields:
-        # `confidence` stands on every one of these exits (it is a fact about the
-        # ranking that an override about the graph does not contradict).
-        envelope["confidence"] = confidence
-        envelope["note"] = note
-        if blackout:
-            envelope["all_superseded"] = retired
-            # Closes the text/JSON divergence: the text branch below has printed
-            # this note since 2d while `--json` carried the handles alone.
-            envelope["note"] = blackout_note(retired)
-        if unbuilt:
-            envelope["note"] = missing_graph_note("cli", config)
-        if withheld:
-            envelope["rejected_paths_withheld"] = withheld
+        composed.place_into(envelope)
         _emit_json(envelope)
         return
 
-    if blackout:
+    # The text renders the same composed note; the band line prints only when no
+    # override replaced the legend, and nothing the graph supplies prints under the
+    # unbuilt note.
+    unbuilt = composed.override == OVERRIDE_UNBUILT
+    if composed.override == OVERRIDE_BLACKOUT:
         # Stamped for the same reason as the miss below: "everything here is
         # superseded" and "you asked the wrong project" are the two readings this
         # line separates. `cmd_surface`'s blackout already names its corpus (it
         # falls through the stamped empty header); this branch returns early and
         # was the one text exit of the read verbs that named none.
         _echo_corpus(config)
-        print(blackout_note(retired))
+        _print_retired_partition(handles, part.omitted)
+        _print_rejection_section(section)
+        _print_stamp_labels(config, composed.envelope_keys())
+        print(composed.note)
         return
 
     # Genuine miss — nothing was retrieved (or nothing resolved). The provenance
@@ -1336,22 +1525,19 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if not matches:
         print(provenance_line(config))
         print("No matching decisions found.")
-        # This branch APPENDS where the envelope above assigns, so the override is
-        # written rather than inherited: left to the copy, a miss over an unbuilt
-        # graph would print the band note *and* the pointer, and the band note's
-        # redirect sends the caller to `surface`, which answers just as empty over
-        # that same unbuilt graph — a turn spent one line above the correct heal.
-        if unbuilt:
-            print(f"→ {missing_graph_note('cli', config)}")
-        else:
-            band_line = _query_band_line(confidence)
+        # The case the rejection section exists for is often this one: the query
+        # names a rejected option, so no live decision ranks and the item does.
+        if not unbuilt:
+            _print_rejection_section(section)
+            _print_stamp_labels(config, composed.envelope_keys())
+            band_line = _query_band_line(composed.confidence)
             if band_line:
                 print(band_line)
-            print(f"→ {note}")
+        print(f"→ {composed.note}")
         return
 
     print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
-    band_line = _query_band_line(confidence)
+    band_line = _query_band_line(composed.confidence)
     if band_line:
         print(band_line)
     print("-" * 60)
@@ -1362,11 +1548,290 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if marker:
             print(f"   {marker}")
         if "rejected_paths" in d:
-            print(f"   Rejected: {d['rejected_paths']}")
+            print(render_rejected_paths(d["rejected_paths"], "   Rejected: "))
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
-    print(f"→ {note}")
+    _print_retired_partition(handles, part.omitted)
+    _print_rejection_section(section)
+    _print_stamp_labels(config, composed.envelope_keys())
+    print(f"→ {composed.note}")
+
+
+def _cmd_query_rejections(config: MitosConfig, query_text: str, *, as_json: bool,
+                          limit: Optional[int], full_top: Optional[int]) -> None:
+    """Answers ``mitos query --field rejected_paths``: the rejection index alone.
+
+    The CLI twin of ``mcp_server._query_rejections`` — the same walk
+    (``retrieval_walk.walk_rejection_lookup``), the same composer
+    (``recall.rejection_lookup``) and the same lexical answer
+    (``degraded.lexical_rejection_envelope``) on the same exits; the text is a
+    renderer over the envelope ``--json`` emits. Like the decision ranking it never
+    dereferences a slug (ADR ``cli-query-stays-semantic-not-dereference-twin``).
+
+    Args:
+        config: The active workspace configuration.
+        query_text: The claim the caller asked about.
+        as_json: Emit the JSON envelope instead of text.
+        limit: The caller's limit in items.
+        full_top: The effective depth in owners (0 under ``--brief``).
+    """
+    top_k = clamp_limit(limit)
+
+    def lexical(reason: str, store: Optional[GraphStore], *, gap: bool = False) -> None:
+        envelope = lexical_rejection_envelope(
+            query_text, config=config, surface="cli", reason=reason, store=store,
+            limit=top_k, full_top=full_top, gap=gap,
+        )
+        if as_json:
+            _emit_json(envelope)
+        else:
+            _print_rejection_lookup_lexical(config, envelope)
+
+    # A pre-V1a graph raises at store construction: the match reads markdown alone.
+    try:
+        manager = MitosSyncManager(config)
+    except Exception as e:
+        lexical(degraded_reason_from_error(e, surface="cli", project=config.project),
+                None)
+        return
+    store = manager.store
+    index = _ranked_rejection_index(config)
+    if not manager.embed_provider or index is None:
+        lexical(degraded_reason_from_error(None, surface="cli", project=config.project),
+                store)
+        return
+    walk = None
+    try:
+        q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
+        walk = walk_rejection_lookup(q_vector, index=index, graph=store,
+                                     items_of=point_items, limit=top_k)
+    except WalkContractError:
+        # A wrong store or index double: loud, never "recall degraded".
+        raise
+    except CollectionMissingError:
+        if missing_rejection_index_is_a_gap(store):
+            lexical(rejection_lookup_gap_reason(surface="cli", config=config), store,
+                    gap=True)
+            return
+        # An empty expected set: the absent collection IS the empty index.
+    except Exception as e:
+        lexical(degraded_reason_from_error(e, surface="cli", project=config.project),
+                store)
+        return
+    if walk is not None and walk.state == REJECTIONS_OVER_BUDGET:
+        lexical(REJECTION_LOOKUP_OVER_BUDGET_REASON, store)
+        return
+    lookup = rejection_lookup(
+        walk, query=query_text, full_top=full_top, shape=rejection_matches_payload,
+        margin=RANKED_EDGE_MARGIN, top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING,
+        graph_gap=lambda: missing_graph_is_a_gap(
+            store, config, corpus_scan=corpus_holds_entries),
+        surface="cli", config=config,
+        read_labels=lambda found: match_labels(store, found),
+    )
+    if as_json:
+        _emit_json(lookup.envelope)
+        return
+    _print_rejection_lookup(config, lookup.envelope, override=lookup.override)
+
+
+class _MatchList(NamedTuple):
+    """The ``matches`` view :func:`_print_rejection_section` reads."""
+
+    matches: List[Dict[str, Any]]
+
+
+def _print_rejection_lookup(config: MitosConfig, envelope: Dict[str, Any], *,
+                            override: Optional[str]) -> None:
+    """Renders the field-scoped lookup's healthy envelope on the CLI text surface.
+
+    The corpus line, the band line (as ``mitos query`` prints it), the ranked
+    rejected options through :func:`_print_rejection_section` (the section's own
+    match lines), then the ``→`` note. A miss says so in place of the list. Under
+    the unbuilt-graph note no band line prints (``override``, the composer's marker,
+    kept off the envelope): that note stands alone, on text as on ``--json``.
+    """
+    matches = envelope.get("rejection_matches", [])
+    if matches:
+        print(f"\nRejection lookup for: '{envelope['query']}'  [{provenance_line(config)}]")
+    else:
+        print(provenance_line(config))
+        print("No matching rejected options found.")
+    band_line = (_query_band_line(envelope["confidence"])
+                 if override != OVERRIDE_UNBUILT else None)
+    if band_line:
+        print(band_line)
+    if matches:
+        print("-" * 60)
+        _print_rejection_section(_MatchList(matches))
+    _print_stamp_labels(config, envelope)
+    print(f"→ {envelope['note']}")
+
+
+def _print_rejection_lookup_lexical(config: MitosConfig, envelope: Dict[str, Any]) -> None:
+    """Renders the field-scoped lookup's lexical answer on the CLI text surface.
+
+    The corpus line, the note (the degraded header first), then one line per
+    matched item — owner slug, state when known, ordinal and the item — with its
+    matched terms, and the owner's Letter under a ``here`` match.
+    """
+    print(provenance_line(config))
+    print(envelope["note"])
+    _print_lexical_matches(envelope.get("rejection_matches", []))
+    print()
+    _print_stamp_labels(config, envelope)
+
+
+def _print_lexical_matches(matches: List[Dict[str, Any]]) -> None:
+    """Prints rejection matches found by words, one line per matched item.
+
+    Shared by the lookup's lexical answer and every degraded section: owner slug,
+    state when known, ordinal and the item verbatim (a multi-line item hangs under
+    the hit line, ``rejections.render_rejected_item``), its matched terms, then, by
+    ``letter``: the owner's Letter under a ``here`` match, ``see rank N above`` for
+    a ``window`` owner; then the owner's stamps marker. No score: none was computed.
+    Every line is indented, so none reads as a numbered decision line.
+    """
+    for m in matches:
+        state = f"  ({m['state']})" if "state" in m else ""
+        print(render_rejected_item(m["item"], f"  {m['slug']}{state}  item {m['ordinal']}: "))
+        if m["matched_terms"]:
+            print(f"    matched: {', '.join(m['matched_terms'])}")
+        if m["letter"] == "here":
+            print(f"    Decided:  {m['axiom']}")
+            if "rejected_paths" in m:
+                print(render_rejected_paths(m["rejected_paths"], "    Rejected: "))
+            if m["scope"]:
+                print(f"    Scope:    {', '.join(m['scope'])}")
+        elif m["letter"] == "window":
+            print(f"    see rank {m['rank']} above")
+        marker = _modifier_marker(m)
+        if marker:
+            print(f"    {marker}")
+
+
+def _print_lexical_section(matches: List[Dict[str, Any]]) -> None:
+    """Prints a degraded answer's rejection section, matched by words, on the CLI text
+    surface: a heading naming the lexical order, the matches, a blank line. Prints
+    nothing at all when there are no matches, so a degraded answer the section did
+    not reach renders exactly as before it existed."""
+    if not matches:
+        return
+    print("Rejected options sharing this query's words (most words first):")
+    _print_lexical_matches(matches)
+    print()
+
+
+def _print_section(section: Optional[Any]) -> None:
+    """Prints ``cmd_surface``'s section through the printer its kind needs: the
+    lexical one for the scope dump's (no score), the ranked one otherwise."""
+    if isinstance(section, DumpSection):
+        _print_lexical_section(section.matches)
+    else:
+        _print_rejection_section(section)
+
+
+def _print_stamp_labels(config: MitosConfig, keys: Mapping[str, Any], *,
+                        noteless: bool = False, file: Optional[Any] = None) -> None:
+    """Prints an answer's stamp label map on the CLI text surface (8a).
+
+    The text twin of ``stamp_labels``: a ``Stamped slugs, labelled:`` heading and one
+    ``  <slug> — <label>`` line per entry, then a blank line; nothing when the map is
+    absent. The one printer every carrying text exit calls, placed after the
+    sections it labels. A label fault is stated by the note's clause where the answer
+    has a note; ``noteless`` (the listing, the record pause) prints the clause as its
+    own line instead.
+
+    Args:
+        config: The active workspace configuration (the clause's selector).
+        keys: The envelope, payload or ``RankedNote.envelope_keys()`` carrying the
+            two keys.
+        noteless: Whether the surface has no note to carry the fault's clause.
+        file: The stream; stdout when None (the pause prints on stderr).
+    """
+    labels = keys.get("stamp_labels")
+    if labels:
+        print("Stamped slugs, labelled:", file=file)
+        for slug, label in labels.items():
+            print(f"  {slug} — {label}", file=file)
+        print(file=file)
+    elif noteless and keys.get("stamp_labels_unread"):
+        print(stamp_labels_unread_clause(surface="cli", config=config), file=file)
+
+
+def _print_retired_partition(handles: List[Dict[str, Any]], omitted: int) -> None:
+    """Prints a ranked answer's retired partition on the CLI text surface.
+
+    The text twin of the ``retired_partition`` / ``retired_partition_omitted``
+    keys, shared by ``mitos surface`` and ``mitos query`` and called on every exit
+    that carries handles, just before the ``→`` note line. One line per handle —
+    slug, state, score, the full id (a retired decision may share its slug with
+    the live one that replaced it, so the id is the handle that reads it whole),
+    its successor stamps and its live end when present — then a count of the
+    members the bound left out. Prints nothing when there are no handles.
+
+    Args:
+        handles: The shown handles (``display.retired_handle``).
+        omitted: How many further members were left out.
+    """
+    if not handles:
+        return
+    print("Retired decisions this ranking passed (closest first):")
+    for h in handles:
+        line = f"  {h['slug']}  ({h['state']}, score {h['score']:.3f})  id {h['id']}"
+        for key in ("superseded_by", "corrected_by", "live_end"):
+            if key in h:
+                line += f"  {key}: {', '.join(h[key]) if h[key] else '(none)'}"
+        print(line)
+    if omitted:
+        print(f"  (+{omitted} more retired not listed)")
+    print()
+
+
+def _print_rejection_section(section: Optional[Any]) -> None:
+    """Prints a ranked answer's rejection matches on the CLI text surface.
+
+    The text twin of ``rejection_matches``, shared by ``mitos surface`` and ``mitos
+    query`` and called on every ranked text exit (blackout, miss, empty and
+    populated), after the retired partition and before the ``→`` note line, which
+    carries the section's state clause. One hit line per match — owner slug, state,
+    score, ordinal and the item text verbatim, a multi-line item hung under it —
+    then, by ``letter``: the owner's Letter under a ``here`` match, ``see rank N
+    above`` for a ``window`` owner, and the successors and live end for a
+    ``retired`` one. Prints nothing when there are no matches.
+
+    Args:
+        section: The answer's ``recall.RejectionSection``, or None when the walk
+            did not run.
+    """
+    if section is None or not section.matches:
+        return
+    print("Rejected options matching this query (closest first):")
+    for m in section.matches:
+        print(render_rejected_item(m["item"], f"  {m['slug']}  ({m['state']}, score "
+                                              f"{m['score']:.3f})  item {m['ordinal']}: "))
+        if m["letter"] == "here":
+            print(f"    Decided:  {m['axiom']}")
+            if "rejected_paths" in m:
+                print(render_rejected_paths(m["rejected_paths"], "    Rejected: "))
+            if m["scope"]:
+                print(f"    Scope:    {', '.join(m['scope'])}")
+        elif m["letter"] == "window":
+            print(f"    see rank {m['rank']} above")
+        elif m["letter"] == "retired":
+            line = "   "
+            for key in ("superseded_by", "corrected_by", "live_end"):
+                if key in m:
+                    line += f" {key}: {', '.join(m[key]) if m[key] else '(none)'}"
+            if line.strip():
+                print(line)
+        if m["letter"] != "retired":
+            marker = _modifier_marker(m)
+            if marker:
+                print(f"    {marker}")
+    print()
 
 
 def _query_band_line(confidence: str) -> Optional[str]:
@@ -1625,7 +2090,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         
     if node["kind"] == "decision":
         print(f"Decided:      {node['core_axiom']}")
-        print(f"Rejected:     {node['rejected_paths']}")
+        print(render_rejected_paths(node["rejected_paths"], "Rejected:     "))
         print(f"Mechanisms:   {', '.join(node['mechanisms'])}")
         print(f"Scope:        {', '.join(node['scope'])}")
         if node.get("invalidates_if"):
@@ -1705,14 +2170,20 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             scope=scope, scope_counts=scope_counts, surface="cli"
         )
 
+    items = [_list_item(d) for d in decisions]
+    # The stamp labels (8a), read once for both encodings, at the default and brief
+    # tiers only — the same call mcp_server.list_decisions makes.
+    label_keys = {} if oneline else list_labels(store, decisions=items).envelope_keys()
+
     if as_json:
         payload: Dict[str, Any] = {
-            "decisions": [_list_item(d) for d in decisions],
+            "decisions": items,
             "open_questions": [_oq_payload(oq) for oq in parked],
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
         }
+        payload.update(label_keys)
         # The brief and oneline tiers withhold the field on every decision; the count
         # says so (no clause: list has no note). Absent at zero, before provenance.
         withheld = count_withheld(payload["decisions"])
@@ -1773,6 +2244,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             if marker:
                 print(f"        {marker}")
     print()
+    _print_stamp_labels(config, label_keys, noteless=True)
 
 
 def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
@@ -2082,7 +2554,10 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
 # The text pause's terminal preview of a neighbour's rejected_paths, in characters.
 # The axiom prints whole (it is what the author judges by); a longer rejected_paths
 # is cut here and the cut is named, with a recipe for the whole field. The --json
-# and MCP payloads carry both fields whole.
+# and MCP payloads carry both fields whole. This name is load-bearing: the source sweep
+# in tests/test_rejection_render.py finds the pause's preview (both branches, the
+# one whole-field print exempt from rejections.render_rejected_paths) by the if/elif
+# chain whose test names it, so a rename reds that row on purpose.
 _PAUSE_REJECTED_PREVIEW = 80
 
 
@@ -2145,7 +2620,7 @@ def _acknowledged_line(value: Optional[List[str]]) -> str:
     Returns:
         The receipt line, without a trailing newline.
     """
-    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+    floor = _floor_text(_NEIGHBOR_REVIEW_THRESHOLD)
     if value is None:
         return ("  Acknowledged: unknown — the neighbours this record went past "
                 "could not be gathered")
@@ -2153,6 +2628,43 @@ def _acknowledged_line(value: Optional[List[str]]) -> str:
         return f"  Acknowledged: no unlinked decision at or above {floor} similarity"
     return (f"  Acknowledged: {', '.join(value)} — the unlinked decisions at or above "
             f"{floor} similarity this record went past")
+
+
+def _acknowledged_tombstones_lines(value: Optional[List[Dict[str, Any]]],
+                                   config: MitosConfig) -> List[str]:
+    """Renders the `created` receipt's ``acknowledged_tombstones`` (7b).
+
+    The sibling of :func:`_acknowledged_line`, keyed on the same flag. Each handle is
+    one line in the pause's tombstone shape (``† slug (state, score) id``) plus where
+    its current word lives, and the floor prints exactly (:func:`_floor_text`), never
+    rounded up. ``None`` means the retired decisions could not be read and must not
+    read as an empty list.
+
+    Args:
+        value: The key's value: handles, ``[]``, or ``None``.
+        config: The workspace config; its ``project`` selects the read recipe.
+
+    Returns:
+        The receipt lines, without trailing newlines.
+    """
+    floor = _floor_text(_TOMBSTONE_FLOOR)
+    if value is None:
+        return ["  Acknowledged tombstones: unknown — the retired decisions this record "
+                "went past could not be read"]
+    if not value:
+        return [f"  Acknowledged tombstones: no retired decision at or above {floor} "
+                "similarity"]
+    lines = [f"  Acknowledged tombstones — the retired decisions at or above {floor} "
+             "similarity this record went past, closest first:"]
+    for t in value:
+        lines.append(f"    † {t['slug']}  ({t['state']}, score {t['score']:.3f})  "
+                     f"id {t['id']}")
+        successors = _live_successors(t)
+        lines.append(f"      current word: {', '.join(successors)}" if successors
+                     else "      current word: no live decision reached")
+    lines.append(f"    read one whole with `mitos show {shell_flag('-p', config.project)} "
+                 "-- <id>`")
+    return lines
 
 
 def cmd_record(
@@ -2256,11 +2768,25 @@ def cmd_record(
         # would be a wall between the author and the anti-knowledge it judges
         # tenability from; the sentences are `_declared_echo_lines` over this same
         # dict's keys, so this render and the two machine encodings cannot disagree.
+        #
+        # 7a: the header counts both partitions with their floors; a tombstone-only
+        # pause never says it is similar to zero decisions. One block per tombstone
+        # follows the neighbours, its whole-read recipe naming the retired decision's
+        # id (a slug may name its live bearer), then the counts and the full-review
+        # sentence verbatim.
         _echo_corpus(config, file=sys.stderr)
-        print(f"⚠ Paused — '{result['slug']}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
-              f"similar to {len(result.get('neighbors', []))} existing decision(s) you "
-              "did not reference. Nothing written.", file=sys.stderr)
-        for n in result.get("neighbors", []):
+        neighbors = result.get("neighbors", [])
+        tombstones = result.get("tombstones", [])
+        said = []
+        if neighbors:
+            said.append(f"≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} similar to "
+                        f"{len(neighbors)} existing decision(s) you did not reference")
+        if tombstones:
+            said.append(f"≥{_floor_text(_TOMBSTONE_FLOOR)} similar to {len(tombstones)} "
+                        "decision(s) this corpus retired")
+        print(f"⚠ Paused — '{result['slug']}' is {', and '.join(said)}. Nothing written.",
+              file=sys.stderr)
+        for n in neighbors:
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
             stamps = "".join(
@@ -2282,15 +2808,64 @@ def cmd_record(
                 print(f"      rejected: {rejected}", file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
+            if n.get("descends_from_declared"):
+                print(f"      descends from what this draft declares: "
+                      f"{', '.join(n['descends_from_declared'])}", file=sys.stderr)
+        if result.get("neighbors_omitted"):
+            print(f"  (+{result['neighbors_omitted']} more live neighbour(s) above the "
+                  "floor not shown)", file=sys.stderr)
+        if tombstones:
+            print("  Tombstones — decisions this corpus retired, closest first:",
+                  file=sys.stderr)
+        for t in tombstones:
+            print(f"  † {t['slug']}  ({t['state']}, score {t['score']:.3f})  id {t['id']}",
+                  file=sys.stderr)
+            axiom = "\n      ".join((t.get("axiom") or "").splitlines())
+            if axiom:
+                print(f"      {axiom}", file=sys.stderr)
+            for key in ("live_end", "superseded_by", "corrected_by"):
+                if key in t:
+                    print(f"      {key.replace('_', ' ')}: "
+                          f"{', '.join(t[key]) if t[key] else '(none reached)'}",
+                          file=sys.stderr)
+            if t.get("successor_on_pause"):
+                print(f"      its successor is on this pause: "
+                      f"{', '.join(t['successor_on_pause'])}", file=sys.stderr)
+            if t.get("successor_ambiguous") and len(_live_successors(t)) > 1:
+                print("      a relation to a slug two decisions carry is refused, and at "
+                      "least one of its successors is one; --acknowledge-neighbors "
+                      "clears it", file=sys.stderr)
+            elif t.get("successor_ambiguous"):
+                print("      its successor's slug names two decisions, so a relation to "
+                      "it is refused; --acknowledge-neighbors clears it",
+                      file=sys.stderr)
+            print(f"      read it whole with "
+                  f"`mitos show {shell_flag('-p', config.project)} -- {shell_arg(t['id'])}`",
+                  file=sys.stderr)
+        if result.get("tombstones_omitted"):
+            print(f"  (+{result['tombstones_omitted']} more tombstone(s) above the floor "
+                  "not shown)", file=sys.stderr)
+        _print_stamp_labels(config, result, noteless=True, file=sys.stderr)
         for line in _declared_echo_lines(result):
             print(f"  {line}", file=sys.stderr)
+        # The review's coverage sentences, verbatim (each names no command, so every
+        # surface carries the same string): it filled full, or it was cut.
+        if result.get("neighbor_review_full"):
+            print(f"  {result['neighbor_review_full']}", file=sys.stderr)
+        if result.get("neighbor_review_cut"):
+            print(f"  {result['neighbor_review_cut']}", file=sys.stderr)
         # Same co-equal framing as the shared needs_review message (one constant,
         # two spellings — the CLI renders flags, the message bare names).
         menu = "/".join(f"--{r}" for r in _PAUSE_RESOLVING_RELATIONS)
-        print(f"  → Judge each neighbour, then re-record with that judgment: {menu} "
-              "<slug> at any neighbour this decision relates to, "
-              "--acknowledge-neighbors for neighbours that stand independently — or "
-              "both at once for a mixed set.", file=sys.stderr)
+        if neighbors:
+            print(f"  → Judge each neighbour, then re-record with that judgment: {menu} "
+                  "<slug> at any neighbour this decision relates to, "
+                  "--acknowledge-neighbors for neighbours that stand independently — or "
+                  "both at once for a mixed set.", file=sys.stderr)
+        if tombstones:
+            print("  → For a tombstone the draft does not re-tread: --supersedes <live "
+                  "successor> for a deliberate reversal, another relation flag at that "
+                  "successor, or --acknowledge-neighbors.", file=sys.stderr)
         # The message's held clause without its digest half: this render carries no
         # draft_digest, and pointing at a key the reader cannot see would be false.
         print(f"  → {PAUSE_HELD_CLAUSE}.", file=sys.stderr)
@@ -2335,7 +2910,13 @@ def cmd_record(
     if no_op:
         for line in _exists_recovery_lines(result, config):
             print(line)
-    print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    if result.get("state") in LIVE_STATES or "state" not in result:
+        print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    else:
+        # A retired node is no relation target (the commit refuses one), and a slug a
+        # live decision also carries names that one: the handle is its id (7b).
+        print(f"  Handle:    {result['id']} — this decision is retired: its id reads it, "
+              "and new decisions relate to its live successor, never to it.")
     # Read back from the committed node (NOT an echo of the flags): the edges the
     # commit actually wired, each naming what it hit, scope as stored, and
     # mechanisms as authored in decisions.md, followed by the fold line when the
@@ -2361,6 +2942,10 @@ def cmd_record(
     # Keyed on presence: [] and None are both answers, only the flag's absence isn't.
     if "acknowledged_neighbors" in result:
         print(_acknowledged_line(result["acknowledged_neighbors"]))
+    if "acknowledged_tombstones" in result:
+        for line in _acknowledged_tombstones_lines(result["acknowledged_tombstones"],
+                                                   config):
+            print(line)
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
     # Flush stdout first so the receipt lands before the nudge even when stdout is piped
@@ -2379,6 +2964,12 @@ def cmd_record(
     if review_notice:
         sys.stdout.flush()
         print(f"\n{review_notice}", file=sys.stderr)
+    # Its sibling: the review ran, but its gather was cut above the floor. Same
+    # flush-first stderr shape; the two never ride one receipt.
+    review_cut = result.get("neighbor_review_cut")
+    if review_cut:
+        sys.stdout.flush()
+        print(f"\n{review_cut}", file=sys.stderr)
     # A rotation failure — the write stands. Same flush-first stderr shape, and before
     # the coherence line, which stays last.
     if rotated and rotated.get("outcome") == ROTATION_FAILED:
@@ -2417,6 +3008,11 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     states the verb cannot reach are conditionals: the receipt does not know which,
     if either, holds.
 
+    A retired node (7b) leads with where its current word lives, binds the amend
+    recipe to its id, and closes on its live successor rather than on its own slug,
+    which no relation may name; when its successor's slug names two decisions the
+    close names no relation flag, only the two ``show`` reads that tell them apart.
+
     Args:
         result: The ``exists`` receipt dict.
         config: The workspace config; its ``project`` selects every recipe.
@@ -2426,10 +3022,16 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     """
     project = config.project
     slug = result["slug"]
+    retired = result.get("state") not in LIVE_STATES
     # The handle leads the flags the reader appends (`--scope` eats every word after
-    # it), and no `--` guards it, so a dash-led slug falls back to the id.
-    handle = result["id"] if slug.startswith("-") else slug
-    return [
+    # it), and no `--` guards it, so a dash-led slug falls back to the id. A retired
+    # node is named by its id too: amend-commentary resolves a handle as `show` does,
+    # and a slug a live decision also carries names the live one (7b).
+    handle = result["id"] if retired or slug.startswith("-") else slug
+    lines: List[str] = []
+    if retired:
+        lines.append(_exists_retired_line(result, config))
+    lines += [
         f"  → To change its commentary: `mitos amend-commentary {shell_flag('-p', project)} {shell_arg(handle)}` "
         "with a flag per field (--rejected, --scope, --invalidates-if, --context, "
         "--new-slug); it edits in place and keeps the id.",
@@ -2440,9 +3042,59 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
         f"{shell_flag('--slug', slug)}` re-materializes one first; if the entry has "
         "rotated into decisions/archive/, edit it there, then run "
         f"`mitos rebuild {shell_flag('-p', project)}`.",
-        "  → To record a changed decision, write a new one with --supersedes or --amends "
-        "naming this slug.",
     ]
+    if not retired:
+        lines.append("  → To record a changed decision, write a new one with --supersedes "
+                     "or --amends naming this slug.")
+        return lines
+    faulted = result.get("superseded_by", []) is None
+    successors = [] if faulted else _live_successors(result)
+    if not successors:
+        return lines
+    named = ", ".join(successors)
+    if result.get("successor_ambiguous"):
+        if slug.casefold() in {s.casefold() for s in successors}:
+            lines.append("  → Its slug also names the live decision: --reconcile-entry "
+                         "and restore-source --slug above reach an entry by that slug, "
+                         "so check which block they name before running them.")
+        refused = (f"A relation to {named} is refused: two decisions carry that slug."
+                   if len(successors) == 1 else
+                   "A relation to a slug two decisions carry is refused, and at least one "
+                   f"of {named} is one.")
+        lines.append(
+            f"  → {refused} "
+            f"`mitos show {shell_flag('-p', project)} -- {shell_arg(successors[0])}` "
+            "reads the live one; "
+            f"`mitos show {shell_flag('-p', project)} -- {shell_arg(result['id'])}` "
+            "reads this one.")
+    else:
+        reversal = (f"--supersedes {shell_arg(successors[0])}" if len(successors) == 1
+                    else "--supersedes at one of them")
+        lines.append(
+            f"  → To record a changed decision, write a new one relating to {named} "
+            f"({reversal} for a deliberate reversal), never to this decision's slug: a "
+            "relation can name only a live decision.")
+    return lines
+
+
+def _exists_retired_line(result: Dict[str, Any], config: MitosConfig) -> str:
+    """The first recovery line of a retired node's ``exists``: where its word lives (7b).
+
+    Composed from the receipt's handle keys, like the dict's note, with this
+    boundary's own recipe: ``None`` keys (a faulted handle read) name the id-bound
+    ``mitos show`` that reads the successors.
+    """
+    state = result.get("state")
+    if result.get("superseded_by", []) is None:
+        return (f"  → This decision is {state}; its successors could not be read: "
+                f"`mitos show {shell_flag('-p', config.project)} -- "
+                f"{shell_arg(result['id'])}` reads them.")
+    successors = _live_successors(result)
+    if successors:
+        return (f"  → This decision is {state}; its current word lives in "
+                f"{', '.join(successors)}.")
+    return (f"  → This decision is {state}; its chain of successors reaches no live "
+            "decision.")
 
 
 def _rotation_receipt_lines(report: Dict[str, Any]) -> List[str]:
@@ -2621,54 +3273,30 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     )
     top_k = clamp_limit(limit)
 
-    def _shape(node, score, thinned):
-        d = letter_payload(node, brief=thinned, extras={"score": score})
-        d.update(store.get_modifiers(node["id"]))
-        return d
-
     results: Dict[str, Any] = {"active_decisions": []}
     results.update(corpus_provenance(config))
     semantic_ran = False
-    top_score: Optional[float] = None
-    retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
-    lever = None
-    dump_total: Optional[int] = None
+    # Bound before the walk's block — see cmd_query.
+    part = RetiredPartition([], 0, False)
+    handles: List[Dict[str, Any]] = []
+    # The rejection section; composed only when the walk ran.
+    section = None
 
+    walk = None
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
-            matches = manager.vector_store.query(q_vector, limit=top_k)
+            # The shared identity walk — see cmd_query.
+            walk = walk_ranked(q_vector, vector_store=manager.vector_store,
+                               graph=store, limit=top_k,
+                               rejections=_rejection_leg(config), light=True)
             semantic_ran = True
-            # Raw points, not surfaced decisions: the lever reads retrieval depth.
-            lever = window_lever(points=len(matches), limit=top_k,
-                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
-            for m in matches:
-                node = store.get_node_by_slug(m["slug"])
-                if not node:
-                    handle = _retired_handle(store, m["slug"])
-                    if handle:
-                        retired.append(handle)
-                    continue
-                if node["kind"] != "decision":
-                    # An open question: never embedding-ranked (C4), not retired.
-                    continue
-                state = store.get_node_state(node["id"])
-                if state not in ("active", "drifted"):
-                    handle = _retired_handle(store, m["slug"])
-                    if handle:
-                        retired.append(handle)
-                    continue
-                # Rank among the decisions returned, at append time — never the
-                # index into `matches`, whose skipped entries consume no rank.
-                rank = len(results["active_decisions"]) + 1
-                results["active_decisions"].append(
-                    _shape(node, m["score"], _rank_thinned(rank, full_top))
-                )
-                if top_score is None or m["score"] > top_score:
-                    top_score = m["score"]
+        except WalkContractError:
+            # A wrong store or vector double: loud, never "recall degraded".
+            raise
         except CollectionMissingError as e:
-            # I8 — see cmd_query. Over an empty active set the absent collection IS
+            # I8 — see cmd_query. Over an empty expected set the absent collection IS
             # the empty index, so `semantic_ran` stays True: the read renders "ran
             # and found nothing", which is also what correctly suppresses the
             # degraded-only unranked scope dump below.
@@ -2681,29 +3309,39 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             semantic_ran = False
             degraded_error = e
 
-    # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
-    # semantic run that found nothing must not masquerade as an unranked scope dump.
-    if not semantic_ran and not results["active_decisions"] and scope:
-        try:
-            active_decs = store.get_active_decisions(scope=scope)
-            dump_total = len(active_decs)
-            for d in active_decs[:top_k]:
-                rank = len(results["active_decisions"]) + 1
-                results["active_decisions"].append(
-                    _shape(d, 1.0, _rank_thinned(rank, full_top))
-                )
-        except Exception:
-            pass
+    # Composition, outside the `try` — see cmd_query.
+    if walk is not None:
+        for rank, hit in enumerate(walk.window, start=1):
+            d = letter_payload(hit.node, brief=_rank_thinned(rank, full_top),
+                               extras={"score": hit.score})
+            for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
+                d[key] = list(slugs)
+            results["active_decisions"].append(d)
+        # The retired decisions this ranking passed — see cmd_query.
+        part = retired_partition(walk)
+        handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
+                                  live_ends=walk.live_ends)
+                   for h in part.shown]
+        # The rejection section — see cmd_query.
+        section = rejection_section(
+            walk, full_top=full_top,
+            gap=lambda: missing_rejection_index_is_a_gap(store),
+            shape=rejection_matches_payload, surface="cli", config=config,
+        )
 
     # The degraded cause, computed once and handed to both the lexical exit's header
-    # and the scope-dump / partial-list note, so the two cannot name different causes.
+    # and the scope dump's note, so the two cannot name different causes.
     reason = (degraded_reason_from_error(degraded_error, surface="cli",
                                          project=config.project)
               if not semantic_ran else None)
 
-    # Open questions only when a scope was given (absent = not scanned, [] = none here).
+    # Open questions only when a scope was given (absent = not scanned, [] = none
+    # here). A scan that raised leaves the key absent and names the fault (WIRING_LEDGER
+    # entry-005): `[]` would claim "none parked here" for a scan that never finished.
+    scan_faults: List[str] = []
     if scope:
         open_questions = []
+        oq_unread = False
         try:
             for oq in store.get_open_questions(scope=scope):
                 if oq["state"] == "parked":
@@ -2712,8 +3350,35 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                         "park_reason": oq.get("park_reason"), **_oq_modifiers(oq),
                     })
         except Exception:
-            pass
-        results["open_questions"] = open_questions
+            oq_unread = True
+        if oq_unread:
+            scan_faults.append(oq_scan_fault_clause(scope))
+        else:
+            results["open_questions"] = open_questions
+
+    # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
+    # semantic run that found nothing must not masquerade as an unranked scope dump.
+    # One read, stamped by its own hydration; None (a fault, or an empty scope)
+    # leaves the answer empty-handed, so it takes the lexical exit below.
+    if not semantic_ran and not results["active_decisions"] and scope:
+        dump = scope_dump(store, scope, limit=top_k, full_top=full_top)
+        if dump is not None:
+            results["active_decisions"] = dump.decisions
+            # The dump's whole degraded statement, composed once (degraded); the
+            # boundary places its keys and prints its note.
+            dumped = dump_section(query, dump, config=config, store=store,
+                                  full_top=full_top, surface="cli", scope=scope,
+                                  reason=reason, scan_faults=scan_faults)
+            results.update(dumped.envelope_keys())
+            if notice:
+                results["check_notice"] = notice
+            if as_json:
+                _emit_json(results)
+                return
+            _print_surface_answer(config, query, scope, results, handles=[],
+                                  omitted=0, section=dumped, override=None,
+                                  notice=notice)
+            return
 
     # Degraded and empty-handed on decisions: route into the deterministic
     # lexical fallback (ADR read-verbs-degrade-to-lexical-decisions-md-fallback)
@@ -2725,64 +3390,39 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             config, query, reason=reason,
             store=store, as_json=as_json, full_top=full_top, limit=limit,
             open_questions=results.get("open_questions"),
-            check_notice=notice,
+            check_notice=notice, scan_faults=scan_faults,
         )
         return
 
-    # Confidence signal — distinguish a settled precedent from loose neighbours / no
-    # match (AX P5). Shared policy with the MCP tool via mitos.recall. The live
-    # scope-count map (busiest-first) is the unused-scope oracle + did-you-mean / top-K
-    # source; calm-degrade to None on error.
+    # The live scope-count map (busiest-first) is the unused-scope oracle + did-you-mean
+    # / top-K source; a read that raised leaves it None and is named (entry-005).
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None
     if scope:
+        counts_unread = False
         try:
             scope_counts = order_scope_counts(store.get_scope_counts())
         except Exception:
-            pass
-    confidence, note = assess_surface_recall(
-        semantic_ran=semantic_ran,
-        top_score=top_score,
-        result_count=len(results["active_decisions"]),
-        scope=scope,
-        scope_counts=scope_counts,
-        surface="cli",
-        lever=lever,
-        scope_total=dump_total,
-        degraded_reason=reason,
+            counts_unread = True
+        if counts_unread:
+            scan_faults.append(scope_counts_fault_clause(scope))
+
+    # The stamp labels (8a) — the same call mcp_server.surface_decisions makes.
+    labels = ranked_labels(
+        store, window=results["active_decisions"], handles=handles,
+        matches=section.matches if section is not None else [])
+
+    # The band, its evidence and the note, composed once — the same call
+    # mcp_server.surface_decisions makes (CLI⇄MCP parity by construction).
+    composed = compose_ranked(
+        walk, register="surface", surface="cli", config=config, handles=handles,
+        part=part, section=section,
+        unbuilt=lambda: missing_graph_is_a_gap(store, config,
+                                               corpus_scan=corpus_holds_entries),
+        top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
+        scope_counts=scope_counts, scan_faults=scan_faults, labels=labels,
     )
-    if confidence is not None:
-        results["confidence"] = confidence
-    results["note"] = note
-
-    # Blackout: semantic ranking ran and retrieved precedents, but every one was
-    # superseded-filtered (no active match). Override the note with the recovery
-    # vector and attach the retired handles — distinct from a true miss (where
-    # `retired` is empty). Fires regardless of any parked open questions (the
-    # all_superseded vector must not be suppressed by a non-empty open_questions).
-    blackout = semantic_ran and not results["active_decisions"] and bool(retired)
-    if blackout:
-        results["note"] = blackout_note(retired)
-        results["all_superseded"] = retired
-        note = results["note"]
-
-    # W31 — the unbuilt graph, consulted on the ordinary empty path (see cmd_query).
-    # Placed after the blackout override so the graph note wins if both ever applied:
-    # with no graph, a pointer at the collection or the graveyard names the wrong
-    # heal. They cannot both apply in fact — a retired handle is a node — but the
-    # precedence is written down rather than left to that coincidence.
-    if not results["active_decisions"] and missing_graph_is_a_gap(
-        store, config, corpus_scan=corpus_holds_entries
-    ):
-        results["note"] = missing_graph_note("cli", config)
-        note = results["note"]
-
-    # A thinned answer says so by a count and a clause, after every note override
-    # (they need zero hits) and before the notice; the printed note follows.
-    withheld = count_withheld(results["active_decisions"])
-    if withheld:
-        results["note"] = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
-        note = results["note"]
-        results["rejected_paths_withheld"] = withheld
+    composed.place_into(results)
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -2791,9 +3431,28 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if as_json:
         _emit_json(results)
         return
+    _print_surface_answer(config, query, scope, results, handles=handles,
+                          omitted=part.omitted, section=section,
+                          override=composed.override, notice=notice)
 
+
+def _print_surface_answer(config: MitosConfig, query: str, scope: Optional[str],
+                          results: Dict[str, Any], *, handles: List[Dict[str, Any]],
+                          omitted: int, section: Optional[Any],
+                          override: Optional[str],
+                          notice: Optional[Dict[str, Any]]) -> None:
+    """Renders ``mitos surface``'s text answer from its composed envelope.
+
+    The text twin of the ``--json`` envelope, gated as the envelope is: under the
+    unbuilt-graph note no retired partition and no rejection section print (lock A),
+    and the band line prints only when no override replaced the legend. Its ``none``
+    line names no scope: a scopeless call and an answer of open questions alone hold
+    no populated scope to speak of.
+    """
     ad, oqs = results["active_decisions"], results.get("open_questions", [])
     conf = results.get("confidence")
+    note = results["note"]
+    unbuilt = override == OVERRIDE_UNBUILT
     if not ad and not oqs:
         # The clean-empty header asserts "checked, none found" — it must never
         # co-occur with a degraded/unavailable note ("couldn't check"). With the
@@ -2804,15 +3463,18 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             scope_note = f" (scope: {scope})" if scope else ""
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
+        if not unbuilt:
+            _print_retired_partition(handles, omitted)
+            _print_section(section)
+        _print_stamp_labels(config, results)
         print(f"→ {note}")
         _print_check_notice(config, notice)
         return
     print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else "")
           + f"  [{provenance_line(config)}]")
-    if conf == "weak":
-        print("⚠ confidence: weak — twilight zone: matches are close but may not settle this.")
-    elif conf == "none":
-        print("⚠ confidence: likely off-axis — the scope is populated, but nothing matches your query.")
+    band_line = _surface_band_line(conf) if override is None else None
+    if band_line:
+        print(band_line)
     print("-" * 60)
     for i, d in enumerate(ad, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -2821,17 +3483,46 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if marker:
             print(f"   {marker}")
         if "rejected_paths" in d:
-            print(f"   Rejected: {d['rejected_paths']}")
+            print(render_rejected_paths(d["rejected_paths"], "   Rejected: "))
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    # After the hit list, before the open questions and the note: on a blackout
+    # with parked open questions this is the branch that renders the handles.
+    if not unbuilt:
+        _print_retired_partition(handles, omitted)
+        _print_section(section)
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
         marker = _modifier_marker(oq)
         if marker:
             print(f"   {marker}")
+    _print_stamp_labels(config, results)
     print(f"\n→ {note}")
     _print_check_notice(config, notice)
+
+
+def _surface_band_line(confidence: Optional[str]) -> Optional[str]:
+    """The one-line band label for ``mitos surface``'s text rendering, or None.
+
+    The twin of :func:`_query_band_line`, in ``surface``'s words: ``strong`` and a
+    degraded answer (no band) print nothing. The ``none`` line names the band and the
+    ranking fact only — "the scope is populated" was false on every scopeless call
+    and on an answer of open questions alone. The caller prints it only when no
+    override replaced the legend: a blackout or unbuilt note beside a band label
+    contradicts it.
+
+    Args:
+        confidence: The band from the composed envelope, or None.
+
+    Returns:
+        The line to print, or None when the band prints none.
+    """
+    if confidence == "weak":
+        return "⚠ confidence: weak — twilight zone: matches are close but may not settle this."
+    if confidence == "none":
+        return "⚠ confidence: none — nothing ranked close to this query."
+    return None
 
 
 def cmd_serve() -> None:
@@ -3189,10 +3880,10 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
       separates the fresh project (flagged before, healthy now) from a populated one.
     * **No prescription.** The corpus gate cannot separate the clone whose graph was
       never built (heal: ``mitos rebuild``) from the project whose collection was swept
-      (heal: ``mitos reconcile``), and for the clone ``reconcile`` is the heal 4b
-      calls *"one word away and worse than silence"* — it diffs an empty active set
-      against an absent collection, enqueues nothing, and reports success on a
-      workspace it did not touch. So the note points at ``mitos status <name>``,
+      (heal: ``mitos reconcile``), and for the clone ``reconcile`` is not the heal —
+      over an unbuilt graph it judges no point, deletes nothing, refuses naming
+      ``rebuild`` and exits 1, so naming it would route the reader through a
+      refusal. So the note points at ``mitos status <name>``,
       which reads the graph and names the right heal. That is the *"projects
       discovers, status diagnoses"* division the vision already states.
 
@@ -3259,7 +3950,15 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
             decisions_file=os.path.join(project["path"], "decisions.md"),
             archive_dir=os.path.join(project["path"], "decisions", "archive"),
         )
-        if project["collection_present"] is False and corpus_scan(locator):
+        # Scanned at most once per project, and only when a note could use it.
+        populated: List[bool] = []
+
+        def holds_entries() -> bool:
+            if not populated:
+                populated.append(bool(corpus_scan(locator)))
+            return populated[0]
+
+        if project["collection_present"] is False and holds_entries():
             # A pointer, never a diagnosis and never a heal: the overview reads no
             # graph, so it can neither price what re-embedding would cost nor tell a
             # swept collection from an unbuilt one — and those two want opposite
@@ -3271,6 +3970,14 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
             notes.append(
                 f"vector collection unknown — {project['qdrant_url']} did not answer "
                 f"with a usable listing (see below)")
+        elif (project["rejection_collection_present"] is False
+              and holds_entries()):
+            # The same pointer for the rejection index, for the same reason: no graph
+            # read, so no price. Silent while the decision collection is itself
+            # absent — the note above already sends the reader to `status`.
+            notes.append(
+                f"rejection index {project['rejection_collection']} absent — "
+                f"`mitos status {name}` for the heal")
 
     if project["shares_path_with"]:
         # A finding, never a fault — both names reach the same workspace, so nothing
@@ -3632,6 +4339,202 @@ def _commit_gate_lines(row: Dict[str, Any], *, project: str) -> List[str]:
     return lines
 
 
+def _rejection_index_status(
+    config: MitosConfig, reachable: bool, *, pre_v1a: bool
+) -> Dict[str, Any]:
+    """Reads the rejection index for ``status``: the listing first, then one graph read.
+
+    Best-effort throughout: a read that fails leaves its values ``None`` ("could not
+    verify"), never ``0``. The listing is made **before** the graph read, the heal's
+    order: an item a record writes mid-``status`` is then either unlisted (it may read
+    as missing for this one report, the safe direction) or listed with its owner
+    already committed — never orphaned. The diff is the one ``reconcile`` heals
+    (:func:`~mitos.rejections.diff_rejection_index`), so its warning clears by
+    construction. Precedence for stale and orphaned: no listing or no graph read →
+    ``None``; an empty listing (absent, or present and empty) → ``0`` on any graph
+    read; a listing over a graph holding no node → ``None`` (not judged); otherwise
+    the diff's counts. The backlog is named only past
+    ``REJECTION_BACKLOG_FAILURE_TOLERANCE``, never by its raw row count, so a
+    healthy amend never reads as an index falling behind.
+
+    Args:
+        config: The workspace config.
+        reachable: ``_check_qdrant``'s answer; no listing is attempted without it.
+        pre_v1a: A prototype graph is not read.
+
+    Returns:
+        ``exists``, ``present_items``, ``expected_items``, ``missing_items``,
+        ``missing_owners``, ``stale_items``, ``orphan_items``, ``past_tolerance``,
+        ``gap`` and ``seed``.
+    """
+    out: Dict[str, Any] = {
+        "exists": None, "present_items": None, "expected_items": None,
+        "missing_items": None, "missing_owners": None, "stale_items": None,
+        "orphan_items": None, "past_tolerance": None, "gap": None, "seed": None,
+    }
+    listing: Optional[Dict[str, Optional[str]]] = None
+    if reachable:
+        try:
+            listing = QdrantRejectionIndex(
+                config.qdrant_url, config.rejection_collection
+            ).list_point_owners()
+            out["exists"] = True
+        except CollectionMissingError:
+            listing = {}
+            out["exists"] = False
+        except Exception:
+            listing = None
+        if listing is not None:
+            out["present_items"] = len(listing)
+
+    owner_fields: Optional[Dict[str, str]] = None
+    node_count: Optional[int] = None
+    if pre_v1a:
+        pass  # a prototype graph is not read; every graph-side value stays None
+    elif not os.path.exists(config.db_path):
+        # No graph file: nothing is recorded, so nothing is expected.
+        owner_fields, node_count, out["gap"], out["past_tolerance"] = {}, 0, False, 0
+    else:
+        try:
+            store = GraphStore(config.db_path, read_only=True)
+        except Exception:
+            store = None
+        if store is not None:
+            try:
+                node_count = len(store.get_all_node_ids())
+                owner_fields = store.get_rejection_index_owner_fields()
+            except Exception:
+                owner_fields = node_count = None
+            out["gap"] = missing_rejection_index_is_a_gap(store)
+            try:
+                out["past_tolerance"] = store.count_rejection_backlog(
+                    min_retry=REJECTION_BACKLOG_FAILURE_TOLERANCE
+                )
+            except Exception:
+                pass
+            out["seed"] = store.rejection_seed()
+        else:
+            out["gap"] = True  # "could not check" is never the healthy-empty answer
+
+    if owner_fields is None:
+        return out
+    try:
+        expected = expected_rejection_points(owner_fields)
+    except Exception:
+        return out
+    out["expected_items"] = len(expected)
+    if listing is None:
+        return out
+    diff = diff_rejection_index(expected, listing, owners=owner_fields.keys())
+    out["missing_items"] = len(diff.missing)
+    out["missing_owners"] = len(diff.missing_owners)
+    if not listing:
+        out["stale_items"] = out["orphan_items"] = 0
+    elif node_count:
+        out["stale_items"] = len(diff.stale)
+        out["orphan_items"] = len(diff.orphaned)
+    # else: items listed over a graph holding no node — not judged.
+    return out
+
+
+def _rejection_row_hint(
+    rejection: Dict[str, Any], config: MitosConfig, reachable: bool, *,
+    graph_unbuilt: bool, pre_v1a: bool = False,
+) -> Optional[str]:
+    """The rejection index row's hint, printed only when the index is not present.
+
+    The decision row's ladder: unreachable, unlisted, a prototype or unbuilt graph
+    (each deferring to its own row or rung, never naming ``reconcile``, which is not
+    their heal), then an absent collection priced from the diff (K of N, with K = N:
+    this index keeps no embedding cache), unpriced when the graph could not be read,
+    or calm when no decision states a rejected item. No form interpolates a ``None``.
+    """
+    reconcile = f"`mitos reconcile {shell_flag('-p', config.project)}`"
+    if not reachable:
+        return "needs Qdrant up (see above)"
+    if rejection["exists"] is None:
+        return (
+            f"could not be listed; `mitos status {shell_flag('-p', config.project)}` "
+            f"again when Qdrant answers"
+        )
+    if rejection["exists"]:
+        return None
+    if pre_v1a:
+        return "not read — the graph predates V1a (see the graph schema row)"
+    if graph_unbuilt:
+        return "nothing indexed yet — the graph is unbuilt (see below)"
+    missing = rejection["missing_items"]
+    if missing is None:
+        if rejection["gap"] is False:
+            return (
+                "created when a decision's rejected items are first indexed — none "
+                "expected yet"
+            )
+        return f"missing — could not read the graph to price it; run {reconcile}"
+    if missing:
+        return (
+            f"missing — {missing} rejected item(s) of {rejection['missing_owners']} "
+            f"decision(s) have no point; run {reconcile} ({missing} embedding(s) — "
+            f"this index keeps no embedding cache)"
+        )
+    return "created when a decision's rejected items are first indexed — none expected yet"
+
+
+def _rejection_index_rungs(rejection: Dict[str, Any], config: MitosConfig) -> List[str]:
+    """The rejection index's informational rungs, gated on the diff, never the backlog.
+
+    Missing items in a present collection (with the seed line when a marker stands),
+    stale items as a neutral line (a healthy amend leaves them until the next drain),
+    orphaned items, items not judged over a graph holding no node, and backlog rows
+    past the tolerance. None feeds ``ready``, the verdict or the exit code. Each states
+    an index fact and its heal. Only the stale line says what a read finds — that no
+    read serves a stale item, because every ranked read checks each match against its
+    decision's current field (since 5a); no other line makes a read claim.
+    """
+    sel = shell_flag("-p", config.project)
+    lines: List[str] = []
+    missing = rejection["missing_items"]
+    if rejection["exists"] and missing:
+        lines.append(
+            f"\n  ⚠ rejection index incomplete — {missing} rejected item(s) of "
+            f"{rejection['missing_owners']} decision(s) have no point. "
+            f"`mitos reconcile {sel}` embeds them: {missing} embedding(s), none cached. "
+            f"Informational, not a readiness blocker."
+        )
+        seed = rejection["seed"]
+        if seed:
+            lines.append(
+                f"      the rejection backlog was seeded by `{seed['established_by']}` "
+                f"at {seed['established_at']} — the next `mitos sync {sel}` builds it "
+                f"once the embedding provider answers"
+            )
+    stale = rejection["stale_items"]
+    if stale:
+        lines.append(
+            f"  • {stale} rejected item(s) await removal — their decision's field no "
+            f"longer states them, so no read serves them; `mitos reconcile {sel}` "
+            f"removes them."
+        )
+    orphaned = rejection["orphan_items"]
+    if orphaned:
+        lines.append(
+            f"\n  ⚠ {orphaned} rejected item(s) belong to no decision in the graph — "
+            f"`mitos reconcile {sel}` deletes them. Informational, not a readiness "
+            f"blocker."
+        )
+    present = rejection["present_items"]
+    if present and stale is None and orphaned is None and rejection["expected_items"] is not None:
+        lines.append(f"  • {present} rejected item(s) not judged — the graph holds no nodes.")
+    past = rejection["past_tolerance"]
+    if past:
+        lines.append(
+            f"\n  ⚠ {past} decision(s)' rejected items failed to index "
+            f"{REJECTION_BACKLOG_FAILURE_TOLERANCE} or more times; they stay queued, and "
+            f"every `mitos sync {sel}` and `mitos reconcile {sel}` attempts them again."
+        )
+    return lines
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False, *,
                project: Optional[str] = None, verbose: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
@@ -3771,6 +4674,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     graph_nodes = None
     active_nodes = None
     active_ids: Set[str] = set()
+    # The decision index's expected set (every decision + the active open questions),
+    # its own `None` default: "the expected read completed" is not inferred from
+    # `active_nodes`, which a later fault in the same `try` leaves set.
+    expected_ids: Optional[FrozenSet[str]] = None
     id_to_slug: Dict[str, str] = {}
     # Read-only size-ceiling report for the generated context files. This is the
     # health surface the write-path overflow nudge points at — the detailed breakdown
@@ -3793,9 +4700,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             id_to_slug = {n["id"]: n["slug"] for n in all_nodes}
             active_ids = ro_store.get_active_node_ids()
             active_nodes = len(active_ids)
+            expected_ids = ro_store.get_decision_index_expected_ids()
             overflows = overflow_report(ro_store)
             # The coverage marker, if one stands: a `rebuild`/`cutover`/`reconcile`
-            # bounded the outbox to the active set and has not drained yet. Purely
+            # seeded the outbox with the decision index's expected set and has not
+            # drained yet. Purely
             # informational — it tells the operator that a plain `mitos sync` restores
             # search, which is otherwise a fact only the drain knows. Never a readiness
             # gate: an unseeded queue is an ordinary state, not a fault.
@@ -3806,41 +4715,97 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
 
     # Vector-index completeness by EXACT id-diff, not a count proxy. `mitos status`
     # is the SENSOR (reconcile is the heal), so it must catch a shortfall the count
-    # `points >= active` structurally can't — dead-vector slack in the graveyard
-    # (superseded vectors that linger, never GC'd) inflates the point total past the
-    # active threshold and hides genuinely-missing active vectors (the live-corpus
-    # incident: 181 >= 178 read healthy over 12 invisible active nodes). We scroll
-    # Qdrant's actual point ids and diff. `status` is a read-only sensor and creates
-    # nothing — the module-level scroll keeps it independent of a store entirely.
+    # `points >= active` structurally can't — non-active points (retired decisions'
+    # vectors, kept by design) inflate the point total past the active threshold and
+    # hide genuinely-missing active vectors (the live-corpus incident: 181 >= 178
+    # read healthy over 12 invisible active nodes). We scroll Qdrant's actual point
+    # ids and diff. `status` is a read-only sensor and creates nothing — the
+    # module-level scroll keeps it independent of a store entirely.
     #
     # `missing_active` = active nodes with no vector (invisible to semantic search —
-    #   the warned state). `orphan_points` = points with no active node — the
-    #   graveyard substrate the all-superseded blackout vector consumes, per
-    #   graveyard-vectors-now-consumed-by-blackout-best-effort: reported neutrally,
-    #   never a warning, never deleted here. `None` means "could not verify" (scroll
-    #   failed) — distinct from `0` ("verified complete"); we never fall back to the
-    #   count proxy we just declared structurally blind.
+    #   the warned state). `orphan_points` = points with no active node, partitioned
+    #   (`partition_points`, the one partition `reconcile` applies) into
+    #   `retired_node_points` — points of nodes still in the graph but not active:
+    #   history, the substrate retired matches and the all-superseded blackout read
+    #   (graveyard-vectors-now-consumed-by-blackout-best-effort), reported neutrally
+    #   and never collected — and `nodeless_points`, points whose node is not in the
+    #   graph at all: garbage, which `mitos reconcile` deletes. The partition is read
+    #   AFTER the scroll, in the heal's order, so a record landing during `status`
+    #   cannot show as node-less, and `orphan_points` derives from that same read
+    #   pair, so the two keys sum to it. Over a graph holding no nodes with points
+    #   listed the partition is not computed (every point would look node-less):
+    #   the pair stays `None` while `orphan_points` keeps its int. `None` everywhere
+    #   means "could not verify" (scroll failed, or a graph read failed) — distinct
+    #   from `0` ("verified complete"); we never fall back to the count proxy we
+    #   just declared structurally blind.
+    # `missing_retired_*` = retired decisions with no vector, the sibling partition of
+    #   the decision index's expected set (`expected_ids - active_ids`, one store read
+    #   shared with `reconcile`, so the heal clears this warning by construction).
+    #   Their `None` follows `missing_active_*` branch for branch, and is also `None`
+    #   when the expected read did not complete.
     missing_active_slugs: Optional[List[str]] = None
+    missing_retired_slugs: Optional[List[str]] = None
     orphan_points: Optional[int] = None
+    retired_node_points: Optional[int] = None
+    nodeless_points: Optional[int] = None
+    retired_ids: Optional[FrozenSet[str]] = (
+        None if expected_ids is None else expected_ids - active_ids
+    )
     scroll_failed = False
     if q["reachable"] and q["collection_exists"] and active_nodes is not None:
+        present: Optional[Set[str]] = None
         try:
             present = scroll_point_ids(config.qdrant_url, config.qdrant_collection)
             missing_active_slugs = sorted(
                 id_to_slug.get(nid, nid) for nid in active_ids if hash_to_uuid(nid) not in present
             )
-            active_uuids = {hash_to_uuid(nid) for nid in active_ids}
-            orphan_points = len(present - active_uuids)
+            if retired_ids is not None:
+                missing_retired_slugs = sorted(
+                    id_to_slug.get(nid, nid) for nid in retired_ids
+                    if hash_to_uuid(nid) not in present
+                )
         except VectorStoreError:
             scroll_failed = True  # unknown — do not fabricate "complete"
-    elif q["reachable"] and not q["collection_exists"] and active_ids:
+            present = None
+        if present is not None:
+            # The partition's read pair, after the scroll and outside its `try`: a
+            # graph fault here leaves the three point keys "could not verify" and
+            # keeps the slug diffs, and it is not a scroll failure.
+            try:
+                pair_store = GraphStore(config.db_path, read_only=True)
+                pair_active = pair_store.get_active_node_ids()
+                pair_nodes = pair_store.get_all_node_ids()
+            except Exception:
+                pair_nodes = None
+            if pair_nodes is not None:
+                active_uuids = {hash_to_uuid(nid) for nid in pair_active & pair_nodes}
+                orphan_points = len(present - active_uuids)
+                if not present:
+                    retired_node_points = nodeless_points = 0
+                elif pair_nodes:
+                    partition = partition_points(
+                        present, node_ids=pair_nodes, active_ids=pair_active
+                    )
+                    retired_node_points = len(partition.retired_node)
+                    nodeless_points = len(partition.nodeless)
+                # else: points listed over a graph holding no nodes — not judged.
+    elif q["reachable"] and not q["collection_exists"] and expected_ids:
         # Collection deleted OUTRIGHT (not just its points) while the graph holds
-        # active nodes — the whole active surface is missing (the diff against an
-        # empty collection). This is a full wipe, NOT the healthy fresh-project empty
-        # state; absence of the collection must not read as calm health next to a
-        # populated graph. `mitos reconcile` re-creates the collection and re-embeds.
+        # nodes the decision index should hold — every one of them is missing (the
+        # diff against an empty collection). This is a full wipe, NOT the healthy
+        # fresh-project empty state; absence of the collection must not read as calm
+        # health next to a populated graph. Gated on the expected set, not the active
+        # one, so a graph holding only retired decisions reports them too. `mitos
+        # reconcile` re-creates the collection and embeds every one.
         missing_active_slugs = sorted(id_to_slug.get(nid, nid) for nid in active_ids)
-        orphan_points = 0
+        missing_retired_slugs = sorted(id_to_slug.get(nid, nid) for nid in retired_ids)
+    if q["reachable"] and not q["collection_exists"] and active_nodes is not None:
+        # An absent collection lists nothing, so its points are judged and empty on
+        # any graph that was read — a graph found empty included. Only the three
+        # point keys: the missing-vector keys keep the expected-set gate above.
+        orphan_points = retired_node_points = nodeless_points = 0
+
+    rejection = _rejection_index_status(config, q["reachable"], pre_v1a=pre_v1a)
 
     # Corpus↔graph divergence (B′). Purely informational — a corpus mid-edit is a
     # normal state, so gating readiness on it would make an ordinary hand edit read
@@ -3920,6 +4885,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "pre_v1a": pre_v1a,
             "qdrant_url": config.qdrant_url,
             "collection": config.qdrant_collection,
+            "rejection_collection": config.rejection_collection,
             # The four resolved corpus locations, flat beside the other
             # resolved-identity values rather than in a `paths` sub-map: `checks` is
             # the payload's only nested map and it holds verdicts and the counts that
@@ -3953,8 +4919,27 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                     None if missing_active_slugs is None else len(missing_active_slugs)
                 ),
                 "missing_active_slugs": missing_active_slugs,
+                # Siblings, not a retype (3b): retired-decision completeness against
+                # the decision index's expected set. The active keys above keep their
+                # meaning. Neither feeds `ready`, the verdict or the exit code.
+                "retired_decisions": None if retired_ids is None else len(retired_ids),
+                "missing_retired_vectors": (
+                    None if missing_retired_slugs is None else len(missing_retired_slugs)
+                ),
+                "missing_retired_slugs": missing_retired_slugs,
                 "orphan_points": orphan_points,
+                "retired_node_points": retired_node_points,
+                "nodeless_points": nodeless_points,
                 "graph_unbuilt": graph_unbuilt,
+                # The rejection index (4d), siblings of the decision index's keys and
+                # worded from the same id diff `reconcile` heals. None = could not
+                # verify. Neither feeds `ready`, the verdict or the exit code.
+                "rejection_collection_exists": rejection["exists"],
+                "rejection_expected_items": rejection["expected_items"],
+                "missing_rejection_items": rejection["missing_items"],
+                "stale_rejection_items": rejection["stale_items"],
+                "orphan_rejection_items": rejection["orphan_items"],
+                "rejection_backlog_past_tolerance": rejection["past_tolerance"],
                 # Renamed from `mcp_wired` in 6a, and the rename is the point: the
                 # same file read now means the opposite thing. A consumer reading
                 # `mcp_wired: true` for "good" would read a hazard as an
@@ -4007,6 +4992,16 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             f"missing — {len(active_ids)} active node(s) have no vectors; "
             f"run `mitos reconcile {shell_flag('-p', config.project)}`",
         )
+    elif expected_ids:
+        # No active node, but the decision index still expects retired decisions —
+        # decisions WERE recorded, and the creation carve-out keys on the expected
+        # set, so the next record will not create the collection either. "None
+        # recorded yet" would be false twice.
+        coll_mark, coll_hint = (
+            None,
+            f"missing — {len(retired_ids or ())} retired decision(s) have no vectors; "
+            f"run `mitos reconcile {shell_flag('-p', config.project)}`",
+        )
     elif graph_unbuilt:
         # The calm fresh-project sentence below is FALSE over a corpus of hundreds,
         # and it is part of the same lie the rung exists to stop: an absent
@@ -4054,6 +5049,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # about which name is in force.
         (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint,
          _inert_pin_note(config, offer_deletion=True)),
+        # The rejection index's sibling row: ✓ when present, else neutral "—", never
+        # ✗ — an absent rejection collection is never a readiness question.
+        (f"rejection index '{config.rejection_collection}'",
+         True if rejection["exists"] else None,
+         _rejection_row_hint(rejection, config, q["reachable"],
+                             graph_unbuilt=graph_unbuilt, pre_v1a=pre_v1a),
+         (f"({rejection['present_items']} item(s) indexed)"
+          if rejection["exists"] else None)),
         # No MCP-wiring row lives here any more. Wiring is a one-time machine-global
         # act since the registry landed, so it is not a per-project readiness rung
         # in either direction — and its replacement is a *finding* that must be
@@ -4084,7 +5087,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         print(f"      ({q['points']} vector(s) indexed)")
     # The three corpus locations that have no check row to hang off, as neutral `•`
     # facts in the idiom the report already speaks (`• graph holds …`, `• {n}
-    # graveyard point(s)`) — a resolved path passes and fails nothing, so it is not
+    # point(s) belong to retired nodes`) — a resolved path passes and fails nothing, so it is not
     # a rung in any glyph and never joins `checks`. Unconditional by design: the two
     # sessions that grepped `.mitos/decisions.md` and got confident zero-hit answers
     # were working in HEALTHY workspaces where every row read ✓, so a path shown
@@ -4111,12 +5114,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     #
     # The heal is `mitos rebuild` — the corpus is buffer plus archives, and `mitos
     # sync` reads the buffer alone, so over a drained buffer it builds nothing — and
-    # EMPHATICALLY not `mitos reconcile`: reconcile
-    # diffs an empty active set against an absent collection, finds nothing to
-    # enqueue, and reports success on a workspace it did not touch — converting a
-    # recoverable state into one the operator believes they already fixed. That is
-    # one word away from being the wrong answer, which is why a row asserts the
-    # word's absence from this rung.
+    # EMPHATICALLY not `mitos reconcile`: over an unbuilt graph reconcile judges no
+    # point, deletes nothing, refuses naming `rebuild` and exits 1, so naming it here
+    # would send the operator through a refusal to reach the heal this rung can name
+    # directly. A row asserts the word's absence from this rung.
     if graph_unbuilt:
         print(
             "\n  ⚠ the graph is unbuilt — the markdown corpus (decisions.md and "
@@ -4133,8 +5134,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     #   • missing_active_slugs non-empty → the warned state: active nodes with no
     #     vector, invisible to semantic surface/query (names slugs at small N).
     #   • empty → verified complete; stay quiet.
-    # Orphan (graveyard) points are reported neutrally, never as a warning — they
-    # are the blackout vector's substrate (graveyard-vectors-now-consumed-by-blackout).
+    # Retired nodes' points are reported neutrally, never as a warning — they are
+    # history, the blackout vector's substrate (graveyard-vectors-now-consumed-by-
+    # blackout). Node-less points get an informational rung naming `reconcile`, the
+    # collector; neither feeds `ready`, the verdict or the exit code.
     # Each branch is self-guarding on the diff outcome above — no collection_exists
     # gate here, so a full collection wipe with a populated graph (which sets
     # missing_active_slugs to the whole active set) warns just like a points wipe.
@@ -4164,12 +5167,45 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         if n <= 5:
             for slug in missing_active_slugs:
                 print(f"      • {slug}")
-    if orphan_points:
+    if not scroll_failed and missing_retired_slugs:
+        n = len(missing_retired_slugs)
         print(
-            f"  • {orphan_points} graveyard point(s) belong to inactive/removed "
-            f"nodes — retained (they power all-superseded blackout recovery), "
-            f"not an error."
+            f"\n  ⚠ {n} retired decision(s) have no vector, so semantic surface/query "
+            f"cannot name them among retired matches. Run "
+            f"`mitos reconcile {shell_flag('-p', config.project)}` to embed only the "
+            f"missing ones — it needs the embedding provider to answer, which this "
+            f"report does not check. Informational, not a readiness blocker."
         )
+        if embedding_seed:
+            print(
+                f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
+                f"at {embedding_seed['established_at']} — `mitos sync {shell_flag('-p', config.project)}` "
+                f"completes it once the embedding provider answers"
+            )
+        if n <= 5:
+            for slug in missing_retired_slugs:
+                print(f"      • {slug}")
+    if retired_node_points:
+        print(
+            f"  • {retired_node_points} point(s) belong to retired nodes — history, "
+            f"kept: retired matches and the all-superseded blackout read them; not an "
+            f"error."
+        )
+    if nodeless_points:
+        print(
+            f"\n  ⚠ {nodeless_points} point(s) belong to no node in the graph — left by "
+            f"a rebuild that did not reconstruct their nodes; they take ranked-read "
+            f"slots and resolve to nothing. Run "
+            f"`mitos reconcile {shell_flag('-p', config.project)}` to delete them. "
+            f"Informational, not a readiness blocker."
+        )
+    if orphan_points and nodeless_points is None:
+        # Points listed over a graph holding no nodes: every one would look node-less,
+        # so none is judged. No heal is named here — the unbuilt rung names `rebuild`
+        # when the corpus holds entries.
+        print(f"  • {orphan_points} point(s) not judged — the graph holds no nodes.")
+    for line in _rejection_index_rungs(rejection, config):
+        print(line)
     if overflows:
         _print_overflow_detail(overflows, verbose=verbose, project=config.project)
     if divergence_report is not None:
@@ -5147,11 +6183,11 @@ def cmd_cutover(
     print("  1. Wipe the stale Qdrant collection (its vectors are keyed on the old")
     print("     prototype ids — it auto-recreates on the next sync):")
     print(f"       {qdrant_wipe_cmd}")
-    print("  2. Re-embed the V1a active set:  mitos sync   (or: mitos sync --embed-only)")
+    print("  2. Embed every decision:  mitos sync   (or: mitos sync --embed-only)")
     print("     Semantic surface/query stay degraded until the queue drains;")
     print("     graph-only `mitos list` works throughout.")
     print("     (If you ever wipe Qdrant later with the outbox already empty,")
-    print("      `mitos reconcile` re-embeds the active set in one pass.)")
+    print("      `mitos reconcile` embeds every missing decision in one pass.)")
     print("  3. If `mitos serve` was running, restart it.")
     print("  4. Verify:  mitos status   → expect READY ✓")
     if bak_path:
@@ -6023,6 +7059,9 @@ def _check_json_object(
         "summary_row_written": row_written,
         # Always present: null unless this unscoped run's entry write failed.
         "attempt_unrecorded": attempt_unrecorded,
+        # Always present: healthy sweeps whose gather was cut above the floor. The
+        # raw bound's alarm — never a degradation, never persisted.
+        "gathers_cut": result.gathers_cut,
     })
     return obj
 
@@ -6036,7 +7075,7 @@ def _print_check_finding_side(node: Dict[str, Any]) -> None:
     print(f"      Scope:    {scope_text}")
     rejected = node.get("rejected_paths")
     if rejected:
-        print(f"      Rejected: {rejected}")
+        print(render_rejected_paths(rejected, "      Rejected: "))
     for key in _CHECK_MODIFIER_STAMP_KEYS:
         if key in node:
             print(f"      ({key.replace('_', ' ')}: {', '.join(node[key])})")
@@ -6193,6 +7232,9 @@ def _print_check_report(
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
               f"may be thinned. Run `mitos sync {shell_flag('-p', project)}` to catch up.")
 
+    if result.gathers_cut:
+        print(f"\n{_gathers_cut_line(result.gathers_cut, 'decision')}")
+
     if not result.findings and not degradations:
         if scope is not None and result.nodes_total == 0:
             print(f"0 of {denominator} live decisions match scope '{scope}' — "
@@ -6205,6 +7247,20 @@ def _print_check_report(
                   f"no contradictions found.")
     if not degradations and result.nodes_total:
         print(_check_cost_line(result))
+
+
+def _gathers_cut_line(count: int, noun: str) -> str:
+    """One report line counting gathers the raw bound cut above the floor.
+
+    Shared by the corpus and ``--staged`` reports. It states the bound's alarm and
+    names no recovery: a cut degrades nothing, and the remedy is mitos's, not the
+    reader's.
+    """
+    plural = noun if count == 1 else f"{noun}s"
+    return (f"Neighbour search was cut short for {count} {plural}: it read its whole "
+            f"bound and held fewer than {CONFLICT_OVERFETCH_LIMIT} live decisions while "
+            "its last point still scored at or above the floor, so a conflicting "
+            "decision may lie past what it read.")
 
 
 def _check_cost_line(result: "check.CheckRunResult") -> str:
@@ -7116,7 +8172,7 @@ def _print_staged_finding(entry: ParsedEntry, finding: "Any") -> None:
     scope_text = ", ".join(entry.scope) if entry.scope else "(global — no scope declared)"
     print(f"      Scope:    {scope_text}")
     if entry.rejected_paths:
-        print(f"      Rejected: {entry.rejected_paths}")
+        print(render_rejected_paths(entry.rejected_paths, "      Rejected: "))
     payload = finding.payload
     print(f"  conflicts with active decision '{payload['slug']}'   "
           f"(similarity {payload['score']:.2f}):")
@@ -7125,7 +8181,7 @@ def _print_staged_finding(entry: ParsedEntry, finding: "Any") -> None:
     p_scope_text = ", ".join(p_scope) if p_scope else "(global — no scope declared)"
     print(f"      Scope:    {p_scope_text}")
     if "rejected_paths" in payload:
-        print(f"      Rejected: {payload['rejected_paths']}")
+        print(render_rejected_paths(payload["rejected_paths"], "      Rejected: "))
     for key in _CHECK_MODIFIER_STAMP_KEYS:
         if key in payload:
             print(f"      ({key.replace('_', ' ')}: {', '.join(payload[key])})")
@@ -7141,6 +8197,7 @@ def _print_staged_report(
     degraded: "Set[str]",
     exclusions: List[Dict[str, Any]],
     transient_count: int,
+    gathers_cut: int,
 ) -> None:
     """Renders the human gate report to stdout — calm, both sides named (P9)."""
     if findings:
@@ -7172,6 +8229,9 @@ def _print_staged_report(
     if transient_count:
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
               f"may be thinned. Run `mitos sync` to catch up.")
+
+    if gathers_cut:
+        print(f"\n{_gathers_cut_line(gathers_cut, 'pending decision')}")
 
     if not findings and not degraded:
         noun = "decision" if nodes_swept == 1 else "decisions"
@@ -7228,6 +8288,7 @@ def _run_staged_check(
                     exit_code=0, nodes_total=0, nodes_swept=0, batches_executed=0,
                     pairs_judged_fresh=0, finding_objs=[], degradations=[],
                     exclusions=[], transient_count=0, row_written=False,
+                    gathers_cut=0,
                 ), **corpus_provenance(config)})
             else:
                 # THE OBLIGATION CARVE-OUT (§4.7): the echo rides output the surface
@@ -7302,6 +8363,9 @@ def _run_staged_check(
         nodes_swept = 0
         pairs_judged_fresh = 0
         batches_executed = 0
+        # Healthy checks whose gather was cut above the floor: counted on the report,
+        # never a degradation token and never an exit-code input.
+        gathers_cut = 0
         for entry in pending:
             result = run_conflict_check(
                 entry, embed_provider=embed, vector_store=vector, store=store, judge=judge
@@ -7325,6 +8389,8 @@ def _run_staged_check(
                         degraded.add("judgment_truncated")
                 break
             nodes_swept += 1
+            if result.gather_cut:
+                gathers_cut += 1
             pairs_judged_fresh += len(result.judged_pairs)
             if result.execution is not None:
                 batches_executed += 1
@@ -7404,12 +8470,14 @@ def _run_staged_check(
             finding_objs=[_staged_finding_json(e, h, f, p) for e, h, f, p in findings],
             degradations=sorted(degraded), exclusions=exclusions,
             transient_count=transient_count, row_written=row_written,
+            gathers_cut=gathers_cut,
         ), **corpus_provenance(config)})
     else:
         _echo_corpus(config)
         _print_staged_report(
             findings, nodes_swept=nodes_swept, nodes_total=len(pending),
             degraded=degraded, exclusions=exclusions, transient_count=transient_count,
+            gathers_cut=gathers_cut,
         )
     return exit_code
 
@@ -7429,6 +8497,7 @@ def _staged_json_object(
     exclusions: List[Dict[str, Any]],
     transient_count: int,
     row_written: bool,
+    gathers_cut: int,
 ) -> Dict[str, Any]:
     """Assembles the single §8 staged ``--json`` object (a shipped API — additive only).
 
@@ -7438,7 +8507,8 @@ def _staged_json_object(
     ``exit_code == 1 ⟺ findings_new > 0`` holds on staged exactly as on corpus. The
     ``batches_*`` accounting reads: planned = one potential batch per pending entry;
     executed = entries that fired the judge; skipped = clean-empty or breaker-skipped
-    (so ``planned == executed + skipped`` holds).
+    (so ``planned == executed + skipped`` holds). ``gathers_cut`` (always present) counts
+    the pending entries whose healthy check's gather was cut above the floor.
     """
     return {
         "run_id": run_id,
@@ -7461,6 +8531,7 @@ def _staged_json_object(
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
         "summary_row_written": row_written,
+        "gathers_cut": gathers_cut,
     }
 
 
@@ -7964,6 +9035,15 @@ _BRIEF_HELP = ("An existence screen: axiom-only hits (no rejected_paths) to scan
                "read the ones that matter whole with `show`.")
 _FULL_TOP_HELP = ("Keep rejected_paths on the top N ranks only; lower ranks are axiom-only "
                   "(default: all).")
+# The ranked verbs' --help says no more about a band than its notes do (6c); the
+# weak sentence is the composer's own constant, interpolated at each epilog.
+_RANKED_HELP_DESCRIPTION = (
+    "Phrase the query by the mechanism and subject, not by the conclusion you are about "
+    "to reach: phrasing moves the score. --json carries `confidence`, which rates this "
+    "ranking, `band_evidence` (top_score, top_cluster, edge, next_score) and a note "
+    "describing the ranking's shape.")
+_RANKED_HELP_ABSENCE = ("A ranking cannot show that nothing covers this claim; the exhaustive "
+                        "read can: mitos list -p <project> --scope <scope>")
 
 
 def _non_negative_int(value: str) -> int:
@@ -8167,7 +9247,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # sync
     sync_p = subparsers.add_parser("sync", help="Sync buffer decisions to graph database.")
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
-    sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
+    sync_p.add_argument("--embed-only", action="store_true", help="Drain the embedding queues only (the decision outbox, then the rejection backlog); run no sync.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
     sync_p.add_argument(
         "--full", action="store_true",
@@ -8194,7 +9274,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # reconcile
     rec_p = subparsers.add_parser(
         "reconcile",
-        help="Re-embed active nodes missing from Qdrant (heal a direct vector wipe).",
+        help="Embed every decision (live or retired) and active open question missing "
+             "from Qdrant (heal a direct vector wipe), and delete points whose node has "
+             "left the graph. Also builds the rejection index and deletes rejected items "
+             "no decision states.",
     )
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
@@ -8204,7 +9287,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # query (alias: query_decisions — MCP tool name)
     q_p = subparsers.add_parser("query", aliases=["query_decisions"],
-                                help="Targeted lookup by slug or pointed claim (its confidence rates the ranking, not the corpus).")
+                                help="Targeted lookup of a pointed claim; `--field rejected_paths` ranks rejected options alone (its confidence rates the ranking, not the corpus).",
+                                description=_RANKED_HELP_DESCRIPTION,
+                                epilog=(f"Under weak, {WEAK_MEANING}. {_RANKED_HELP_ABSENCE}, "
+                                        "with --oneline for one line per decision. After "
+                                        "--field rejected_paths, that ranking cannot show that "
+                                        "no rejected option covers this claim; read the same "
+                                        "scope without --oneline or --brief, which keeps each "
+                                        "decision's rejected_paths."))
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -8214,11 +9304,17 @@ def _build_parser() -> argparse.ArgumentParser:
     q_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
                          dest="full_top", help=_FULL_TOP_HELP)
     q_p.add_argument("--limit", type=int, default=None,
-                     help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
+                     help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial; a degraded text match takes the same count.")
+    q_p.add_argument("--field", choices=list(LOOKUP_FIELDS), default=None,
+                     help="Search one stored field alone: `rejected_paths` asks whether an option was already rejected, and by what. --limit then counts rejected options and --full-top their decisions.")
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
-                                   help="Surface active decisions relevant to a query (precedent check before deciding — its confidence rates whether precedent exists).")
+                                   help="Surface active decisions relevant to a claim (the precedent check before deciding; its confidence rates this ranking, and `list --scope` is what shows an absence).",
+                                   description=_RANKED_HELP_DESCRIPTION,
+                                   epilog=(f"Under weak, {WEAK_MEANING}: read the hits. "
+                                           f"{_RANKED_HELP_ABSENCE}, or the same with "
+                                           "--oneline for one line per decision."))
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -8227,7 +9323,7 @@ def _build_parser() -> argparse.ArgumentParser:
     surf_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
                             dest="full_top", help=_FULL_TOP_HELP)
     surf_p.add_argument("--limit", type=int, default=None,
-                        help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
+                        help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial; a degraded text match takes the same count.")
 
     # show
     show_p = subparsers.add_parser("show", help="Display details of a specific node. A missing handle exits 1 (text on stderr; --json still emits {found: false}).")
@@ -8765,7 +9861,7 @@ def main() -> None:
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):
-            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
+            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top, field=args.field)
         elif args.command in ("surface", "surface_decisions"):
             cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
         elif args.command == "show":

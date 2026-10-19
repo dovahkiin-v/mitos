@@ -480,6 +480,40 @@ def default_collection_name(workspace_dir: str) -> str:
     return f"mitos-{safe}-{digest}" if safe else f"mitos-{digest}"
 
 
+# The rejection index's collection is named after the decision collection it sits
+# beside. See ``rejection_collection_name`` for why the suffix is a contract.
+REJECTION_COLLECTION_SUFFIX: str = "-rejections"
+
+
+def rejection_collection_name(decision_collection: str) -> str:
+    """Derives the rejection index's sibling collection name from the decision one.
+
+    The rejection index holds one point per rejected item in a collection of its
+    own, beside the workspace's decision collection. Its name is the decision
+    collection's name plus ``REJECTION_COLLECTION_SUFFIX``. Pure and total.
+
+    The derivation is **contract** and cannot change after release, for the reason
+    ``default_collection_name`` gives: the name is the address of live data, so a
+    changed suffix strands every rejection index in the wild (P1, interoperability
+    across time). Two properties follow from its shape:
+
+    1. **The decision name is the prefix.** Anything that selects collections by a
+       prefix of the decision name selects the sibling too — the test suite's sweep
+       of leaked ``mitos-tmp*`` collections among them.
+    2. **No sibling can equal any workspace's decision name.** A derived decision
+       name always ends in a ``-`` segment of 8 hex characters (step 3 of
+       ``default_collection_name``), and ``rejections`` holds non-hex letters.
+
+    Args:
+        decision_collection: The workspace's decision collection name
+            (``MitosConfig.qdrant_collection``).
+
+    Returns:
+        The sibling rejection collection's name.
+    """
+    return decision_collection + REJECTION_COLLECTION_SUFFIX
+
+
 class MitosConfig:
     """Represents the configuration state for the active Mitos workspace."""
 
@@ -573,6 +607,9 @@ class MitosConfig:
         # original's vectors. Re-derived on every construction and NEVER persisted;
         # a `qdrant_collection` line in the file cannot override it (it is retired).
         self.qdrant_collection = default_collection_name(self.workspace_dir)
+        # Derived from the decision name, never persisted and never overridable by a
+        # file key, like ``qdrant_collection`` itself.
+        self.rejection_collection = rejection_collection_name(self.qdrant_collection)
 
         # Retired file keys the workspace's config.toml actually carries:
         # {key: the value found in the file}. Populated by `_load_config_file`,

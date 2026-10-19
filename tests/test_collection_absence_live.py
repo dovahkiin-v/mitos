@@ -21,11 +21,16 @@ And the write half (1c), which is where absence becomes *durable*:
 * a **non-covering** write does not, and N consecutive records leave the listing
   byte-identical with N rows queued;
 * ``rebuild`` → ``sync`` (and its ``--embed-only`` twin) creates the collection holding
-  the full active set, which is what makes ``rebuild``'s own printed next step true;
-* ``rebuild`` → ``record`` with no sync creates nothing — the marker has exactly one
-  consumer;
+  the full expected set (here, the active set: no decision is retired), which is what
+  makes ``rebuild``'s own printed next step true;
+* ``rebuild`` → ``record`` with no sync creates nothing — exactly one consumer acts on
+  the marker;
 * ``import`` into a populated graph creates nothing and leaves every row queued;
-* ``reconcile`` heals the whole surface in one pass.
+* ``reconcile`` heals the whole surface in one pass;
+* a seeded drain skips points the collection already holds (phase 3a of the
+  recall-confidence vision);
+* over a collection holding the active points only, ``status`` names the retired
+  decisions missing, ``reconcile`` embeds exactly those, and ``status`` clears (3b).
 
 Discipline: every collection name here carries the ``mitos-tmp`` prefix so
 ``conftest``'s ``sweep_leaked_qdrant_collections`` can reclaim it, and each row
@@ -165,7 +170,7 @@ def test_a_covering_write_still_creates_the_absent_collection(
 
     1b moved *where* creation happens; 1c narrows *which writes* may do it. This is the
     surviving half of the row 1b left for this phase to argue with: a write that declares
-    it covers the active set creates and lands, unchanged.
+    it covers the decision index's expected set creates and lands, unchanged.
     """
     assert absent_collection not in _listing()
 
@@ -310,7 +315,7 @@ def test_a_fresh_projects_first_record_does_create_live(
 ) -> None:
     """Success criterion 2 against a real instance: the carve-out is not theoretical.
 
-    An empty graph's first record IS the whole active set, so there is no partial index to
+    An empty graph's first record IS the whole expected set, so there is no partial index to
     fear and nothing for absence to protect. The row matters because the narrowing is easy
     to over-apply: a gate that also refused here would leave every genuinely new project
     with no index until someone ran ``reconcile``, for no benefit at all.
@@ -356,7 +361,8 @@ def test_rebuild_then_sync_creates_the_collection_with_the_full_active_set(
     """Success criteria 3 and 4: the printed next-step is true, on both drain entry points.
 
     ``rebuild`` and ``cutover`` issue no upsert of their own — they bound the outbox to
-    exactly the active set — so the covering write is the **next** command's drain. That
+    exactly the decision index's expected set — so the covering write is the **next**
+    command's drain. That
     is what ``mitos rebuild`` already promises in print (*"Re-embed so semantic
     surface/query reflect the rebuild: mitos sync"*), and a rule that could only read
     intent from the running call site would make that shipped line false.
@@ -387,11 +393,11 @@ def test_rebuild_then_sync_creates_the_collection_with_the_full_active_set(
 
     _rebuild_and_swap(config)
 
-    # The rebuild left the outbox bounded to the active set and said so, and it created
+    # The rebuild left the outbox bounded to the expected set and said so, and it created
     # nothing on the instance.
     post_rebuild = GraphStore(config.db_path)
-    active_ids = post_rebuild.get_active_node_ids()
-    assert len(active_ids) == 2
+    expected_ids = post_rebuild.get_decision_index_expected_ids()
+    assert len(expected_ids) == 2
     seed = post_rebuild.embedding_seed()
     assert seed is not None and seed["established_by"] == "rebuild"
     assert absent_collection not in _listing()
@@ -405,7 +411,7 @@ def test_rebuild_then_sync_creates_the_collection_with_the_full_active_set(
 
     assert absent_collection in _listing()
     assert manager.vector_store.list_point_ids() == {
-        hash_to_uuid(nid) for nid in active_ids
+        hash_to_uuid(nid) for nid in expected_ids
     }
     # Coverage delivered: the outbox is empty and the claim is spent.
     assert manager.store.get_pending_embeddings() == []
@@ -415,7 +421,7 @@ def test_rebuild_then_sync_creates_the_collection_with_the_full_active_set(
 def test_rebuild_then_record_with_no_sync_creates_nothing(
     absent_collection: str, tmp_path
 ) -> None:
-    """Gotcha 1: the marker has exactly ONE consumer, and this is the row that proves it.
+    """Gotcha 1: exactly ONE consumer acts on the marker, and this is the row that proves it.
 
     If a ``record`` consulted the marker after a ``rebuild``, the first record into a
     swept project would mint a one-point collection — the precise hazard this phase exists
@@ -493,8 +499,8 @@ def test_reconcile_heals_an_absent_collection_end_to_end(
     """T5 against a real instance: the heal creates the collection and repopulates it.
 
     The whole chain in one row — the pre-write diff reads the absent collection as
-    empty, every active node is enqueued, the drain's first upsert creates, and the
-    active set lands. Before 1b the diff's 404 raised and ``mitos reconcile``
+    empty, every expected node is enqueued, the drain's first upsert creates, and the
+    expected set lands. Before 1b the diff's 404 raised and ``mitos reconcile``
     reported "Qdrant or embedding provider down" over a healthy Qdrant, so the heal
     this vision prescribes failed on the exact state the collection migration
     creates.
@@ -530,10 +536,210 @@ def test_reconcile_heals_an_absent_collection_end_to_end(
 
     result = manager.reconcile_embeddings()
 
-    assert result == {"active": 3, "present": 0, "enqueued": 3}
+    shipped = ("active", "present", "enqueued")
+    assert {k: result[k] for k in shipped} == {"active": 3, "present": 0, "enqueued": 3}
+    assert (result["written"], result["left_queued"], result["drain_stop"]) == (3, 0, None)
     assert absent_collection in _listing()
     assert manager.vector_store.list_point_ids() == {
         hash_to_uuid(nid) for nid in node_ids
     }
     # Idempotent: the second pass finds everything present and enqueues nothing.
-    assert manager.reconcile_embeddings() == {"active": 3, "present": 3, "enqueued": 0}
+    again = manager.reconcile_embeddings()
+    assert {k: again[k] for k in shipped} == {"active": 3, "present": 3, "enqueued": 0}
+
+
+def test_a_seeded_drain_skips_points_the_collection_already_holds(
+    absent_collection: str, tmp_path
+) -> None:
+    """Phase 3a of the recall-confidence vision: presence-skip against a real collection.
+
+    Three of four queued nodes already have their points (content-derived ids, so
+    presence is the right vector). Under a stamped marker the drain lists once, removes
+    those three rows without embedding them, embeds the fourth, and spends the marker.
+    """
+    from mitos.vector_store import hash_to_uuid
+
+    config, node_ids = _live_workspace(
+        tmp_path, absent_collection,
+        ("seed-skip-a", "Seed skip axiom a."), ("seed-skip-b", "Seed skip axiom b."),
+        ("seed-skip-c", "Seed skip axiom c."), ("seed-skip-d", "Seed skip axiom d."),
+    )
+    writer = QdrantVectorStore(QDRANT_URL, absent_collection)
+    for node_id in node_ids[:3]:
+        writer.upsert(node_id, _vector(), {"slug": node_id[:8], "scope": []}, may_create=True)
+
+    manager = _manager_with_faked_embeddings(config, absent_collection)
+    for node_id in node_ids:
+        manager.store.add_pending_embedding(node_id)
+    manager.store.stamp_embedding_seed("rebuild")
+
+    outcome = manager.drain_pending_embeddings()
+
+    assert manager.embed_provider.get_embedding.call_count == 1
+    assert (outcome.written, outcome.skipped_present, outcome.stop) == (1, 3, None)
+    assert manager.store.get_pending_embeddings() == []
+    assert manager.store.embedding_seed() is None
+    assert manager.vector_store.list_point_ids() == {hash_to_uuid(n) for n in node_ids}
+
+
+def test_status_then_reconcile_then_status_heals_the_graveyard_live(
+    absent_collection: str, tmp_path, monkeypatch, capsys
+) -> None:
+    """Vision §4.5 end to end, on a real instance (phase 3b of the recall-confidence vision).
+
+    A collection written by today's path holds the active points only. ``status --json``
+    reports the retired decisions missing in its sibling keys, one ``reconcile`` (real
+    Qdrant, faked embeddings) embeds exactly those, the points equal the decision index's
+    expected set, and ``status --json`` clears — the heal clears its own warning.
+    """
+    import json
+
+    from mitos import cli
+    from mitos.config import MitosConfig
+    from mitos.vector_store import hash_to_uuid
+
+    config, _ids = _live_workspace(
+        tmp_path, absent_collection,
+        ("graveyard-new-b", "Graveyard axiom B, the successor.\n**Supersedes:** graveyard-old-b"),
+        ("graveyard-old-b", "Graveyard axiom B, retired."),
+        ("graveyard-new-a", "Graveyard axiom A, the successor.\n**Supersedes:** graveyard-old-a"),
+        ("graveyard-old-a", "Graveyard axiom A, retired."),
+        ("graveyard-live", "Graveyard axiom, never retired."),
+    )
+    manager = _manager_with_faked_embeddings(config, absent_collection)
+    store = manager.store
+    active = store.get_active_node_ids()
+    expected = store.get_decision_index_expected_ids()
+    retired = expected - active
+    assert (len(active), len(retired)) == (3, 2)
+
+    # Today's path: the collection holds the active points only.
+    writer = QdrantVectorStore(QDRANT_URL, absent_collection)
+    for node_id in active:
+        writer.upsert(node_id, _vector(), {"slug": node_id[:8], "scope": []}, may_create=True)
+
+    # `status` builds its own config from the path; point it at this row's collection.
+    real_config = MitosConfig
+
+    def _config(*args: Any, **kwargs: Any) -> MitosConfig:
+        built = real_config(*args, **kwargs)
+        built.qdrant_url = QDRANT_URL
+        built.qdrant_collection = absent_collection
+        return built
+
+    monkeypatch.setattr(cli, "MitosConfig", _config)
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+
+    def _checks() -> dict:
+        capsys.readouterr()
+        cli.cmd_status(config.workspace_dir, as_json=True)
+        return json.loads(capsys.readouterr().out)["checks"]
+
+    before = _checks()
+    assert before["missing_active_vectors"] == 0
+    assert before["retired_decisions"] == 2
+    assert before["missing_retired_vectors"] == 2
+    assert before["missing_retired_slugs"] == ["graveyard-old-a", "graveyard-old-b"]
+
+    result = manager.reconcile_embeddings()
+
+    assert manager.embed_provider.get_embedding.call_count == len(retired)
+    assert (result["enqueued"], result["written"], result["left_queued"]) == (2, 2, 0)
+    assert manager.vector_store.list_point_ids() == {hash_to_uuid(n) for n in expected}
+
+    after = _checks()
+    assert after["missing_retired_vectors"] == 0
+    assert after["missing_retired_slugs"] == []
+    assert after["missing_active_vectors"] == 0
+
+
+def test_reconcile_collects_a_nodeless_point_and_status_clears_live(
+    absent_collection: str, tmp_path, monkeypatch, capsys
+) -> None:
+    """L1 (phase 3c of the recall-confidence vision): the death story on a real instance.
+
+    Two active decisions and a superseded one, all embedded, plus one point written by
+    hand whose node is not in the graph. ``status --json`` partitions the orphan count
+    (one history, one garbage), ``reconcile --json`` deletes exactly the node-less one by
+    its listed id, the next listing holds every other point, and ``status`` clears.
+    """
+    import json
+    from unittest.mock import patch
+
+    from mitos import cli
+    from mitos.config import MitosConfig
+    from mitos.vector_store import hash_to_uuid
+
+    config, _ids = _live_workspace(
+        tmp_path, absent_collection,
+        ("orphan-new", "Orphan axiom, the successor.\n**Supersedes:** orphan-old"),
+        ("orphan-old", "Orphan axiom, retired."),
+        ("orphan-live", "Orphan axiom, never retired."),
+    )
+    manager = _manager_with_faked_embeddings(config, absent_collection)
+    expected = manager.store.get_decision_index_expected_ids()
+    writer = QdrantVectorStore(QDRANT_URL, absent_collection)
+    for node_id in expected:
+        writer.upsert(node_id, _vector(), {"slug": node_id[:8], "scope": []}, may_create=True)
+    nodeless_node = uuid.uuid4().hex * 2  # a sha-shaped id no node carries
+    writer.upsert(nodeless_node, [0.0] * EMBEDDING_DIM, {"slug": "gone"}, may_create=False)
+    kept = {hash_to_uuid(n) for n in expected}
+    assert writer.list_point_ids() == kept | {hash_to_uuid(nodeless_node)}
+
+    real_config = MitosConfig
+
+    def _config(*args: Any, **kwargs: Any) -> MitosConfig:
+        built = real_config(*args, **kwargs)
+        built.qdrant_url = QDRANT_URL
+        built.qdrant_collection = absent_collection
+        return built
+
+    monkeypatch.setattr(cli, "MitosConfig", _config)
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+
+    def _checks() -> dict:
+        capsys.readouterr()
+        cli.cmd_status(config.workspace_dir, as_json=True)
+        return json.loads(capsys.readouterr().out)["checks"]
+
+    before = _checks()
+    assert (before["retired_node_points"], before["nodeless_points"]) == (1, 1)
+    assert before["orphan_points"] == 2
+
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", return_value=manager):
+        assert cli.cmd_reconcile(config, as_json=True) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert (result["deleted"], result["delete_failed"]) == (1, 0)
+    assert result["enqueued"] == 0
+
+    assert writer.list_point_ids() == kept
+
+    after = _checks()
+    assert (after["retired_node_points"], after["nodeless_points"]) == (1, 0)
+
+
+def test_delete_points_against_a_real_instance(absent_collection: str) -> None:
+    """L2: the client's contract measured, not assumed (G1 — Qdrant 1.16.3).
+
+    A listed id is gone from the next scroll; an id never written is confirmed all the
+    same (``completed`` says "gone", never "existed"); an absent collection raises the
+    typed error and is not created.
+    """
+    from mitos.vector_store import hash_to_uuid
+
+    store = QdrantVectorStore(QDRANT_URL, absent_collection)
+    with pytest.raises(CollectionMissingError):
+        store.delete_points([hash_to_uuid("a" * 64)])
+    assert absent_collection not in _listing()
+
+    for node_id in ("a" * 64, "b" * 64):
+        store.upsert(node_id, _vector(), {"slug": node_id[:4]}, may_create=True)
+    listed = store.list_point_ids()
+    assert listed == {hash_to_uuid("a" * 64), hash_to_uuid("b" * 64)}
+
+    store.delete_points([hash_to_uuid("a" * 64)])
+    assert store.list_point_ids() == {hash_to_uuid("b" * 64)}
+
+    store.delete_points([hash_to_uuid("c" * 64)])  # never written: confirmed anyway
+    assert store.list_point_ids() == {hash_to_uuid("b" * 64)}

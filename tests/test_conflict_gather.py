@@ -1,19 +1,22 @@
 """Tests for the Conflict sensor's candidate-gathering stage (Phase 2a, §6.5 S1–S3).
 
 ``gather_candidates`` is the first pipeline stage: embed a proposed axiom in *document*
-space → one bounded scope-blind over-fetch → per-match computed-state re-verify (keep
-``active ∪ drifted``) → return every live over-fetched neighbour *un-filtered,
-un-ranked, un-truncated* (S4–S6 is 2b), OR a typed ``Unavailable`` when the semantic
-substrate fails. The load-bearing property under test: the **three terminal states**
-(``Unavailable`` / ``[]`` / ``[Candidate…]``) never blur into each other.
+space → one scope-blind over-fetch at ``CONFLICT_RAW_BOUND`` → resolve every hit by
+point id and fill ``CONFLICT_OVERFETCH_LIMIT`` live decisions (``active ∪ drifted``,
+the resolver's computed state) through the shared identity walk (recall-confidence
+2d) → return them *un-filtered, un-ranked, un-truncated* (S4–S6 is 2b) in a
+``Gathering``, OR a typed ``Unavailable`` when the semantic substrate fails. The
+load-bearing property under test: the **three terminal states** (``Unavailable`` /
+an empty ``live`` / live candidates) never blur into each other.
 
 Discipline (PATTERNS + scout brief): synchronous hand-rolled fakes (NOT
 ``unittest.mock``); a real temp ``GraphStore`` seeded via ``commit_parsed_entry`` (never
 embeds → keyless + deterministic) for the graph reads; env stripped of keys so nothing
 reaches a live service. ``drifted`` is not constructible on the real v0.1 store (the
-channel is reserved) → its "kept as live" case uses a stub store.
+channel is reserved) → its "kept as live" case uses a stub resolver.
 """
 
+import hashlib
 import shutil
 import tempfile
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -24,6 +27,7 @@ from mitos import conflict
 from mitos.conflict import (
     Candidate,
     ConflictUnavailableReason,
+    Gathering,
     JUDGMENT_REASONS,
     SEMANTIC_SUBSTRATE_REASONS,
     Unavailable,
@@ -35,7 +39,11 @@ from mitos.errors import (CollectionMissingError, DatabaseError, EmbeddingError,
                           VectorStoreError)
 from mitos.identity import canonical_core_string_norm, embedding_text
 from mitos.parser import ParsedEntry
+from mitos.retrieval_walk import EXHAUSTED, PointResolution
 from mitos.store import GraphStore
+from mitos.vector_store import hash_to_uuid
+
+from _point_hits import CannedVector, orphan_hit, orphan_point_id, point_hit
 
 
 # --------------------------------------------------------------------------- #
@@ -122,73 +130,108 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    """Returns canned matches (or raises); records the over-fetch limit + call count."""
+class _FakeVector(CannedVector):
+    """Returns canned matches (or raises); records the over-fetch limit + call count.
+
+    Routes through the shared canned-hit leaf, so every hit carries its node's
+    ``point_id`` and ``limit`` is honoured as production honours it.
+    """
 
     def __init__(
         self,
         matches: Optional[List[Dict[str, Any]]] = None,
         raises: Optional[BaseException] = None,
     ) -> None:
-        self._matches = matches if matches is not None else []
+        super().__init__(matches)
         self._raises = raises
-        self.last_limit: Optional[int] = None
-        self.call_count = 0
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        self.call_count += 1
-        self.last_limit = limit
+    @property
+    def call_count(self) -> int:
+        return self.queries
+
+    def canned_for(self, vector: List[float]) -> Optional[List[Dict[str, Any]]]:
         if self._raises is not None:
             raise self._raises
-        return list(self._matches)
+        return self._matches
 
     def upsert(self, *a: Any, **k: Any) -> None:  # pragma: no cover - never hit in 2a
         pass
 
 
+def _stub_id(slug: str) -> str:
+    """The stub resolver's node id for ``slug``: derived, never hardcoded."""
+    return hashlib.sha256(slug.encode("utf-8")).hexdigest()
+
+
+def _stub_hit(slug: str, score: float) -> Dict[str, Any]:
+    """A raw production-shaped hit for a ``_StubStore`` row (it holds no graph to bind)."""
+    return point_hit(_stub_id(slug), score, slug=slug)
+
+
 class _SpyStore:
-    """Wraps a real store, counting the S3 reads so a test can prove the None short-circuit."""
+    """Wraps a real store, recording every read the gather makes of it.
+
+    Since 2d the gather reads a store through two batched calls (the resolver and
+    the stamp map); a per-hit slug or state read would show up here, so a row can
+    prove the gather makes none.
+    """
 
     def __init__(self, inner: GraphStore) -> None:
         self._inner = inner
-        self.slug_calls: List[str] = []
-        self.state_calls: List[str] = []
+        self.calls: List[str] = []
+
+    def resolve_point_ids(self, point_ids: List[str]) -> PointResolution:
+        self.calls.append("resolve_point_ids")
+        return self._inner.resolve_point_ids(point_ids)
+
+    def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Any]:
+        self.calls.append("get_modifiers_map")
+        return self._inner.get_modifiers_map(node_ids)
 
     def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        self.slug_calls.append(slug)
+        self.calls.append("get_node_by_slug")
         return self._inner.get_node_by_slug(slug)
 
     def get_node_state(self, node_id: str) -> str:
-        self.state_calls.append(node_id)
+        self.calls.append("get_node_state")
         return self._inner.get_node_state(node_id)
 
 
 class _StubStore:
-    """A fully hand-rolled store: ``get_node_by_slug`` resolves, ``get_node_state`` is scripted.
+    """A hand-rolled store whose resolver reports a scripted computed state.
 
-    Lets a test force ``get_node_by_slug`` (active-scoped) and ``get_node_state`` (M3
-    computed) to *disagree* — the race window the real single-process store can't open —
-    to prove 2a treats ``get_node_state`` as the authoritative live filter (D4a), and to
-    inject a store fault that must propagate (D4).
+    Lets a test hand the gather a state the real single-process store cannot produce
+    (``drifted``) or a resolver verdict that must win (``superseded``), and inject a
+    fault into either batched read, which must propagate (D4). It resolves the point
+    ids of the slugs it is built with (``_stub_hit`` authors those ids) and reports
+    every other id as an orphan.
     """
 
-    def __init__(self, state: Optional[str] = None, state_raises: Optional[BaseException] = None) -> None:
+    def __init__(self, *slugs: str, state: str = "active",
+                 resolve_raises: Optional[BaseException] = None,
+                 stamps_raise: Optional[BaseException] = None) -> None:
+        self._ids = {hash_to_uuid(_stub_id(slug)): slug for slug in slugs}
         self._state = state
-        self._state_raises = state_raises
-        self.slug_calls: List[str] = []
-        self.state_calls: List[str] = []
+        self._resolve_raises = resolve_raises
+        self._stamps_raise = stamps_raise
 
-    def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        self.slug_calls.append(slug)
-        # A live-looking hydrated node dict (carries the "id" get_node_state needs).
-        return {"id": f"id-{slug}", "core_axiom": f"axiom for {slug}", "kind": "decision"}
+    def resolve_point_ids(self, point_ids: List[str]) -> PointResolution:
+        if self._resolve_raises is not None:
+            raise self._resolve_raises
+        nodes = {
+            pid: {"id": _stub_id(self._ids[pid]), "slug": self._ids[pid],
+                  "kind": "decision", "core_axiom": f"axiom for {self._ids[pid]}",
+                  "computed_state": self._state}
+            for pid in point_ids if pid in self._ids
+        }
+        return PointResolution(nodes=nodes,
+                               orphans=[pid for pid in point_ids if pid not in nodes],
+                               ambiguous={})
 
-    def get_node_state(self, node_id: str) -> str:
-        self.state_calls.append(node_id)
-        if self._state_raises is not None:
-            raise self._state_raises
-        assert self._state is not None
-        return self._state
+    def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Any]:
+        if self._stamps_raise is not None:
+            raise self._stamps_raise
+        return {}
 
 
 def _gather(axiom: str, embed: Any, vector: Any, store: Any) -> Any:
@@ -206,7 +249,7 @@ def test_happy_path_keeps_every_live_neighbour_and_applies_no_2b_filter(store: G
     """The §8a trace: 2a drops ONLY the non-live row, never 2b's declared/floor drops.
 
     9 over-fetched neighbours; row 4 (``eviction-lru``) is superseded. 2a returns the
-    other 8 in query order — crucially still carrying the declared-target/own-slug rows
+    other 8 live in query order (row 4 rides ``retired``, never ``live``) — crucially still carrying the declared-target/own-slug rows
     (1, 2) and the below-floor rows (8, 9), which are 2b's to drop, not 2a's. (Row 5 is
     ``drifted`` in the vision; the real v0.1 store can't produce drifted, so it is seeded
     active here — its liveness is identical for 2a's purposes; the drifted case is pinned
@@ -237,15 +280,16 @@ def test_happy_path_keeps_every_live_neighbour_and_applies_no_2b_filter(store: G
     )
     result = _gather("Cache aggressively with a v2 policy.", _FakeEmbed(), _FakeVector(matches), store)
 
-    assert isinstance(result, list)
-    assert [c.slug for c in result] == [s for s, _ in live]        # order preserved, row 4 gone
-    assert [c.score for c in result] == [sc for _, sc in live]     # scores carried verbatim
-    assert "eviction-lru" not in {c.slug for c in result}          # the sole non-live drop
+    assert isinstance(result, Gathering)
+    assert [c.slug for c in result.live] == [s for s, _ in live]   # order preserved, row 4 gone
+    assert [c.score for c in result.live] == [sc for _, sc in live]  # scores carried verbatim
+    assert "eviction-lru" not in {c.slug for c in result.live}     # the sole non-live drop
+    assert [h.node["slug"] for h in result.retired] == ["eviction-lru"]  # passed, kept apart
     # Stage-boundary pins: 2a does NOT apply 2b's filters.
-    kept = {c.slug for c in result}
+    kept = {c.slug for c in result.live}
     assert {"cache-policy", "cache-policy-v2"} <= kept             # declared/own-slug NOT dropped
     assert {"db-conn-pooling", "logging-format"} <= kept          # below-floor NOT dropped
-    assert all(isinstance(c, Candidate) for c in result)
+    assert all(isinstance(c, Candidate) for c in result.live)
 
 
 # --------------------------------------------------------------------------- #
@@ -270,37 +314,48 @@ def test_s1_embeds_normalized_document_space_text_not_the_raw_axiom(store: Graph
 # --------------------------------------------------------------------------- #
 
 def test_s2_single_bounded_overfetch_past_top_k(store: GraphStore) -> None:
-    """One query call, ``limit == CONFLICT_OVERFETCH_LIMIT`` (> TOP_K) — never a re-fetch loop."""
+    """One query call at the raw bound, ids only — never a re-fetch loop.
+
+    Since 2d the call's ``limit`` is ``CONFLICT_RAW_BOUND``, and
+    ``CONFLICT_OVERFETCH_LIMIT`` (> TOP_K) is the live count the walk fills from it.
+    """
     vector = _FakeVector([])
-    _gather("Some axiom.", _FakeEmbed(), vector, store)
+    result = _gather("Some axiom.", _FakeEmbed(), vector, store)
 
     assert vector.call_count == 1
-    assert vector.last_limit == conflict.CONFLICT_OVERFETCH_LIMIT
-    assert vector.last_limit > conflict.CONFLICT_TOP_K
+    assert vector.calls == [(conflict.CONFLICT_RAW_BOUND, False)]
+    assert result.bound == conflict.CONFLICT_RAW_BOUND
+    assert conflict.CONFLICT_RAW_BOUND > conflict.CONFLICT_OVERFETCH_LIMIT
+    assert conflict.CONFLICT_OVERFETCH_LIMIT > conflict.CONFLICT_TOP_K
 
 
 # --------------------------------------------------------------------------- #
-# 4. S3 — retired / absent resolve to None (the primary filter); state NOT probed
+# 4. S3 — orphan and retired points drop without any per-hit state probe
 # --------------------------------------------------------------------------- #
 
 def test_s3_absent_and_retired_drop_at_none_without_probing_state(store: GraphStore) -> None:
-    """Both an absent slug and a superseded node drop at ``get_node_by_slug is None``.
+    """An orphan point and a superseded node both drop, and no per-hit read is made.
 
-    And ``get_node_state`` is never called for either — proving the ordering short-circuit
-    (probing an unresolved id would default to ``active`` and mislabel a stale vector live).
+    Rewritten on intent in 2d. The old guard was an ordering short-circuit: probing
+    ``get_node_state`` on an unresolved id defaults to ``active`` and would mislabel a
+    stale vector live. Under the walk that hazard is structural: the resolver names
+    each point's node (or none) in one batched read, the orphan is counted and never
+    probed, the retired node rides ``retired``, and the gather makes no slug or state
+    read at all.
     """
     _seed_decision(store, "eviction-lru", "Evict least-recently-used entries.")
     _supersede(store, "eviction-fifo", "eviction-lru")
     spy = _SpyStore(store)
     matches = [
-        {"slug": "ghost-never-committed", "score": 0.9},  # (a) absent → None
-        {"slug": "eviction-lru", "score": 0.8},           # (b) superseded → None (active-scoped)
+        orphan_hit(0.9, slug="ghost-never-committed"),     # (a) a point naming no node
+        {"slug": "eviction-lru", "score": 0.8},           # (b) superseded
     ]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), spy)
 
-    assert result == []
-    assert spy.slug_calls == ["ghost-never-committed", "eviction-lru"]
-    assert spy.state_calls == []  # never probed — the None short-circuit held
+    assert result.live == []
+    assert [h.node["slug"] for h in result.retired] == ["eviction-lru"]
+    assert spy.calls == ["resolve_point_ids"]  # no stamp read for an empty window either
+    assert "get_node_state" not in spy.calls and "get_node_by_slug" not in spy.calls
 
 
 # --------------------------------------------------------------------------- #
@@ -333,24 +388,30 @@ def test_open_question_match_is_dropped_by_kind_not_crashed_on(store: GraphStore
     ]
     result = _gather("Cache invalidation policy.", _FakeEmbed(), _FakeVector(matches), store)
 
-    assert isinstance(result, list)                          # no crash, no Unavailable
-    assert [c.slug for c in result] == ["cache-policy"]      # OQ screened, decision kept
-    assert all(c.node["kind"] == "decision" for c in result)
+    assert isinstance(result, Gathering)                     # no crash, no Unavailable
+    assert [c.slug for c in result.live] == ["cache-policy"]  # OQ screened, decision kept
+    assert all(c.node["kind"] == "decision" for c in result.live)
+    assert result.retired == []                              # an OQ is not a retired decision
 
 
 # --------------------------------------------------------------------------- #
-# 5. S3 — get_node_state is the authoritative M3 re-verify (the race-guard)
+# 5. S3 — the resolver's computed state is the authoritative M3 verdict
 # --------------------------------------------------------------------------- #
 
 def test_s3_drops_when_state_reverify_says_superseded_even_if_slug_resolved() -> None:
-    """A node that passes the active-view slug read but whose computed state is superseded is dropped."""
-    stub = _StubStore(state="superseded")
-    matches = [{"slug": "raced-out", "score": 0.9}]
+    """A resolver reporting ``superseded`` is retired, never live.
+
+    Rewritten on intent in 2d: the old race guard forced ``get_node_by_slug`` and
+    ``get_node_state`` to disagree. The gather now reads one source, the resolver's
+    ``computed_state`` (``get_node_state``'s semantics), so the row pins that its
+    verdict wins whatever the payload says.
+    """
+    stub = _StubStore("raced-out", state="superseded")
+    matches = [_stub_hit("raced-out", 0.9)]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), stub)
 
-    assert result == []
-    assert stub.slug_calls == ["raced-out"]
-    assert stub.state_calls == ["id-raced-out"]  # the re-verify DID run and did the dropping
+    assert result.live == []
+    assert [h.node["slug"] for h in result.retired] == ["raced-out"]
 
 
 # --------------------------------------------------------------------------- #
@@ -359,13 +420,14 @@ def test_s3_drops_when_state_reverify_says_superseded_even_if_slug_resolved() ->
 
 def test_drifted_is_kept_as_live() -> None:
     """A ``drifted`` computed state counts as live (``active ∪ drifted``) and is kept."""
-    stub = _StubStore(state="drifted")
-    matches = [{"slug": "drifting", "score": 0.7}]
+    stub = _StubStore("drifting", state="drifted")
+    matches = [_stub_hit("drifting", 0.7)]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), stub)
 
-    assert isinstance(result, list) and len(result) == 1
-    assert result[0].slug == "drifting"
-    assert result[0].state == "drifted"
+    assert isinstance(result, Gathering) and len(result.live) == 1
+    assert result.live[0].slug == "drifting"
+    assert result.live[0].state == "drifted"
+    assert "computed_state" not in result.live[0].node  # carried on .state, not the node
 
 
 # --------------------------------------------------------------------------- #
@@ -403,8 +465,8 @@ def test_collection_missing_is_its_own_typed_unavailable(store: GraphStore) -> N
     check token would all report "unreachable" for a running Qdrant.
 
     **The seeded decision is load-bearing, not scenery.** The ``store`` fixture is an
-    empty graph, and over an empty active set an absent collection is the empty index
-    rather than a gap (I8) — the arm returns ``[]`` and never reaches the reason this
+    empty graph, and over an empty expected set an absent collection is the empty index
+    rather than a gap (I8) — the arm returns an empty gathering and never reaches the reason this
     row is about. One live decision puts the sweep in the state where absence is a
     real hole, which is the only state where arm ordering is observable. The
     empty-graph twin lives in ``test_conflict_faults.py``.
@@ -427,10 +489,17 @@ def test_collection_missing_is_its_own_typed_unavailable(store: GraphStore) -> N
 # 9. A graph-store fault PROPAGATES — it is never masked as Unavailable/[]  (D4)
 # --------------------------------------------------------------------------- #
 
-def test_store_fault_propagates_and_is_not_masked() -> None:
-    """A ``DatabaseError`` from the graph store propagates — not swallowed into a lie."""
-    stub = _StubStore(state_raises=DatabaseError("db locked"))
-    matches = [{"slug": "foo", "score": 0.9}]
+@pytest.mark.parametrize("fault", ["resolve_raises", "stamps_raise"])
+def test_store_fault_propagates_and_is_not_masked(fault: str) -> None:
+    """A ``DatabaseError`` from the resolver or the stamp read propagates — never a lie.
+
+    Rewritten on intent in 2d: the gather's two graph reads are the batched resolver
+    and its own live-window stamp read. Either fault is a local graph-store fault (D4),
+    so neither becomes ``Unavailable`` and neither is degraded to "stamps lost" (the
+    ranked surfaces' rule, which governs a different contract).
+    """
+    stub = _StubStore("foo", **{fault: DatabaseError("db locked")})
+    matches = [_stub_hit("foo", 0.9)]
     with pytest.raises(DatabaseError):
         _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), stub)
 
@@ -440,11 +509,15 @@ def test_store_fault_propagates_and_is_not_masked() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_healthy_empty_query_returns_empty_list_not_unavailable(store: GraphStore) -> None:
-    """A healthy substrate that simply matched nothing returns ``[]`` (a list), never Unavailable."""
+    """A healthy substrate that matched nothing is an empty gathering, never Unavailable.
+
+    The fetch ran out (``exhausted``), so it is not a cut at any floor.
+    """
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector([]), store)
-    assert result == []
-    assert isinstance(result, list)
-    assert not isinstance(result, Unavailable)
+    assert isinstance(result, Gathering)
+    assert result.live == [] and result.retired == []
+    assert result.end == EXHAUSTED and result.returned == 0 and result.last_score is None
+    assert not result.cut_above(0.0)
 
 
 def test_all_matches_retired_returns_empty_list_not_unavailable(store: GraphStore) -> None:
@@ -453,26 +526,35 @@ def test_all_matches_retired_returns_empty_list_not_unavailable(store: GraphStor
     _supersede(store, "new-policy", "old-policy")
     matches = [
         {"slug": "old-policy", "score": 0.9},     # superseded → None
-        {"slug": "vanished", "score": 0.8},        # absent → None
+        orphan_hit(0.8, slug="vanished"),          # absent → None
     ]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), store)
-    assert result == []
-    assert isinstance(result, list)
+    assert isinstance(result, Gathering)
+    assert result.live == []
+    assert [h.node["slug"] for h in result.retired] == ["old-policy"]
 
 
 # --------------------------------------------------------------------------- #
-# 11. slug=None guard — a payload missing its slug drops before any store read
+# 11. A payload's slug is never read: a slug-less point resolves by its id
 # --------------------------------------------------------------------------- #
 
 def test_none_slug_is_guarded_before_the_store_read(store: GraphStore) -> None:
-    """A match with ``slug=None`` (vector_store emits it) drops with no ``get_node_by_slug`` call."""
+    """A point whose payload carries ``slug=None`` is resolved by id like any other.
+
+    Rewritten on intent in 2d: the old guard dropped a slug-less payload before a slug
+    read. The gather now asks for ids only (``with_payload=False``) and never reads a
+    payload slug, so the guard's subject is structural: a slug-less point naming no node
+    is an orphan, and one naming a live node is gathered under the node's slug.
+    """
+    _seed_decision(store, "cache-policy", "Cache aggressively.")
+    live_id = store.resolve_slug("cache-policy")[0]
     spy = _SpyStore(store)
-    matches = [{"slug": None, "score": 0.9}]
+    matches = [{"point_id": orphan_point_id("none-slug"), "slug": None, "score": 0.9},
+               point_hit(live_id, 0.8, slug=None)]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), spy)
 
-    assert result == []
-    assert spy.slug_calls == []   # the guard fired before touching the store
-    assert spy.state_calls == []
+    assert [c.slug for c in result.live] == ["cache-policy"]
+    assert "get_node_by_slug" not in spy.calls and "get_node_state" not in spy.calls
 
 
 # --------------------------------------------------------------------------- #

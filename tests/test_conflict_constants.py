@@ -87,6 +87,9 @@ def test_module_exposes_the_five_constants_and_the_2a_pipeline_symbols() -> None
         "ConflictFinding",
         "ConflictCheckResult",
         "run_conflict_check",
+        # The recall-confidence vision's 2d: the gather's raw bound and its carrier.
+        "CONFLICT_RAW_BOUND",
+        "Gathering",
     }
     missing = expected_api - public
     assert not missing, f"conflict.py is missing intended public symbols: {sorted(missing)}"
@@ -95,9 +98,10 @@ def test_module_exposes_the_five_constants_and_the_2a_pipeline_symbols() -> None
 def test_overfetch_limit_is_a_bounded_margin_above_top_k() -> None:
     """The 2a over-fetch dial is a single bounded window wider than the final top-K.
 
-    CONF-D3/D7: the raw KNN window must exceed CONFLICT_TOP_K so S3's non-live drops
-    and 2b's declared/own-slug drops cannot shadow an undeclared neighbour out of the
-    final batch. Pinned as an int strictly greater than TOP_K (not the exact value —
+    CONF-D3/D7: the gather's live window must exceed CONFLICT_TOP_K so 2b's
+    declared/own-slug drops cannot shadow an undeclared neighbour out of the final
+    batch (since the recall-confidence vision's 2d it counts live candidates, filled
+    from one call at CONFLICT_RAW_BOUND, so non-live points no longer take a slot). Pinned as an int strictly greater than TOP_K (not the exact value —
     it is an operational tuning dial, like a config knob, not a calibrated constant).
     """
     limit = conflict.CONFLICT_OVERFETCH_LIMIT

@@ -34,6 +34,8 @@ from mitos.parser import ParsedEntry
 from mitos.store import open_connection
 from mitos.sync import MitosSyncManager
 
+from _point_hits import CannedVector, record_fault
+
 
 # --------------------------------------------------------------------------- #
 # Hand-rolled fakes (the 2a / test_conflict_facade idiom — synchronous, no SDK)
@@ -72,19 +74,22 @@ class _CountingEmbed:
         return self._cache[text]
 
 
-class _FakeVector:
-    """Returns canned `(slug, score)` matches for the over-fetch query; no-op upsert."""
+class _FakeVector(CannedVector):
+    """Returns canned `(slug, score)` matches for the over-fetch query; no-op upsert.
 
-    def __init__(self, matches: Optional[List[Dict[str, Any]]] = None) -> None:
-        self._matches = matches if matches is not None else []
-        self.queries = 0
+    Routes through the shared canned-hit leaf (``tests/_point_hits.py``), so every hit
+    carries the ``point_id`` of the node its slug names and ``limit`` is honoured as
+    production honours it. ``_wire_fakes`` binds the manager's store; a bare
+    construction binds to the one graph its test built.
+    """
+
+    def __init__(self, matches: Optional[List[Dict[str, Any]]] = None, *,
+                 store: Optional[Any] = None,
+                 store_of: Optional[Any] = None) -> None:
+        super().__init__(matches, store=store, store_of=store_of)
         #: Every `may_create` this fake was handed, in call order — so a row can assert
         #: WHICH intent the write path declared, not merely that it declared something.
         self.may_create_calls: List[bool] = []
-
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        self.queries += 1
-        return list(self._matches)
 
     def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any],
                *, may_create: bool) -> None:
@@ -124,14 +129,17 @@ class _KeyedEmbed:
         return list(self._vectors[text])
 
 
-class _KeyedVector:
+class _KeyedVector(CannedVector):
     """Returns canned matches keyed on the exact query VECTOR; records every query.
 
     The ``_KeyedEmbed`` counterpart: sentinel vector in → that node's canned matches
-    out (keyed on ``tuple(vector)`` — lists aren't hashable). ``queried`` is the
-    per-query log the 2b laziness test reads: an unconsumed sweep node must leave no
-    entry here. ``raises`` (also vector-keyed) is the vector-substrate fault seam —
-    folded in now so 2c's breaker tests don't grow a third private fork.
+    out (keyed on ``tuple(vector)`` — lists aren't hashable), each routed through the
+    shared canned-hit leaf so every hit carries its node's ``point_id``. ``queried``
+    is the per-query log the 2b laziness test reads: an unconsumed sweep node must
+    leave no entry here. ``raises`` (also vector-keyed) is the vector-substrate fault
+    seam — a deliberate raise. An UNKNOWN vector is a fixture gap: it is recorded as a
+    fixture fault (the conftest teardown fails the test) and answers ``[]``, never a
+    ``KeyError`` that a reader's catch-all would turn into a degraded read.
     """
 
     def __init__(
@@ -139,17 +147,22 @@ class _KeyedVector:
         matches: Dict[Tuple[float, ...], List[Dict[str, Any]]],
         *,
         raises: Optional[Dict[Tuple[float, ...], BaseException]] = None,
+        store: Optional[Any] = None,
     ) -> None:
-        self._matches = matches
+        super().__init__(None, store=store)
+        self._keyed = matches
         self._raises = raises if raises is not None else {}
         self.queried: List[Tuple[float, ...]] = []
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def canned_for(self, vector: List[float]) -> Optional[List[Dict[str, Any]]]:
         key = tuple(vector)
         self.queried.append(key)
         if key in self._raises:
             raise self._raises[key]
-        return list(self._matches[key])
+        if key not in self._keyed:
+            record_fault(f"_KeyedVector: no canned matches for query vector {list(key)}")
+            return None
+        return self._keyed[key]
 
     def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any],
                *, may_create: bool) -> None:
@@ -162,6 +175,7 @@ def _keyed_substrate(
     *,
     embed_raises: Optional[Dict[str, BaseException]] = None,
     vector_raises: Optional[Dict[str, BaseException]] = None,
+    store: Optional[Any] = None,
 ) -> Tuple[_KeyedEmbed, _KeyedVector]:
     """Builds a coherent ``(_KeyedEmbed, _KeyedVector)`` pair from ``{axiom_text: matches}``.
 
@@ -172,7 +186,9 @@ def _keyed_substrate(
     TEXT-keyed (the vector fake's is translated onto its sentinel vector here), so one
     builder covers per-node embed faults and vector faults alike. A ``vector_raises``
     key absent from ``neighbourhoods`` has no sentinel to ride — that is a fixture gap
-    and fails loud here, never a silently un-armed fault.
+    and fails loud here, never a silently un-armed fault. ``store`` binds the graph the
+    canned slugs resolve in; omitted, the vector binds to the one graph its test built
+    (``tests/_point_hits.py``).
     """
     if vector_raises:
         unknown = set(vector_raises) - set(neighbourhoods)
@@ -191,7 +207,7 @@ def _keyed_substrate(
             translated[tuple(sentinel)] = vector_raises[text]
     return (
         _KeyedEmbed(vectors, raises=embed_raises),
-        _KeyedVector(matches, raises=translated),
+        _KeyedVector(matches, raises=translated, store=store),
     )
 
 
@@ -366,7 +382,7 @@ def _wire_fakes(
     `gather_candidates` reads `manager.embed_provider` / `manager.vector_store` directly.
     """
     manager.embed_provider = embed if embed is not None else _FakeEmbed()  # type: ignore[assignment]
-    vector = _FakeVector(matches)
+    vector = _FakeVector(matches, store_of=lambda: manager.store)
     manager.vector_store = vector  # type: ignore[assignment]
     manager._build_conflict_judge = lambda: judge  # type: ignore[assignment]
     return vector

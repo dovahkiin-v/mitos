@@ -1,7 +1,7 @@
 # Adding Mitos to a project
 
 Mitos is **per-project**: each project gets its own decision graph and its own
-Qdrant collection, sharing one Qdrant instance. Setting it up for a new project
+Qdrant collections, sharing one Qdrant instance. Setting it up for a new project
 takes a couple of minutes.
 
 Two commands are worth knowing before you start, because they answer different
@@ -275,7 +275,7 @@ uses the MCP for the decision loop and the CLI for setup/ops.
 | Inspect open questions — `open-questions` | ✅ (only here) | — |
 | **Record a decision** (+ typed relations: `supersedes`/`amends`/`depends_on`/…) | `mitos record` | `record_decision` ★ |
 | **Surface precedents (the recall loop)** | `mitos surface` | `surface_decisions` ★ |
-| **Look up by slug/claim** | `mitos query` | `query_decisions` |
+| **Look up a pointed claim** (MCP also an exact slug; `--field rejected_paths` / `field` ranks rejected options alone) | `mitos query` | `query_decisions` |
 | **Enumerate the full set in a scope (exhaustive recall)** | `mitos list` | `list_decisions` |
 | **Enumerate the scope vocabulary** | `mitos scopes` | `list_scopes` |
 | **Show one node by slug** | `mitos show` | `show_node` |
@@ -329,15 +329,33 @@ If yes, record it — and `surface_decisions` first when unsure.
 that one's exact slug to the matching relation argument so the graph stays
 connected instead of accumulating silent tension: `supersedes` (replaces it),
 `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. A record
-that is strongly similar (≥0.80) to an existing decision it does not reference
-pauses instead of committing (`needs_review` — nothing is written) and surfaces
-each neighbour's axiom, `rejected_paths`, `scope`, and modifier stamps. Judge
-each neighbour from that payload: if the new decision
-amends/supersedes/contradicts/cites one, re-record with that relation pointing
-at its slug; if it is genuinely independent, re-record with
-`acknowledge_neighbors=True`. If you go on to supersede or amend a neighbour, an
+that sits close to a decision it does not reference pauses instead of committing
+(`needs_review` — nothing is written), in two partitions. `neighbors` are live
+decisions strongly similar (≥0.80) to the draft, each with its axiom,
+`rejected_paths`, `scope`, and modifier stamps. `tombstones` are retired
+decisions at ≥0.8265, each with its axiom and where its current word lives
+(`superseded_by` / `corrected_by`, or `live_end` when the chain runs through
+another retired decision). Judge each neighbour from that payload: if the new
+decision amends/supersedes/contradicts/cites one, re-record with that relation
+pointing at its slug; if it is genuinely independent, re-record with
+`acknowledge_neighbors=True`. A retired decision is never a relation target, so
+for a tombstone the draft does not re-tread, relate to its live successor
+instead (a deliberate reversal is a `supersedes` of the successor), or
+acknowledge it. A tombstone marked `successor_ambiguous` has a successor whose
+slug two decisions carry, and `record_decision` refuses that slug as a relation
+target, so acknowledge it. The usual case is the same-slug one, a decision
+superseded by a new one under its own slug: the slug reads the live decision
+and the id reads the retired one. A relation still clears it when the draft's
+declarations reach the tombstone another way: for example `amends`, `narrows` or
+`supersedes` naming a decision descended from its successor, or, for a tombstone
+with several successors, any relation to one whose slug names a single decision.
+An acknowledged write's receipt names what it went past, `acknowledged_neighbors` and
+`acknowledged_tombstones`, and a re-record identical to a retired decision
+answers `exists` naming its successors. If you go on to supersede or amend a neighbour, an
 `amended_by`/`narrowed_by` stamp on it means it has moved on — dereference that
-slug before linking.
+slug before linking. The pause's `stamp_labels` gives the first clause of each
+live decision a neighbour's stamp or a tombstone's successor names, so you see
+what it moved to before you do.
 
 ---
 
@@ -511,6 +529,49 @@ if its spend needs confirming, a person runs it at a terminal and confirms.
 
 ---
 
+## Upgrading a workspace written by an earlier Mitos
+
+An upgrade can change what a workspace's indexes should hold. This build keeps a
+vector for every decision, live or retired, and a second collection beside the
+decision collection — its name plus `-rejections` — holding each decision's
+rejected options. A workspace an earlier build wrote has neither the retired
+vectors nor that collection, and nothing builds them implicitly. Upgrade in this
+order:
+
+1. **Move every build that reads a workspace first.** Update the global install
+   (*Prerequisites* → **Updating**); the machine-wide MCP server runs it. A
+   running `mitos serve` keeps the build it started with until its session
+   restarts, and so does any other installed build or clone: restart or update
+   each one.
+2. **Then run one `mitos reconcile -p <project>` per workspace.** It embeds the
+   retired decisions the decision index lacks and builds the rejection index in
+   the same pass, and it reports the items it embedded and those it found
+   already present (`--json` adds the embedding calls). `mitos status <project>`
+   beforehand shows what it will embed; the rejection index's missing count is
+   its embedding count, because rejected items bypass the embedding cache. Until
+   it has built the rejection index, every ranked read states that the index is
+   missing and names this heal; the decision answer is unchanged. Why the order:
+   an older build reads the decision collection unfiltered, so once the retired
+   vectors are back they take slots from live hits in its reads and in its
+   conflict sensing.
+3. **Then refresh each workspace's skill text.** If `mitos status <project>`
+   reports that `.mitos/skill.md` differs, run the command it prints. The order
+   matters here too: the skill text teaches `query_decisions`' `field` selector,
+   which a 0.19 server refuses and an older one ignores, answering the decision
+   ranking to a caller who asked for rejected options. So refresh it only after
+   step 1 has moved every server.
+4. **What leaves the machine.** Each decision's `rejected_paths` is now sent to
+   the embedding provider beside its axiom.
+5. **Rolling back.** Install the previous version. The rejection collection stays
+   in Qdrant, unread. Records and amends the previous build makes leave their
+   decisions' rejected items stale or missing; after you upgrade again, `mitos
+   status <project>` names them and `mitos reconcile -p <project>` heals them.
+   Meanwhile each ranked read checks every rejected item it would show against
+   its decision's current field, so an item the previous build left stale is
+   never shown.
+
+---
+
 ## Cutover (migrating a prototype graph to V1a)
 
 A graph created by an **older (pre-V1a) Mitos** uses a different node identity, so
@@ -553,18 +614,30 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    curl -X DELETE <qdrant_url>/collections/<collection>
    ```
    (`mitos cutover` prints the exact command with your URL + collection filled in.)
-5. **Re-embed the V1a active set.** Run `mitos sync -p .` (or `mitos sync -p .
-   --embed-only`) to drain the embedding queue. Until it finishes there is a
+5. **Embed every decision.** Run `mitos sync -p .` (or `mitos sync -p .
+   --embed-only`) to drain the embedding queues — the decisions' and their
+   rejected items'. `cutover` stamps both seed markers, so this one sync builds
+   both indexes, the rejection index's collection included. Until it finishes there is a
    **bounded semantic-surface outage**: `surface`/`query` are degraded, but
    graph-only `mitos list -p .` works throughout.
 
    > **Healing a bare Qdrant wipe.** If you ever delete the Qdrant collection
    > *without* a `cutover`/`rebuild` (which re-seed the embedding queue), the
    > outbox is empty and a sync has nothing to drain. Run **`mitos reconcile
-   > -p .`**: it diffs the active node set against Qdrant's actual points,
-   > re-queues the missing active nodes, and drains them in one pass (idempotent;
-   > re-embeds hit the cache, so no embedding-API spend when text is unchanged).
-   > `mitos status .` flags this state as `⚠ vector index incomplete`.
+   > -p .`**: it diffs every decision (live or retired) plus the active open
+   > questions against Qdrant's actual points, re-queues only the missing ones,
+   > and drains them in one pass (idempotent). `mitos status .` flags this
+   > state as `⚠ vector index incomplete`, and names retired decisions with no
+   > vector on a line of their own. `reconcile` also deletes points whose node
+   > is no longer in the graph, over a built graph only: over a clone whose graph
+   > is unbuilt it deletes nothing and names `mitos rebuild` instead.
+   > It builds the rejection index in the same pass: every decision whose
+   > rejected items have no point is queued and embedded, and items no decision
+   > states any more are deleted. Decision re-embeds hit the embedding cache, so
+   > they cost no embedding-API spend when text is unchanged; rejected items
+   > bypass the cache, so a first build or a lost rejection collection pays one
+   > embedding per item — the missing count `mitos status .` prices on its
+   > `rejection index` row.
 6. **Restart `mitos serve`** if it was running.
 7. **Verify.** `mitos status .` → expect `READY ✓`.
 8. **Remove the backup.** Once you're satisfied, delete the

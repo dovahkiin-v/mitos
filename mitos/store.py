@@ -9,8 +9,11 @@ import json
 import os
 import hashlib
 import logging
+import re
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, FrozenSet, Sequence, Set, Tuple
+from typing import (
+    List, Dict, Optional, Any, FrozenSet, Iterable, NamedTuple, Sequence, Set, Tuple,
+)
 from mitos.errors import (
     DatabaseError,
     ValidationError,
@@ -27,6 +30,7 @@ from mitos.identity import SLUG_MAX_LEN, compute_node_id, mechanism_canonical_no
 from mitos.migrations import (
     EMBEDDING_SEED_ESTABLISHED_BY,
     MIGRATION_STEPS,
+    REJECTION_SEED_ESTABLISHED_BY,
     MigrationStep,
     run_migrations,
     is_pre_v1a_schema,
@@ -34,6 +38,10 @@ from mitos.migrations import (
     restore_from_snapshot,
 )
 from mitos.parser import ParsedEntry
+from mitos.rejections import enumerate_rejected_paths
+# The resolver's result type lives in the walk's leaf so the walk can type-check it
+# without importing this module (the check family's fence); re-exported here.
+from mitos.retrieval_walk import PointResolution
 from mitos.scope_tags import normalize_scope_tags
 
 # Module logger for non-failing notices. The store is a pure primitive — it logs
@@ -257,6 +265,35 @@ _OQ_RESOLVED_PREDICATE: str = (
 )
 _OQ_RESOLVED_SQL: str = f"{_OQ_RESOLVED_PREDICATE} AS is_resolved"
 
+# The decision index's EXPECTED SET (recall-confidence 3b; ADR
+# ``decision-index-gap-and-creation-carve-out-key-on-its-expected-set``): every
+# decision node in every computed state — a decision's vector lives exactly as long
+# as its node (ADR ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``)
+# — plus the open questions that survive Stage 1. No ``_OQ_RESOLVED_PREDICATE``: a
+# *resolved* open question stays in, as it is in ``get_active_node_ids``. So the active
+# set is a subset of this one by construction. ONE atom, bound by both readers
+# (``get_decision_index_expected_ids`` and ``decision_index_expects_node_other_than``),
+# so the sensor (``status``), the heal (``reconcile``), the rebuild/cutover seed, the gap
+# predicate and the creation carve-out cannot drift apart. "Decision index" in the name
+# because the rejection index has an expected set of its own. Like
+# ``_ACTIVE_VIEW_PREDICATE`` it correlates on the UNALIASED ``nodes`` (the §4.3 alias trap).
+_DECISION_INDEX_EXPECTED_PREDICATE: str = (
+    "(nodes.kind = 'decision' OR "
+    f"(nodes.kind = 'open_question' AND {_ACTIVE_VIEW_PREDICATE}))"
+)
+
+# The rejection index's OWNERS (recall-confidence 4b): every decision node in every
+# computed state, and nothing else — an open question holds no ``rejected_paths``, so
+# it never owns an item. Bound by ``rejection_index_expects_owner_other_than`` (the
+# inline creation licence: "the graph's only decision, live or retired"), by the
+# expected-set read ``get_rejection_index_owner_fields`` (4d), by the gap predicate's
+# read ``rejection_index_expects_items`` and by the import's empty-graph read
+# ``holds_any_decision`` — one atom, so the licence and the sensor cannot drift. A
+# superset of "decisions holding at least one item" only through a decision whose field enumerates nothing, which every write
+# route refuses; there the licence errs safe (no create; the row waits for a
+# ``reconcile``). Correlates on the UNALIASED ``nodes`` (the §4.3 alias trap).
+_REJECTION_INDEX_OWNER_PREDICATE: str = "nodes.kind = 'decision'"
+
 # Indexed scope-membership filter (P11: ``idx_node_scopes_scope`` serves
 # ``scope = ?``, then the PK joins back to ``node_id``). Appended to a read SELECT
 # and bound with a single ``?`` scope value — never an O(N) Python post-filter.
@@ -456,6 +493,17 @@ def compute_hash(
 # bound-variable limit on every build, including the older 999-variable default.
 _CREATED_AT_CHUNK = 500
 
+# Ids bound per statement in ``GraphStore.resolve_point_ids`` (one bind per
+# point-id prefix; the range's upper bound is derived in SQL) and in
+# ``GraphStore.get_node_states`` (one bind per exact id). The same 500 keeps both
+# under the 999-variable floor; ``resolve_point_ids`` runs ``_scopes_for`` once per
+# chunk because it does not chunk its own ``IN``.
+_POINT_ID_CHUNK = 500
+
+# A normalized point id: what remains of ``hash_to_uuid(node_id)`` once its dashes
+# are removed and it is lowercased — the first 32 hex characters of a node id.
+_POINT_ID_PREFIX_RE = re.compile(r"[0-9a-f]{32}")
+
 
 def _utc_now_iso() -> str:
     """Returns the current UTC instant as an ISO-8601 microsecond string (MI-10).
@@ -473,7 +521,7 @@ def _utc_now_iso() -> str:
 
 # The one spelling of the ``embedding_seed`` upsert. Two callers need it on two
 # different connections — ``GraphStore.stamp_embedding_seed`` on its own, and
-# ``cutover._prune_embedding_queue_to_active`` inside the transaction that makes the
+# ``cutover._prune_embedding_queue_to_expected`` inside the transaction that makes the
 # claim true — so the SQL is single-sourced here rather than retyped at the second
 # site. The same in-transaction-twin shape ``_enqueue_outbox`` / ``add_pending_embedding``
 # already established for the outbox. ``ON CONFLICT(id) DO UPDATE`` so a re-stamp
@@ -494,7 +542,9 @@ def write_embedding_seed(
 
     The in-transaction twin of :meth:`GraphStore.stamp_embedding_seed`: it issues the
     statement and leaves the transaction to the caller, so the act that *makes* the
-    outbox cover the active set and the record *claiming* it can land together. The
+    outbox cover the decision index's expected set
+    (:meth:`GraphStore.get_decision_index_expected_ids`) and the record *claiming* it
+    can land together. The
     ``established_by`` vocabulary is enforced by the table's own ``CHECK`` (see
     ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``) — an unknown verb is refused at
     write time, not filtered here.
@@ -508,6 +558,81 @@ def write_embedding_seed(
     """
     conn.execute(
         _EMBEDDING_SEED_UPSERT_SQL, (established_by, now or _utc_now_iso())
+    )
+
+
+# The one spelling of the ``rejection_seed`` upsert, shared by
+# ``GraphStore.stamp_rejection_seed`` and :func:`write_rejection_seed` exactly as the
+# decision marker's upsert is shared above. The two markers live in separate tables
+# (ladder step 5), so neither stamp can touch the other's row.
+_REJECTION_SEED_UPSERT_SQL: str = """
+    INSERT INTO rejection_seed (id, established_by, established_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        established_by = excluded.established_by,
+        established_at = excluded.established_at
+"""
+
+
+def write_rejection_seed(
+    conn: sqlite3.Connection, established_by: str, *, now: Optional[str] = None
+) -> None:
+    """Stamps the rejection index's seed marker on ``conn``, without committing.
+
+    The in-transaction twin of :meth:`GraphStore.stamp_rejection_seed`, mirroring
+    :func:`write_embedding_seed`: the statement is issued and the transaction is left
+    to the caller. Its caller is ``cutover._prune_embedding_queue_to_expected``
+    (``rebuild``/``cutover``, in the aside transaction). The ``established_by`` vocabulary is enforced by the table's own
+    ``CHECK`` (``migrations.REJECTION_SEED_ESTABLISHED_BY``).
+
+    Args:
+        conn: An open, writable connection whose transaction the caller owns.
+        established_by: The verb that established coverage — one of
+            ``migrations.REJECTION_SEED_ESTABLISHED_BY``.
+        now: The UTC ISO-8601 stamp to record; defaults to :func:`_utc_now_iso`
+            (MI-10).
+    """
+    conn.execute(
+        _REJECTION_SEED_UPSERT_SQL, (established_by, now or _utc_now_iso())
+    )
+
+
+# SQLite's message when a read names ``rejection_backlog`` on a graph that has not run
+# ladder step 5 (identical on a ``mode=ro`` connection). The backlog reads match it as
+# a substring, like ``_MISSING_ORDINAL_ERROR``, so any other fault still raises.
+_MISSING_REJECTION_BACKLOG_ERROR: str = "no such table: rejection_backlog"
+
+
+class RejectionBacklogRow(NamedTuple):
+    """One ``rejection_backlog`` row, as the store's reads return it (runtime only).
+
+    Attributes:
+        node_id: The owning decision's content-hash id.
+        queued_at: The enqueueing commit's UTC ISO-8601 stamp.
+        enqueue_seq: The row's compare token. A clear or a failure note lands
+            only on the row still carrying it; no later enqueue repeats it.
+        retry_count: Failed write attempts since the row was enqueued.
+    """
+
+    node_id: str
+    queued_at: str
+    enqueue_seq: int
+    retry_count: int
+
+
+# Failed attempts at which a rejection backlog row reads as poison. A count, not a
+# threshold: the drain reports rows at or past it and keeps attempting them (a row is
+# never dropped), and ``status`` reads the same name. ``check`` never reads this backlog.
+REJECTION_BACKLOG_FAILURE_TOLERANCE = 3
+
+
+def _rejection_backlog_row(row: sqlite3.Row) -> RejectionBacklogRow:
+    """Builds a :class:`RejectionBacklogRow` from a backlog ``SELECT`` row."""
+    return RejectionBacklogRow(
+        node_id=row["node_id"],
+        queued_at=row["queued_at"],
+        enqueue_seq=int(row["enqueue_seq"]),
+        retry_count=int(row["retry_count"]),
     )
 
 
@@ -534,11 +659,91 @@ def _strip_citation(raw: str) -> str:
     return s
 
 
+class KillChain(NamedTuple):
+    """One seed's forward walk over kill edges (``_walk_kill_chains``).
+
+    Kill edges point new→old (the killer is the edge's source), so the walk goes
+    from a retired node to whatever retired it, then to whatever retired that, until
+    it reaches nodes nothing has killed: the live ends, where the current word on the
+    seed's claim lives. Drifted counts as live — drift annotates, it does not kill.
+
+    Attributes:
+        killers: The seed's immediate killers (sources of the kill edges onto it),
+            sorted by id.
+        reached: Every node the walk reached, the seed excluded, first-seen
+            depth-first order.
+        live_ends: The ids among ``reached`` that nothing has killed, sorted by
+            id; empty when the walk reached none (a closed cycle).
+        anomaly: None, ``"fan_out"`` (some reached node, the seed included, has two
+            or more killers) or ``"cycle"`` (the walk came back to a node still on
+            its path; reported over ``"fan_out"`` when both hold). Only an
+            out-of-band edit can author either.
+    """
+
+    killers: List[str]
+    reached: List[str]
+    live_ends: List[str]
+    anomaly: Optional[str]
+
+
+def live_ends_from_chains(
+    chains: Dict[str, KillChain], slugs: Dict[str, str]
+) -> Dict[str, List[str]]:
+    """Applies the live-end result rule to walked kill chains: the rule's one home.
+
+    :meth:`GraphStore.get_live_ends` answers through this, and so does any reader
+    that walked once through :meth:`GraphStore.get_kill_chains` for ``reached`` and
+    must not walk again for the ends (PATTERNS "One walk, N call-sites").
+
+    Result rule: a seed appears **only** when some immediate killer is itself
+    retired. A seed whose killers are all live is absent, because its stamps already
+    name the live end; so is a live seed (it has no killer). The value lists every
+    live end the walk reached, sorted by ``slug.casefold()`` then slug, or ``[]``
+    when the walk reached none (a cycle with no exit). Each anomalous seed (a fan-out
+    or a cycle, authorable only out of band) gets one ``logger.warning`` naming it,
+    the anomaly and the heal; the answer still comes back.
+
+    Args:
+        chains: Seed id → :class:`KillChain`, as the walk returned it.
+        slugs: Node id → slug for every node the walk reached.
+
+    Returns:
+        Node id → live-end slugs, for the admitted seeds only.
+    """
+    result: Dict[str, List[str]] = {}
+    for seed, chain in chains.items():
+        if chain.anomaly is not None:
+            logger.warning(
+                "get_live_ends: kill-edge %s detected while walking the kill "
+                "chain of node %s (%d node(s) reached, %d live end(s)). The "
+                "supported write path never authors a kill-edge %s; this is an "
+                "out-of-band or corrupt edge — rebuild the derivative graph from "
+                "the markdown corpus (decisions.md and decisions/archive/, the "
+                "authoritative source) with `mitos rebuild`.",
+                chain.anomaly.replace("_", "-"),
+                seed,
+                len(chain.reached),
+                len(chain.live_ends),
+                chain.anomaly.replace("_", "-"),
+            )
+        live_set = set(chain.live_ends)
+        if not any(k not in live_set for k in chain.killers):
+            continue
+        ends = [slugs[n] for n in chain.live_ends]
+        result[seed] = sorted(ends, key=lambda slug: (slug.casefold(), slug))
+    return result
+
+
 class CommitDelta:
     """Represents the structured delta returned after an entry commit.
 
     Carries metadata about the committed node and any cascading scope changes
-    required for incremental rerendering (V1-D22).
+    required for incremental rerendering (V1-D22), plus what the commit decided
+    for the rejection index: whether the node is new, and the ``enqueue_seq`` of
+    the ``rejection_backlog`` row this commit minted. The seq is handed out of the
+    commit's own transaction because it is the only token that pairs with the
+    field the commit stored; a row read after the commit could return a newer seq
+    a concurrent re-queue minted, and clearing that would lose its write.
     """
 
     def __init__(
@@ -547,13 +752,22 @@ class CommitDelta:
         node_scope: List[str],
         self_old_scope: List[str],
         commentary_fields_changed: bool,
-        cascade_affected_scopes: List[str]
+        cascade_affected_scopes: List[str],
+        created: bool = False,
+        rejection_enqueue_seq: Optional[int] = None,
     ) -> None:
         self.node_id = node_id
         self.node_scope = node_scope
         self.self_old_scope = self_old_scope
         self.commentary_fields_changed = commentary_fields_changed
         self.cascade_affected_scopes = cascade_affected_scopes
+        # True when the commit inserted the node (``commit_parsed_entry``'s
+        # ``is_new``); False for any re-commit of an existing id.
+        self.created = created
+        # The ``enqueue_seq`` this commit's rejection-backlog enqueue minted, or
+        # None when the commit queued no rejection row (an open question, an edit
+        # leaving ``rejected_paths`` unchanged, a new owner with no item).
+        self.rejection_enqueue_seq = rejection_enqueue_seq
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts the CommitDelta into a serializable dictionary."""
@@ -562,8 +776,31 @@ class CommitDelta:
             "node_scope": self.node_scope,
             "self_old_scope": self.self_old_scope,
             "commentary_fields_changed": self.commentary_fields_changed,
-            "cascade_affected_scopes": self.cascade_affected_scopes
+            "cascade_affected_scopes": self.cascade_affected_scopes,
+            "created": self.created,
+            "rejection_enqueue_seq": self.rejection_enqueue_seq,
         }
+
+
+def _point_id_prefix(point_id: Any) -> Optional[str]:
+    """Normalizes a point id to the node-id prefix it names, or None if it names none.
+
+    The inverse of ``vector_store.hash_to_uuid`` up to its truncation: dashes are
+    removed and the rest lowercased, and the result must be exactly 32 hex
+    characters. Anything else cannot be the prefix of a node id.
+
+    Args:
+        point_id: A point id as the vector index returned it.
+
+    Returns:
+        The 32-character lowercase hex prefix, or None.
+    """
+    if not isinstance(point_id, str):
+        return None
+    prefix = point_id.replace("-", "").lower()
+    if _POINT_ID_PREFIX_RE.fullmatch(prefix) is None:
+        return None
+    return prefix
 
 
 def _assert_sqlite_version() -> None:
@@ -693,6 +930,38 @@ def _boot_migrations(
         raise
     finally:
         conn.close()
+
+
+def _warn_lineage_cycle(node_id: str, cycle_node: str, walked: int) -> None:
+    """Emits the mutation-lineage cycle warning, the one text both readers share.
+
+    :meth:`GraphStore.get_lineage` and :meth:`GraphStore.get_lineage_ids` react to a
+    cycle alike (P5/P7): loud, non-fatal, naming the node and the repair. The supported
+    write path never authors a mutation cycle (the write-time reachability guard
+    rejects every cycle-closer), so this is an out-of-band or corrupt edge, and the
+    hot ``record`` path must stay crash-safe over it. The text is byte-identical to
+    the one ``get_lineage`` emitted before 7c, its ``get_lineage:`` lead included:
+    both readers run the same walk, and one text is what keeps the reaction single.
+    (The write guard in :meth:`GraphStore._reconcile_edges` ignores the cycle node on
+    purpose and does not call this.)
+
+    Args:
+        node_id: The seed whose lineage was walked.
+        cycle_node: The node where the cycle closed.
+        walked: How many ancestors were walked before the bound fired.
+    """
+    logger.warning(
+        "get_lineage: mutation cycle detected while walking lineage of "
+        "node %s — the cycle closes at node %s. Returning the partial "
+        "lineage (%d ancestor(s)) walked before the bound fired. The "
+        "supported write path never authors a mutation cycle; this is an "
+        "out-of-band or corrupt edge — rebuild the derivative graph from "
+        "the markdown corpus (decisions.md and decisions/archive/, the "
+        "authoritative source) with `mitos rebuild`.",
+        node_id,
+        cycle_node,
+        walked,
+    )
 
 
 class GraphStore:
@@ -1044,6 +1313,176 @@ class GraphStore:
         finally:
             conn.close()
 
+    def resolve_point_ids(self, point_ids: Iterable[str]) -> PointResolution:
+        """Maps vector-index point ids to their nodes in one batched, state-agnostic read.
+
+        A point id is ``hash_to_uuid(node_id)``: the first 128 bits of the node's
+        content-hash id, so a hit names its node without its payload slug, which is
+        a handle (mutable, MI-2; shared across a same-slug supersession, MI-13).
+        Each input is normalized by removing dashes and lowercasing and must then be
+        32 hex characters; anything else is an orphan. Inputs are deduplicated by
+        the raw string, each distinct prefix is read once, and every distinct raw
+        string gets its own bucket entry.
+
+        Per chunk this costs one ``FROM nodes`` SELECT — an indexed range join, a
+        node matching prefix ``p`` when ``p <= id < p || 'g'`` (ids are lowercase
+        hex and ``'g'`` sorts above every hex digit) — plus at most one bulk scope
+        fetch. The column is never lowercased, which would forfeit the index; the
+        CTE is aliased and ``nodes`` is not, because the derived-state fragments
+        correlate on the bare ``nodes`` (the alias trap), and no CTE column is
+        selected, because :meth:`_hydrate_node` would carry it onto the node.
+
+        ``computed_state`` mirrors :meth:`get_node_state` exactly (decision
+        vocabulary, ``drifted`` for an unkilled node with a drifted signal). An
+        orphan is found by the join returning nothing, never by asking a state:
+        :meth:`get_node_state` answers ``"active"`` for an id the graph does not
+        hold. No modifier stamps are applied — they are a separate batched read
+        (:meth:`get_modifiers_map`), so a stamp fault costs only the stamps.
+
+        Args:
+            point_ids: Point ids exactly as ``VectorStore.query`` returned them.
+
+        Returns:
+            The :class:`PointResolution` partition of the input. Empty input runs
+            no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        return self._resolve_points(point_ids, light=False)
+
+    def resolve_point_states(self, point_ids: Iterable[str]) -> PointResolution:
+        """Maps point ids to their nodes' identity, kind and state only — the light resolver.
+
+        :meth:`resolve_point_ids`' partition, prefix rule, chunking and state
+        derivation, with each node reduced to ``{"id", "kind", "computed_state"}``
+        and nothing hydrated (no columns beyond those, no scopes). The ranked reads
+        walk every hit of their over-fetched call on it and then hydrate only what
+        the answer shows with :meth:`resolve_point_ids` (ADR
+        ``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``,
+        whose trigger 5a's rejection leg fired; superseded by
+        ``ranked-reads-resolve-light-since-the-rejection-leg-fired-the-40ms-trigger-the-gather-stays-whole``).
+
+        Args:
+            point_ids: Point ids exactly as ``VectorStore.query`` returned them.
+
+        Returns:
+            The :class:`PointResolution` partition, with light nodes. Empty input runs
+            no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        return self._resolve_points(point_ids, light=True)
+
+    def _resolve_points(self, point_ids: Iterable[str], *, light: bool) -> PointResolution:
+        """The one body of both resolvers; ``light`` selects the light node shape."""
+        raw = list(dict.fromkeys(point_ids))
+        prefix_of = {pid: _point_id_prefix(pid) for pid in raw}
+        prefixes = list(dict.fromkeys(p for p in prefix_of.values() if p is not None))
+        matched: Dict[str, List[Dict[str, Any]]] = {}
+        if prefixes:
+            conn = self._get_connection()
+            try:
+                for start in range(0, len(prefixes), _POINT_ID_CHUNK):
+                    chunk = prefixes[start:start + _POINT_ID_CHUNK]
+                    values = ",".join("(?)" for _ in chunk)
+                    columns = "nodes.id, nodes.kind" if light else "nodes.*"
+                    rows = conn.execute(
+                        f"WITH p(lo) AS (VALUES {values}) "
+                        f"SELECT {columns}, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                        "FROM p JOIN nodes "
+                        "ON nodes.id >= p.lo AND nodes.id < p.lo || 'g'",
+                        chunk,
+                    ).fetchall()
+                    scopes_map = ({} if light else
+                                  self._scopes_for(conn, [row["id"] for row in rows]))
+                    for row in rows:
+                        # Read the state before hydrating: _hydrate_node pops
+                        # killer_type and recasts is_drifted.
+                        if row["killer_type"] is None and row["is_drifted"]:
+                            state = "drifted"
+                        else:
+                            state = _computed_decision_state(row["killer_type"])
+                        if light:
+                            node = {"id": row["id"], "kind": row["kind"]}
+                        else:
+                            node = self._hydrate_node(row, scopes_map.get(row["id"], []))
+                        node["computed_state"] = state
+                        matched.setdefault(row["id"][:32], []).append(node)
+            except sqlite3.Error as e:
+                raise DatabaseError(
+                    f"Failed to resolve {len(prefixes)} point id(s): {str(e)}"
+                )
+            finally:
+                conn.close()
+
+        nodes: Dict[str, Dict[str, Any]] = {}
+        orphans: List[str] = []
+        ambiguous: Dict[str, List[str]] = {}
+        for pid in raw:
+            prefix = prefix_of[pid]
+            found = matched.get(prefix, []) if prefix is not None else []
+            if not found:
+                orphans.append(pid)
+            elif len(found) > 1:
+                ambiguous[pid] = sorted(node["id"] for node in found)
+            else:
+                nodes[pid] = dict(found[0])
+        return PointResolution(nodes=nodes, orphans=orphans, ambiguous=ambiguous)
+
+    def get_node_states(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Maps each content-hash id the graph holds to its computed state, in one batched read.
+
+        The exact-id sibling of :meth:`resolve_point_ids`, for a caller that already
+        holds whole node ids (the lexical fallback hashes each corpus block the way
+        the commit does). State is :meth:`get_node_state`'s decision vocabulary
+        (``active`` / ``drifted`` / ``superseded`` / ``corrected``), derived from
+        the same ``_IS_DRIFTED_SQL`` / ``_KILLER_TYPE_SQL`` fragments and the same
+        drifted rule, so liveness stays one SQL atom. An id the graph does not hold
+        is **absent** from the map: existence comes from the ``IN`` read, never from
+        asking a state, because :meth:`get_node_state` answers ``"active"`` for an
+        unknown id. Nothing is hydrated and no scopes are fetched. ``nodes`` is not
+        aliased, because the derived-state fragments correlate on the bare name.
+
+        Args:
+            node_ids: Content-hash node ids. Deduplicated here; order is not kept.
+
+        Returns:
+            Node id → computed state, for the ids the graph holds. Empty input runs
+            no statement and opens no connection.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            out: Dict[str, str] = {}
+            # Read at call time, so a test can shrink the chunk.
+            chunk_size = _POINT_ID_CHUNK
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT nodes.id, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                    f"FROM nodes WHERE nodes.id IN ({placeholders})",
+                    chunk,
+                ):
+                    if row["killer_type"] is None and row["is_drifted"]:
+                        out[row["id"]] = "drifted"
+                    else:
+                        out[row["id"]] = _computed_decision_state(row["killer_type"])
+            return out
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read the state of {len(ids)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+
     def _scopes_for(
         self, conn: sqlite3.Connection, node_ids: List[str]
     ) -> Dict[str, List[str]]:
@@ -1291,6 +1730,75 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_live_axioms(self, slugs: Sequence[str]) -> Dict[str, str]:
+        """Maps each slug naming a live decision now to that decision's axiom, in one batched read.
+
+        The stamp label map's read (recall-confidence 8a): the batched form of the
+        question :meth:`get_node_by_slug` answers per handle — which live decision does
+        this slug name? — so a label is what the dereference it saves would return.
+        Live is the active view (no incoming kill-edge; drifted is live) over
+        ``kind = 'decision'``, matched on ``slug_casefold`` with each input's
+        ``str.casefold()`` bound, so the read rides ``idx_nodes_slug_casefold``. Nothing
+        is hydrated and nothing is cut: the label is the leaf's policy, not the store's.
+        ``nodes`` is not aliased, because the active-view predicate correlates on the
+        bare name.
+
+        Unlike :meth:`get_node_by_slug`, an MI-13 breach (two live decisions sharing a
+        casefold, structurally unreachable) does not raise: that slug is omitted with
+        one ``logger.warning`` naming it, because one breached handle must never cost
+        the labels of every other.
+
+        Args:
+            slugs: Slugs as the stamps spell them. Repeats and spellings sharing a
+                casefold are read once.
+
+        Returns:
+            Input spelling → the raw ``axiom`` column (NULL read as ``""``), for each
+            input whose casefold names exactly one live decision. ``[]`` runs no
+            statement and opens no connection.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        spellings = list(dict.fromkeys(slugs))
+        if not spellings:
+            return {}
+        folds = list(dict.fromkeys(slug.casefold() for slug in spellings))
+        conn = self._get_connection()
+        try:
+            found: Dict[str, List[str]] = {}
+            # Read at call time, so a test can shrink the chunk.
+            chunk_size = _POINT_ID_CHUNK
+            for start in range(0, len(folds), chunk_size):
+                chunk = folds[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT nodes.slug_casefold, nodes.axiom FROM nodes "
+                    f"WHERE nodes.slug_casefold IN ({placeholders}) "
+                    f"AND nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}",
+                    chunk,
+                ):
+                    found.setdefault(row["slug_casefold"], []).append(row["axiom"] or "")
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read the live axioms of {len(folds)} slug(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        out: Dict[str, str] = {}
+        for slug in spellings:
+            axioms = found.get(slug.casefold())
+            if not axioms:
+                continue
+            if len(axioms) > 1:
+                logger.warning(
+                    "get_live_axioms: slug %r names %d live decisions (MI-13 breach); "
+                    "its label is omitted", slug, len(axioms),
+                )
+                continue
+            out[slug] = axioms[0]
+        return out
+
     def get_node_state(self, node_id: str) -> str:
         """Computes one node's state from its incoming kill-edge (the V1a active view).
 
@@ -1483,16 +1991,19 @@ class GraphStore:
         kill-edges (``supersedes`` / ``corrects``) via declarative mirror, and a
         post-mutation slug-collision assertion (V1-D4) enforces one active node per
         ``casefold(slug)``. A referential violation rolls the whole entry back with
-        a structured ``source="store"`` envelope. Outbox enqueue (5c) and the read
-        views (5d) remain deferred seams. Format validation is the parser's job
-        (C1 / Decision 2) — the store owns referential truth, not format truth.
+        a structured ``source="store"`` envelope. The decision outbox row and,
+        field-aware, the rejection backlog row are enqueued on the same cursor, so
+        they commit with the node or not at all. Format validation is the parser's
+        job (C1 / Decision 2) — the store owns referential truth, not format truth.
 
         Args:
             parsed: A well-formed ``ParsedEntry`` (the parser's C1 guarantee).
 
         Returns:
-            A ``CommitDelta`` carrying the committed ``node_id`` plus the scope /
-            commentary-change metadata.
+            A ``CommitDelta`` carrying the committed ``node_id``, the scope /
+            commentary-change metadata, whether the node is new (``created``),
+            and the ``enqueue_seq`` of the rejection backlog row this commit
+            minted (``rejection_enqueue_seq``, ``None`` when it queued none).
 
         Raises:
             ValidationError: If the canonical-core field that feeds the hash is
@@ -1734,6 +2245,29 @@ class GraphStore:
                     self._reconcile_edges(cursor, node_id, parsed, now)
                 )
                 self._enqueue_outbox(cursor, node_id, parsed, now)
+                # --- Rejection backlog (field-aware, same transaction) ----------
+                # Only a decision can hold rejected items. A new one enqueues when
+                # its field enumerates at least one item (the leaf decides what an
+                # item is; nothing for a new owner with none). A re-commit enqueues
+                # when the stored field changed, compared raw with None read as
+                # "" — a change to empty included, since its old items must go.
+                # Every other edit leaves a standing row untouched.
+                rejection_enqueue_seq: Optional[int] = None
+                if parsed.kind == "decision":
+                    if is_new:
+                        rejection_due = (
+                            enumerate_rejected_paths(rejected_paths_json or "").shape
+                            != "empty"
+                        )
+                    else:
+                        rejection_due = (
+                            (prior["rejected_paths_json"] or "")
+                            != (rejected_paths_json or "")
+                        )
+                    if rejection_due:
+                        rejection_enqueue_seq = self._enqueue_rejection_backlog(
+                            cursor, node_id, now
+                        )
                 store_failures = list(store_failures)
 
                 # --- Same-id commentary write + the single ``updated_at`` tick --
@@ -1884,6 +2418,8 @@ class GraphStore:
                         False if is_new else direct_footprint_changed
                     ),
                     cascade_affected_scopes=cascade_affected_scopes,
+                    created=is_new,
+                    rejection_enqueue_seq=rejection_enqueue_seq,
                 )
         except sqlite3.IntegrityError as e:
             # The DDL CHECKs/FKs are the structural type gate (Lesson 2). The most
@@ -2314,10 +2850,11 @@ class GraphStore:
 
         The enqueue is **never** skipped (recall-over-precision, OPERA §11): a
         missed enqueue is permanent vector staleness (the costly miss), a false one
-        is a free drain-time cache-hit (the cheap false positive). Commentary is
-        not forever vector-irrelevant — V2's anti-knowledge vector keys on
-        ``rejected_paths`` (commentary) and churns on commentary edits by design,
-        so a commentary-blind enqueue would silently starve it the moment V2 ships.
+        is a free drain-time cache-hit (the cheap false positive). The rejection
+        index is not driven from this row: it keeps a field-aware row of its own in
+        ``rejection_backlog``, written by :meth:`_enqueue_rejection_backlog` in the
+        same transaction, so this outbox stays unconditional on its own grounds
+        and never serves as the rejected items' queue.
 
         A re-enqueue RESETS drain state (re-stamps ``queued_at``, clears
         ``retry_count`` to 0) rather than a bare idempotent no-op: a node V3b
@@ -2355,6 +2892,49 @@ class GraphStore:
             """,
             (node_id, now),
         )
+
+    def _enqueue_rejection_backlog(
+        self, cursor: sqlite3.Cursor, node_id: str, now: str
+    ) -> int:
+        """Queues a decision's rejected items for a write, inside the commit's transaction.
+
+        The in-transaction twin of ``_enqueue_outbox`` for the rejection index: it
+        runs on ``commit_parsed_entry``'s cursor, so the row commits with the node or
+        not at all (MI-12). The caller decides **whether** to enqueue (the decision is
+        new with an item, or its stored ``rejected_paths`` changed); this method
+        writes the row and returns the seq it minted.
+
+        It deletes the node's standing row, if any, and inserts a fresh one, so every
+        enqueue mints a new ``enqueue_seq`` and starts at ``retry_count = 0``. The
+        sequence is ``AUTOINCREMENT`` and never reused within a graph, so a reader
+        holding an older seq can never clear or note the newer row.
+
+        Unlike the decision outbox, a re-commit is **not** this row's retry. Only a
+        field-aware enqueue resets it; a re-commit that leaves ``rejected_paths``
+        unchanged never reaches this method, so a standing row keeps its seq and its
+        ``retry_count``, and it is retried by the next pass over the backlog.
+
+        Args:
+            cursor: The open cursor inside ``commit_parsed_entry``'s transaction.
+            node_id: The committing decision's content-hash id (the node row
+                already exists by this point, so the FK is satisfied).
+            now: The commit's single UTC ISO-8601 stamp (MI-10).
+
+        Returns:
+            The new row's ``enqueue_seq``. It is read as ``cursor.lastrowid``
+            straight after the INSERT, with nothing run on the cursor in between;
+            on an ``INTEGER PRIMARY KEY`` table that is the inserted seq. The
+            commit carries it out on ``CommitDelta.rejection_enqueue_seq``.
+        """
+        cursor.execute(
+            "DELETE FROM rejection_backlog WHERE node_id = ?", (node_id,)
+        )
+        cursor.execute(
+            "INSERT INTO rejection_backlog (node_id, queued_at, retry_count) "
+            "VALUES (?, ?, 0)",
+            (node_id, now),
+        )
+        return int(cursor.lastrowid)
 
     def get_active_decisions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
         """Exposes the active-view set of decisions (C3 / M3).
@@ -2668,62 +3248,174 @@ class GraphStore:
         finally:
             conn.close()
             
+    def get_all_node_ids(self) -> FrozenSet[str]:
+        """Returns every node id in the graph — any kind, any state — unhydrated.
+
+        One ``SELECT id FROM nodes``: the "is this point's node still in the graph?"
+        side of the orphan partition (:func:`mitos.vector_store.partition_points`),
+        read by ``reconcile`` and ``status`` after their listing. It stays **off**
+        :class:`~mitos.protocols.GraphStoreProtocol`: both callers hold a concrete
+        ``GraphStore``, so no duck-typed caller reaches it. ``tests/test_orphan_collection.py``
+        pins it equal to the ids :meth:`get_all_nodes` returns.
+
+        Store faults propagate; each caller decides what a fault means for it.
+
+        Returns:
+            Every node id (SHA-256 hex) the graph holds.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("SELECT id FROM nodes").fetchall()
+            return frozenset(row[0] for row in rows)
+        finally:
+            conn.close()
+
     def get_active_node_ids(self) -> Set[str]:
         """Returns the active node id set (active decisions + open questions).
 
-        The single source of the V1a active predicate (G5): reads through the
-        store's own active-view methods rather than re-encoding the kill-edge
-        anti-join, so cutover, reconcile, and any future consumer share one
-        definition of "the live architectural surface."
+        This is a count of *the live architectural surface*
+        and nothing else: ``status``' ``active_nodes`` / ``missing_active_*``,
+        ``reconcile``'s ``active`` key and the rebuild's
+        ``reconstructed_active_count``. It is **not** what the decision index should
+        hold — that is :meth:`get_decision_index_expected_ids`, a superset (it keeps
+        every retired decision too), and every "what should the index hold?" consumer
+        reads that one (``tests/test_expected_set.py`` pins who calls which).
+
+        One ids-only SQL over the shipped ``_ACTIVE_VIEW_PREDICATE`` (WIRING_LEDGER
+        entry-009): the same population as the ids of :meth:`get_active_decisions`
+        plus :meth:`get_open_questions` — both apply exactly that predicate unscoped,
+        a drifted decision stays in and a parked or resolved open question stays in —
+        without hydrating a row. ``nodes`` stays UNALIASED so the correlated
+        predicate binds. ``tests/test_rejection_covering.py`` pins the agreement with
+        the hydrating derivation over a fixture matrix.
 
         Returns:
             The set of active decision + open-question node ids (SHA-256 hashes).
         """
-        active: Set[str] = {node["id"] for node in self.get_active_decisions()}
-        active.update(node["id"] for node in self.get_open_questions())
-        return active
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id FROM nodes "
+                "WHERE nodes.kind IN ('decision', 'open_question') "
+                f"AND {_ACTIVE_VIEW_PREDICATE}"
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
 
-    def has_active_node_other_than(self, node_id: str) -> bool:
-        """Reports whether the active set holds any node besides ``node_id``.
+    def get_decision_index_expected_ids(self) -> FrozenSet[str]:
+        """Returns the decision index's expected set, as ids, unhydrated.
 
-        The cheap complement of :meth:`get_active_node_ids` for the one question a
-        single-node write needs answered: *does this write cover the live surface, or
-        is there live architecture it leaves unindexed?* An empty graph, or a graph
-        holding only this node, answers ``False`` — the fresh-project carve-out, where
-        one point genuinely **is** the whole active set.
+        Every decision node in every computed state (active, drifted, superseded,
+        corrected) plus the open questions that survive Stage 1 (parked and
+        resolved; a superseded or corrected one is out). A decision's vector lives
+        exactly as long as its node (ADR
+        ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``),
+        so this — not :meth:`get_active_node_ids` — is what ``status`` reports
+        completeness against, what ``reconcile`` diffs, what the rebuild/cutover
+        seed keeps in the outbox and what ``recall.missing_index_is_a_gap`` gates
+        on. One read for the sensor and the heal is what lets the heal clear its
+        own warning (ADR ``decision-index-gap-and-creation-carve-out-key-on-its-expected-set``).
+        The active set is a subset of this one by construction.
 
-        Deliberately not ``len(get_active_node_ids() - {node_id}) > 0``: that is two
-        full active-view fetches, each running ``_hydrate_rows`` (the bulk scope fetch,
-        the modifier stamp, the reader-facing alias re-key), i.e. a hydrated read of
-        the entire live corpus — on **every** record, not only when it matters. This is
-        an ``EXISTS … LIMIT 1`` over the same predicate: an index seek (P11/P17).
+        Binds ``_DECISION_INDEX_EXPECTED_PREDICATE`` rather than re-encoding it, and
+        ``nodes`` stays UNALIASED so the correlated liveness predicate binds (the
+        alias trap the constant's own comment warns about). Its per-record twin is
+        :meth:`decision_index_expects_node_other_than`; ``tests/test_expected_set.py``
+        pins the agreement over a fixture matrix.
 
-        The two must never disagree, so this binds the shipped ``_ACTIVE_VIEW_PREDICATE``
-        rather than re-encoding it ("Active-view liveness is ONE SQL atom", PATTERNS),
-        and over exactly the kinds ``get_active_node_ids`` unions — active decisions
-        **plus** ``get_open_questions``' Stage-1 survivors. Note what is *not* here: no
+        Store faults propagate (``DatabaseError`` / ``sqlite3.Error``); each caller
+        decides what a fault means for it.
+
+        Returns:
+            The node ids the decision index should hold a point for.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id FROM nodes "
+                f"WHERE {_DECISION_INDEX_EXPECTED_PREDICATE}"
+            ).fetchall()
+            return frozenset(row[0] for row in rows)
+        finally:
+            conn.close()
+
+    def decision_index_expects_node_other_than(self, node_id: str) -> bool:
+        """Reports whether the decision index's expected set holds any node besides ``node_id``.
+
+        The cheap complement of :meth:`get_decision_index_expected_ids` for the one
+        question a single-node write needs answered: *does this write cover what the
+        decision index should hold, or is there a node it leaves unindexed?* An empty
+        graph, or a graph holding only this node, answers ``False`` — the
+        fresh-project carve-out, where one point genuinely **is** the whole expected
+        set. A graph holding only retired decisions answers ``True``: they are
+        expected too, so a lone record into it must not create a collection holding
+        one point.
+
+        Deliberately not ``len(get_decision_index_expected_ids() - {node_id}) > 0``:
+        that is a whole-corpus id read on **every** record, not only when it matters.
+        This is an ``EXISTS … LIMIT 1`` over the same predicate: an index seek
+        (P11/P17), and any decision satisfies the first disjunct.
+
+        The two must never disagree, so this binds the one
+        ``_DECISION_INDEX_EXPECTED_PREDICATE`` rather than re-encoding it ("Active-view
+        liveness is ONE SQL atom", PATTERNS). Note what is *not* in it: no
         ``_OQ_RESOLVED_PREDICATE`` clause. ``resolves`` is not a kill edge, so a
         *resolved* open question is still returned by ``get_open_questions`` and is
-        still in the active id set (its docstring says so outright) — it genuinely needs
-        an embedding, and excluding it here would make this gate claim coverage the
-        write does not deliver. ``tests/test_embedding_seed.py`` pins the agreement over
-        a fixture matrix rather than trusting it.
-
-        ``nodes`` stays UNALIASED so the correlated liveness predicate binds (the alias
-        trap the constant's own comment warns about).
+        still expected — it genuinely needs an embedding, and excluding it here would
+        make this gate claim coverage the write does not deliver.
+        ``tests/test_expected_set.py`` pins the agreement over a fixture matrix rather
+        than trusting it.
 
         Args:
             node_id: The node the calling write covers.
 
         Returns:
-            True iff at least one active node other than ``node_id`` exists.
+            True iff at least one expected node other than ``node_id`` exists.
         """
         conn = self._get_connection()
         try:
             row = conn.execute(
                 "SELECT 1 FROM nodes "
-                "WHERE nodes.kind IN ('decision', 'open_question') "
-                f"AND {_ACTIVE_VIEW_PREDICATE} "
+                f"WHERE {_DECISION_INDEX_EXPECTED_PREDICATE} "
+                "AND nodes.id != ? LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def rejection_index_expects_owner_other_than(self, node_id: str) -> bool:
+        """Reports whether any decision node besides ``node_id`` exists, in any state.
+
+        The inline rejection write's creation licence: a write may create the
+        absent rejection collection only when its decision is the graph's only
+        decision, live or retired (ADR
+        ``rejection-collection-creation-follows-the-decision-index-a-seed-marker-of-its-own``).
+        Any other decision could own items the write would leave unindexed in a
+        collection that then looks built. Open questions never count — the
+        rejection index holds none — which is why this is not
+        :meth:`decision_index_expects_node_other_than`: that one counts surviving
+        open questions, so a project's first decision beside a parked question
+        could never create.
+
+        Binds ``_REJECTION_INDEX_OWNER_PREDICATE`` rather than re-encoding it. An
+        ``EXISTS … LIMIT 1`` read: it stops at the first other decision row (the
+        ``UNIQUE (id, kind)`` autoindex covers it), so no index on ``kind`` is
+        needed. Store faults propagate, as the twin's do; the inline leg catches
+        them.
+
+        Args:
+            node_id: The decision the calling write covers.
+
+        Returns:
+            True iff at least one decision node other than ``node_id`` exists.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM nodes "
+                f"WHERE {_REJECTION_INDEX_OWNER_PREDICATE} "
                 "AND nodes.id != ? LIMIT 1",
                 (node_id,),
             ).fetchone()
@@ -2732,7 +3424,7 @@ class GraphStore:
             conn.close()
 
     def stamp_embedding_seed(self, established_by: str) -> None:
-        """Records that ``pending_embeddings`` covers the graph's active set.
+        """Records that ``pending_embeddings`` covers the decision index's expected set.
 
         The standalone-connection twin of :func:`write_embedding_seed`, for the
         producer that is not already inside the transaction it describes
@@ -2764,13 +3456,14 @@ class GraphStore:
         """Returns the coverage marker, or None when no covering act stands.
 
         Absence of the row is the false state — there is no ``covers = 0`` row to
-        interpret. Read by exactly one consumer,
-        ``MitosSyncManager.drain_pending_embeddings``, at its entry.
+        interpret. Two readers: ``MitosSyncManager.drain_pending_embeddings`` acts on
+        it (read once at its entry), and ``mitos status`` prints it. The drain is the
+        only one that acts.
 
         An unreadable marker (a hand-truncated graph missing the table entirely) reads
-        as **absent**, not as a fault: the only consumer's safe answer to "may this
-        write create the collection?" is *no*, and deferral costs an outbox row that
-        was already written. Failing loud here would turn a recoverable graph into a
+        as **absent**, not as a fault: the drain's safe answer to "may this write
+        create the collection?" is *no*, and deferral costs an outbox row that was
+        already written. Failing loud here would turn a recoverable graph into a
         failed ``sync`` while still not creating anything.
 
         Returns:
@@ -2796,11 +3489,20 @@ class GraphStore:
         finally:
             conn.close()
 
-    def clear_embedding_seed(self) -> None:
+    def clear_embedding_seed(self, *, established_at: Optional[str] = None) -> None:
         """Drops the coverage marker — the claim has been delivered or has expired.
 
-        Called by the drain the moment the outbox empties: coverage is no longer
-        pending, so the marker must stop authorizing creation.
+        The drain spends the marker it read once its walk has attempted every row
+        standing at its entry with the collection present, or once it finds the
+        backlog empty (``drain_pending_embeddings`` states the rule). A walk spans
+        minutes, and a ``reconcile`` may re-stamp meanwhile, recording a covering
+        act this drain did not run under — so the drain passes the
+        ``established_at`` it read, and the delete then spends only that marker: a
+        re-stamped one survives.
+
+        Args:
+            established_at: The stamp of the marker to spend, compared exactly. None
+                deletes whatever marker stands.
 
         Raises:
             DatabaseError: If the delete fails.
@@ -2808,9 +3510,462 @@ class GraphStore:
         conn = self._get_connection()
         try:
             with conn:
-                conn.execute("DELETE FROM embedding_seed WHERE id = 1")
+                if established_at is None:
+                    conn.execute("DELETE FROM embedding_seed WHERE id = 1")
+                else:
+                    conn.execute(
+                        "DELETE FROM embedding_seed WHERE id = 1 AND established_at = ?",
+                        (established_at,),
+                    )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to clear the embedding seed marker: {str(e)}")
+        finally:
+            conn.close()
+
+    # --- The rejection backlog and its seed marker (ladder step 5) ---------------
+    #
+    # Reads treat a graph without the rung as "rung not applied": a read-only store
+    # never migrates, so it can open a step-4 graph. They match exactly the missing
+    # table's message; any other SQLite fault raises. Writes never fall back — only a
+    # migrated, writable store reaches them, so a missing table there is a fault.
+
+    def get_rejection_backlog_row(self, node_id: str) -> Optional[RejectionBacklogRow]:
+        """Returns a decision's standing rejection backlog row, or None.
+
+        Args:
+            node_id: The decision's content-hash id.
+
+        Returns:
+            The row, or None when no row stands or the graph predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT node_id, queued_at, enqueue_seq, retry_count "
+                "FROM rejection_backlog WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            return _rejection_backlog_row(row) if row is not None else None
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return None
+            raise DatabaseError(f"Failed to read the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def claim_rejection_backlog(
+        self, limit: int, *, after_seq: Optional[int] = None
+    ) -> List[RejectionBacklogRow]:
+        """Reads the next rejection backlog rows, in enqueue order.
+
+        A plain ordered ``SELECT``, not a claim — the same single-writer semantics as
+        :meth:`claim_pending_embeddings`. Rows come in ``enqueue_seq`` order, and an
+        enqueue replaces its row with a fresh, larger seq, so a re-queued owner moves
+        to the back of the queue. ``after_seq`` is a keyset cursor on the primary key:
+        only rows with a larger seq are returned.
+
+        Args:
+            limit: The most rows to return.
+            after_seq: The last ``enqueue_seq`` already walked, or None to read from
+                the head of the queue.
+
+        Returns:
+            Up to ``limit`` rows; ``[]`` when the graph predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            if after_seq is None:
+                rows = conn.execute(
+                    "SELECT node_id, queued_at, enqueue_seq, retry_count "
+                    "FROM rejection_backlog ORDER BY enqueue_seq LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT node_id, queued_at, enqueue_seq, retry_count "
+                    "FROM rejection_backlog WHERE enqueue_seq > ? "
+                    "ORDER BY enqueue_seq LIMIT ?",
+                    (after_seq, limit),
+                ).fetchall()
+            return [_rejection_backlog_row(row) for row in rows]
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return []
+            raise DatabaseError(f"Failed to read the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def clear_rejection_backlog_row(self, node_id: str, *, enqueue_seq: int) -> bool:
+        """Deletes a decision's backlog row, only if it still carries ``enqueue_seq``.
+
+        A commit that re-queued the owner since the caller read its row replaced
+        that row with a larger seq, so a stale clear deletes nothing.
+
+        Args:
+            node_id: The decision's content-hash id.
+            enqueue_seq: The seq of the row the caller read.
+
+        Returns:
+            True iff a row was deleted.
+
+        Raises:
+            DatabaseError: If the delete fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM rejection_backlog "
+                    "WHERE node_id = ? AND enqueue_seq = ?",
+                    (node_id, enqueue_seq),
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to clear a rejection backlog row: {str(e)}")
+        finally:
+            conn.close()
+
+    def note_rejection_backlog_failure(self, node_id: str, *, enqueue_seq: int) -> bool:
+        """Counts one failed write attempt on a backlog row, only on ``enqueue_seq``.
+
+        Args:
+            node_id: The decision's content-hash id.
+            enqueue_seq: The seq of the row the caller read.
+
+        Returns:
+            True iff the row's ``retry_count`` was incremented.
+
+        Raises:
+            DatabaseError: If the update fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "UPDATE rejection_backlog SET retry_count = retry_count + 1 "
+                    "WHERE node_id = ? AND enqueue_seq = ?",
+                    (node_id, enqueue_seq),
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to note a rejection backlog failure: {str(e)}"
+            )
+        finally:
+            conn.close()
+
+    def count_rejection_backlog(self, *, min_retry: Optional[int] = None) -> int:
+        """Counts the standing rejection backlog rows.
+
+        Args:
+            min_retry: Count only rows whose ``retry_count`` is at least this, or
+                None for every row.
+
+        Returns:
+            The row count; 0 when the graph predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            if min_retry is None:
+                row = conn.execute("SELECT COUNT(*) FROM rejection_backlog").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM rejection_backlog WHERE retry_count >= ?",
+                    (min_retry,),
+                ).fetchone()
+            return int(row[0])
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return 0
+            raise DatabaseError(f"Failed to count the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def rejection_backlog_last_seq(self) -> Optional[int]:
+        """Returns the largest ``enqueue_seq`` standing in the rejection backlog.
+
+        Every enqueue mints a seq larger than any before it, so a row above this
+        value was queued after the read.
+
+        Returns:
+            The largest standing seq, or None when no row stands or the graph
+            predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute("SELECT MAX(enqueue_seq) FROM rejection_backlog").fetchone()
+            return None if row is None or row[0] is None else int(row[0])
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return None
+            raise DatabaseError(f"Failed to read the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def get_rejection_owner_fields(
+        self, node_ids: Sequence[str]
+    ) -> Dict[str, Tuple[str, str]]:
+        """Reads the slug and the raw ``rejected_paths`` of each named node, in one query.
+
+        ``rejected_paths_json`` holds the **raw** field string, not JSON (see
+        :meth:`commit_parsed_entry`), and NULL reads as ``""`` — the same column and
+        the same coalesce the field-aware enqueue compared, so the drain enumerates
+        exactly what the commit queued it for.
+
+        Args:
+            node_ids: The owners to read. Empty asks nothing.
+
+        Returns:
+            ``{node_id: (slug, raw_field)}``; a node not in the graph is absent.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            placeholders = ", ".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, slug, rejected_paths_json FROM nodes "
+                f"WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            return {
+                row["id"]: (row["slug"], row["rejected_paths_json"] or "")
+                for row in rows
+            }
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to read rejection owners: {str(e)}")
+        finally:
+            conn.close()
+
+    def get_rejection_index_owner_fields(self) -> Dict[str, str]:
+        """Reads every rejection index owner's raw ``rejected_paths``, in one query.
+
+        Every decision node in every computed state (``_REJECTION_INDEX_OWNER_PREDICATE``),
+        the field coalesced to ``""`` exactly as :meth:`get_rejection_owner_fields`
+        does; the column holds the **raw** string, not JSON. This is the graph side
+        of the rejection index's expected set: ``rejections.expected_rejection_points``
+        turns it into point ids, and ``status`` and ``reconcile`` both diff a listing
+        against that, so the heal clears its own warning. It stays off
+        :class:`~mitos.protocols.GraphStoreProtocol`: both callers hold a concrete
+        ``GraphStore``.
+
+        Returns:
+            ``{decision id: raw rejected_paths}`` for every decision node.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id, nodes.rejected_paths_json FROM nodes "
+                f"WHERE {_REJECTION_INDEX_OWNER_PREDICATE}"
+            ).fetchall()
+            return {row[0]: row[1] or "" for row in rows}
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to read rejection index owners: {str(e)}")
+        finally:
+            conn.close()
+
+    def rejection_index_expects_items(self) -> bool:
+        """Reports whether some decision's ``rejected_paths`` holds at least one item.
+
+        The rejection index's expected set is non-empty exactly when this is True,
+        so it is what ``recall.missing_rejection_index_is_a_gap`` gates on: an
+        absent collection is a gap only when there is something to build. A cursor
+        over the decisions with a non-empty column, answering at the first field
+        whose enumeration is not ``empty`` (in practice the first row); a
+        whitespace-only field is skipped exactly as the enumeration skips it. An
+        open question owns no item, so a questions-only graph answers False.
+
+        Store faults propagate; the predicate turns them into its loud answer.
+
+        Returns:
+            True iff the rejection index's expected set holds an item.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT nodes.rejected_paths_json FROM nodes "
+                f"WHERE {_REJECTION_INDEX_OWNER_PREDICATE} "
+                "AND nodes.rejected_paths_json IS NOT NULL "
+                "AND nodes.rejected_paths_json != ''"
+            )
+            for row in cursor:
+                if enumerate_rejected_paths(row[0]).shape != "empty":
+                    return True
+            return False
+        finally:
+            conn.close()
+
+    def holds_any_decision(self) -> bool:
+        """Reports whether the graph holds any decision node, in any state.
+
+        The import's "into an empty graph" question for the rejection seed marker:
+        empty means no rejection index owner, so a graph holding only open
+        questions is empty for this index. An ``EXISTS … LIMIT 1`` over
+        ``_REJECTION_INDEX_OWNER_PREDICATE``.
+
+        Returns:
+            True iff at least one decision node exists.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM nodes WHERE {_REJECTION_INDEX_OWNER_PREDICATE} LIMIT 1"
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to read the graph's decisions: {str(e)}")
+        finally:
+            conn.close()
+
+    def enqueue_rejection_backlog_owners(self, node_ids: Iterable[str]) -> int:
+        """Queues each named owner that has no standing rejection backlog row.
+
+        ``reconcile``'s enqueue, the standalone twin of the commit-only
+        ``_enqueue_rejection_backlog``. One transaction; an owner that already has a
+        row is left exactly as it stands (``ON CONFLICT(node_id) DO NOTHING``): its
+        seq is never re-minted, so a drain mid-walk sees no spurious retake, and its
+        ``retry_count`` is never reset, so a poison row keeps reading past the
+        tolerance. That deliberately departs from the decision outbox's
+        ``add_pending_embedding``, which resets the retry count.
+
+        Args:
+            node_ids: The owners to queue (decision ids already in the graph).
+
+        Returns:
+            The number of rows inserted.
+
+        Raises:
+            DatabaseError: If the write fails.
+        """
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return 0
+        now = _utc_now_iso()
+        conn = self._get_connection()
+        try:
+            with conn:
+                inserted = 0
+                for node_id in ids:
+                    cursor = conn.execute(
+                        "INSERT INTO rejection_backlog (node_id, queued_at, retry_count) "
+                        "VALUES (?, ?, 0) ON CONFLICT(node_id) DO NOTHING",
+                        (node_id, now),
+                    )
+                    inserted += cursor.rowcount
+            return inserted
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to queue rejection backlog owners: {str(e)}")
+        finally:
+            conn.close()
+
+    def stamp_rejection_seed(self, established_by: str) -> None:
+        """Records that the rejection backlog covers the rejection index's expected set.
+
+        The standalone-connection twin of :func:`write_rejection_seed`, mirroring
+        :meth:`stamp_embedding_seed`. Re-stamping replaces the existing row. Its
+        callers are ``reconcile_embeddings`` (when it queued a missing owner) and
+        ``MitosProseImporter.import_from_file`` (an import into a graph that held no
+        decision).
+
+        Args:
+            established_by: The verb that established coverage — one of
+                ``migrations.REJECTION_SEED_ESTABLISHED_BY``.
+
+        Raises:
+            DatabaseError: If the write fails, including the ``CHECK`` refusing an
+                ``established_by`` outside the declared vocabulary.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                write_rejection_seed(conn, established_by)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to stamp the rejection seed marker "
+                f"(established_by must be one of "
+                f"{', '.join(REJECTION_SEED_ESTABLISHED_BY)}): {str(e)}"
+            )
+        finally:
+            conn.close()
+
+    def rejection_seed(self) -> Optional[Dict[str, str]]:
+        """Returns the rejection index's seed marker, or None when none stands.
+
+        Mirrors :meth:`embedding_seed`: any unreadable state, a graph without the
+        rung included, reads as absent, which is the safe answer to "may this write
+        create the collection?".
+
+        Returns:
+            ``{"established_by": …, "established_at": …}`` as plain strings, or
+            ``None``.
+        """
+        try:
+            conn = self._get_connection()
+        except DatabaseError:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT established_by, established_at FROM rejection_seed WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "established_by": row["established_by"],
+                "established_at": row["established_at"],
+            }
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def clear_rejection_seed(self, *, established_at: Optional[str] = None) -> None:
+        """Drops the rejection index's seed marker.
+
+        Mirrors :meth:`clear_embedding_seed`, including the stamp compare: given the
+        ``established_at`` the caller read, it spends only that marker, so one
+        re-stamped meanwhile survives.
+
+        Args:
+            established_at: The stamp of the marker to spend, compared exactly. None
+                deletes whatever marker stands.
+
+        Raises:
+            DatabaseError: If the delete fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                if established_at is None:
+                    conn.execute("DELETE FROM rejection_seed WHERE id = 1")
+                else:
+                    conn.execute(
+                        "DELETE FROM rejection_seed WHERE id = 1 AND established_at = ?",
+                        (established_at,),
+                    )
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to clear the rejection seed marker: {str(e)}")
         finally:
             conn.close()
 
@@ -3021,12 +4176,20 @@ class GraphStore:
             A mapping of node_id -> {reverse_key: [modifier_slug, ...]}. Only nodes
             that actually have modifiers appear, and each carries only the
             reverse-relation keys that are non-empty (an unmodified node is absent).
+
+        Raises:
+            DatabaseError: If the read fails. Typed, so a ranked read's stamp fault
+                costs the stamps alone (``retrieval_walk`` catches exactly this).
         """
         if not node_ids:
             return {}
         conn = self._get_connection()
         try:
             return self._modifiers_map(conn, node_ids)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read modifiers for {len(node_ids)} node(s): {str(e)}"
+            )
         finally:
             conn.close()
 
@@ -3043,6 +4206,209 @@ class GraphStore:
             node is unmodified.
         """
         return self.get_modifiers_map([node_id]).get(node_id, {})
+
+    def _walk_kill_chains(
+        self, conn: sqlite3.Connection, node_ids: List[str]
+    ) -> Tuple[Dict[str, KillChain], Dict[str, str]]:
+        """Walks every seed's kill chain forward, in ONE statement plus memory.
+
+        The shared primitive behind :meth:`get_live_ends` (and any later reader
+        that needs ``reached`` — PATTERNS "One walk, N call-sites"). A recursive CTE
+        seeded by ``node_ids`` follows each kill edge ``target_id = current`` to its
+        ``source_id`` and returns every reached kill edge with its source's slug and
+        liveness. ``UNION`` over ``(seed, node)`` rows, never ``UNION ALL``: set
+        semantics is what makes the recursion terminate on an out-of-band cycle.
+
+        Liveness is the one atom, composed on the alias: a source is live iff no
+        kill edge targets it — ``_KILL_EDGE_TYPES_SQL`` spelled out against
+        ``e.source_id`` as ``_modifiers_map``'s source gate does, never
+        ``_ACTIVE_VIEW_PREDICATE`` (it binds the unaliased ``nodes``, so inside this
+        aliased join it would correlate on nothing and call every node live — the
+        alias trap). No ``signals`` read: drifted is live.
+
+        The outer join is a ``CROSS JOIN`` on purpose: it pins SQLite's join order so
+        the read drives from the chain rows into ``idx_edges_target``. Left to the
+        planner, it scanned every edge and probed the chain (measured on the 50,000-
+        decision burial graph: 24.5 ms for five seeds, against 0.4 ms pinned).
+
+        The chain analysis is an iterative three-colour DFS over the fetched edge
+        set (``_walk_mutation_lineage``'s idiom), so a cycle is detected rather
+        than walked forever, and a convergent DAG is not mistaken for one.
+
+        Args:
+            conn: An open connection (the caller owns its lifecycle).
+            node_ids: The seeds; repeats and ids naming no node are harmless (an
+                unknown id has no chain and gets an empty :class:`KillChain`).
+
+        Returns:
+            ``(chains, slugs)``: seed id → :class:`KillChain` for every distinct
+            seed, and node id → slug for every node any chain reached.
+
+        Raises:
+            sqlite3.Error: From the statement; the public readers wrap it.
+        """
+        seeds = list(dict.fromkeys(node_ids))
+        placeholders = ",".join("?" for _ in seeds)
+        rows = conn.execute(
+            f"""
+            WITH RECURSIVE chain(seed, node) AS (
+                SELECT id, id FROM nodes WHERE id IN ({placeholders})
+                UNION
+                SELECT c.seed, e.source_id
+                FROM chain c
+                JOIN edges e ON e.target_id = c.node
+                WHERE e.edge_type IN {_KILL_EDGE_TYPES_SQL}
+            )
+            SELECT c.seed AS seed, e.target_id AS target_id,
+                   e.source_id AS source_id, n.slug AS slug,
+                   NOT EXISTS (
+                       SELECT 1 FROM edges k
+                       WHERE k.target_id = e.source_id
+                         AND k.edge_type IN {_KILL_EDGE_TYPES_SQL}
+                   ) AS live
+            FROM chain c
+            CROSS JOIN edges e ON e.target_id = c.node
+            JOIN nodes n ON n.id = e.source_id
+            WHERE e.edge_type IN {_KILL_EDGE_TYPES_SQL}
+            """,
+            seeds,
+        ).fetchall()
+        killers_of: Dict[str, Dict[str, Set[str]]] = {seed: {} for seed in seeds}
+        live: Set[str] = set()
+        slugs: Dict[str, str] = {}
+        for row in rows:
+            killers_of[row["seed"]].setdefault(row["target_id"], set()).add(
+                row["source_id"]
+            )
+            slugs[row["source_id"]] = row["slug"]
+            if row["live"]:
+                live.add(row["source_id"])
+
+        _WHITE, _GRAY, _BLACK = 0, 1, 2
+        chains: Dict[str, KillChain] = {}
+        for seed in seeds:
+            adjacency = {node: sorted(ks) for node, ks in killers_of[seed].items()}
+            fan_out = any(len(ks) > 1 for ks in adjacency.values())
+            cycle = False
+            reached: List[str] = []
+            color: Dict[str, int] = {seed: _GRAY}
+            stack: List[Tuple[str, Any]] = [(seed, iter(adjacency.get(seed, [])))]
+            while stack:
+                node, killers = stack[-1]
+                descended = False
+                for killer in killers:
+                    state = color.get(killer, _WHITE)
+                    if state == _GRAY:
+                        cycle = True
+                        continue
+                    if state == _BLACK:
+                        continue
+                    color[killer] = _GRAY
+                    reached.append(killer)
+                    stack.append((killer, iter(adjacency.get(killer, []))))
+                    descended = True
+                    break
+                if not descended:
+                    color[node] = _BLACK
+                    stack.pop()
+            anomaly = "cycle" if cycle else ("fan_out" if fan_out else None)
+            chains[seed] = KillChain(
+                killers=list(adjacency.get(seed, [])),
+                reached=reached,
+                live_ends=sorted(n for n in reached if n in live),
+                anomaly=anomaly,
+            )
+        return chains, slugs
+
+    def get_kill_chains(
+        self, node_ids: List[str]
+    ) -> Tuple[Dict[str, KillChain], Dict[str, str]]:
+        """Walks every seed's kill chain forward, typed: the walk's public face.
+
+        :meth:`_walk_kill_chains` over its own connection, in chunks of
+        ``_POINT_ID_CHUNK`` seeds (one ``?`` per seed, so a long list stays under
+        SQLite's variable floor), with ``sqlite3.Error`` wrapped. A reader that needs
+        ``reached`` (the record pause's exemption) calls this; a reader that needs only
+        the live ends calls :meth:`get_live_ends`, and :func:`live_ends_from_chains`
+        turns this result into that one, so the rule exists once.
+
+        Args:
+            node_ids: The seeds; ``[]`` reads nothing. Repeats and unknown ids are
+                harmless (an unknown or live id gets an empty :class:`KillChain`).
+
+        Returns:
+            ``(chains, slugs)``: seed id → :class:`KillChain` for every distinct seed,
+            and node id → slug for every node any chain reached.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        if not node_ids:
+            return {}, {}
+        seeds = list(dict.fromkeys(node_ids))
+        chains: Dict[str, KillChain] = {}
+        slugs: Dict[str, str] = {}
+        conn = self._get_connection()
+        try:
+            for start in range(0, len(seeds), _POINT_ID_CHUNK):
+                part, part_slugs = self._walk_kill_chains(
+                    conn, seeds[start:start + _POINT_ID_CHUNK])
+                chains.update(part)
+                slugs.update(part_slugs)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read kill chains for {len(seeds)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        return chains, slugs
+
+    def get_live_ends(self, node_ids: List[str]) -> Dict[str, List[str]]:
+        """For each id whose kill chain passes through a retired successor, the live ends it reaches.
+
+        A retired decision's ``superseded_by`` / ``corrected_by`` stamps are write
+        facts: they name its **immediate** killer whatever that killer's state, so
+        on a chain they name a dead hop. This read follows the chain to where the
+        current word lives. One batched statement for the whole list
+        (:meth:`_walk_kill_chains`), then the result rule, which lives in
+        :func:`live_ends_from_chains` so a reader that walked for ``reached`` applies
+        the same rule without a second walk.
+
+        Result rule: a seed appears **only** when some immediate killer is itself
+        retired. A seed whose killers are all live is absent, because its stamps
+        already name the live end; so is a live seed (it has no killer). The value
+        lists every live end the walk reached, sorted by ``slug.casefold()`` then
+        slug, or ``[]`` when the walk reached none (a cycle with no exit).
+
+        A fan-out (a node with two or more killers) or a cycle can only be authored
+        out of band (ADR ``kill-edge-acyclicity-requires-active-source``). Each
+        anomalous seed gets one ``logger.warning`` naming it, the anomaly and the
+        heal, and the read still answers: non-fatal, never a raise (ADR
+        ``get-lineage-cycle-bound-is-nonfatal-partial-return-not-abort``).
+
+        Args:
+            node_ids: The retired nodes to follow; ``[]`` reads nothing.
+
+        Returns:
+            Node id → live-end slugs, for the admitted seeds only.
+
+        Raises:
+            DatabaseError: If the read fails. Typed, so a ranked read's live-end
+                fault joins its stamp fault (``retrieval_walk`` catches exactly
+                this).
+        """
+        if not node_ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            chains, slugs = self._walk_kill_chains(conn, node_ids)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read live ends for {len(node_ids)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        return live_ends_from_chains(chains, slugs)
 
     def get_contradictions(self, node_id: str) -> List[Dict[str, str]]:
         """Returns the nodes that contradict ``node_id``, from EITHER direction.
@@ -3109,9 +4475,10 @@ class GraphStore:
     ) -> Tuple[List[str], Optional[str]]:
         """Walks the transitive mutation-union ancestry outward from ``start_id``.
 
-        The ONE shared walk behind both :meth:`get_lineage` (read) and the
-        write-time cycle-rejection guard in :meth:`_reconcile_edges` (the vision's
-        "one walk, two call-sites", §4.3). Follows ``start_id``'s OUTGOING mutation
+        The ONE shared walk behind the read path — :meth:`get_lineage` and its
+        batched id-only twin :meth:`get_lineage_ids` (7c) — and the write-time
+        cycle-rejection guard in :meth:`_reconcile_edges` (the vision's "one walk, two
+        call-sites", §4.3). Follows ``start_id``'s OUTGOING mutation
         edges (``supersedes`` ∪ ``amends`` ∪ ``narrows`` — ``_MUTATION_EDGE_FIELDS``;
         ``corrects`` excluded, Decision 2) transitively: mutation edges point
         new→old, so an ancestor is an older node a chain of mutations descends from.
@@ -3230,23 +4597,7 @@ class GraphStore:
             cursor = conn.cursor()
             ancestor_ids, cycle_node = self._walk_mutation_lineage(cursor, node_id)
             if cycle_node is not None:
-                # Loud, non-fatal: the supported write path never authors a mutation
-                # cycle (the write-time reachability guard rejects every cycle-closer),
-                # so this is an out-of-band / corrupt edge. Name the node and surface
-                # the repair path; do NOT raise (the hot ``record`` path stays
-                # crash-safe over a corrupt graph).
-                logger.warning(
-                    "get_lineage: mutation cycle detected while walking lineage of "
-                    "node %s — the cycle closes at node %s. Returning the partial "
-                    "lineage (%d ancestor(s)) walked before the bound fired. The "
-                    "supported write path never authors a mutation cycle; this is an "
-                    "out-of-band or corrupt edge — rebuild the derivative graph from "
-                    "the markdown corpus (decisions.md and decisions/archive/, the "
-                    "authoritative source) with `mitos rebuild`.",
-                    node_id,
-                    cycle_node,
-                    len(ancestor_ids),
-                )
+                _warn_lineage_cycle(node_id, cycle_node, len(ancestor_ids))
             if not ancestor_ids:
                 return []
             # Hydrate the ancestor ids → identity dicts. ``id`` is the globally-unique
@@ -3262,6 +4613,51 @@ class GraphStore:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+    def get_lineage_ids(self, node_ids: List[str]) -> Dict[str, List[str]]:
+        """Returns each seed's transitive mutation ancestor ids, batched (7c).
+
+        :meth:`_walk_mutation_lineage` per distinct seed, over one connection and one
+        cursor: the same walk as :meth:`get_lineage`, ids only, with no hydration
+        query. The record pause's sibling note (``descends_from_declared``) reads it
+        from the shown live neighbours, comparing ids it already holds.
+
+        The cycle reaction is :meth:`get_lineage`'s, through the same helper: tolerate,
+        truncate, warn loudly naming the node, and return what was walked. Unlike
+        :meth:`get_lineage`, a failed read is typed here (``sqlite3.Error`` →
+        ``DatabaseError``), as :meth:`get_kill_chains` types it.
+
+        Args:
+            node_ids: The seeds; ``[]`` reads nothing and opens no connection. Repeats
+                are harmless.
+
+        Returns:
+            Seed id → its ancestor ids in first-seen depth-first order, seed excluded,
+            for every distinct seed; ``[]`` for a seed with no ancestors or an unknown
+            id.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        if not node_ids:
+            return {}
+        seeds = list(dict.fromkeys(node_ids))
+        lineage: Dict[str, List[str]] = {}
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            for seed in seeds:
+                ancestor_ids, cycle_node = self._walk_mutation_lineage(cursor, seed)
+                if cycle_node is not None:
+                    _warn_lineage_cycle(seed, cycle_node, len(ancestor_ids))
+                lineage[seed] = ancestor_ids
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read the mutation lineage of {len(seeds)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        return lineage
 
     def get_unregistered_mechanisms(self, parsed: ParsedEntry) -> List[str]:
         """Returns the subset of ``parsed``'s mechanism refs NOT yet in the registry.
@@ -3516,28 +4912,69 @@ class GraphStore:
         finally:
             conn.close()
 
-    def claim_pending_embeddings(self, drainer_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Reads a batch of pending embeddings to drain (V1a single-writer semantics).
+    def claim_pending_embeddings(
+        self,
+        drainer_id: str,
+        limit: int = 10,
+        *,
+        after: Optional[Tuple[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Reads the next rows to drain, in queue order (V1a single-writer semantics).
 
-        Aligned to V1a (Phase 8a): the prototype's ``claimed_by`` claim machinery
-        (UPDATE ... RETURNING) defers to V3b (§5.2.8) — V1a is single-writer
-        (``busy_timeout``), so a plain ordered SELECT is the whole contract. The
-        returned rows carry NO ``embedding_text`` (the column is gone, C2/M8); the
-        drainer re-derives it per node. ``drainer_id`` is retained for surface
-        stability (R12) and is unused under single-writer semantics.
+        A plain ordered ``SELECT`` over ``(queued_at, node_id)`` — not a claim. The
+        prototype's ``claimed_by`` machinery (UPDATE ... RETURNING) defers to V3b
+        (§5.2.8); V1a is single-writer (``busy_timeout``), so nothing is reserved and
+        two concurrent drainers can both read a row. ``node_id`` breaks ties because a
+        ``rebuild`` replay can give many rows one ``queued_at`` stamp.
+
+        ``after`` is a keyset cursor: with it, only rows strictly after that
+        ``(queued_at, node_id)`` key are returned, by the same order. The drain walks
+        the backlog this way, so a row that failed (and so kept its ``queued_at``)
+        is passed rather than re-read, and the parameter list stays two values long
+        at any backlog size. The keyset is a row-value comparison so that SQLite seeks
+        ``idx_pending_embeddings_queue`` (ladder step 5) to the cursor; the equivalent
+        ``queued_at > ? OR (queued_at = ? AND …)`` spelling walks the index from its
+        head on every claim. The returned rows carry NO ``embedding_text`` (the column
+        is gone, C2/M8); the drainer re-derives it per node. ``drainer_id`` is
+        retained for surface stability (R12) and is unused.
+
+        Args:
+            drainer_id: Unused (R12).
+            limit: The most rows to return.
+            after: The last ``(queued_at, node_id)`` key already walked, or None to
+                read from the head of the queue.
+
+        Returns:
+            Up to ``limit`` rows ``{"node_id", "queued_at", "retry_count"}``.
+
+        Raises:
+            DatabaseError: If the read fails.
         """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT node_id, queued_at, retry_count
-                FROM pending_embeddings
-                ORDER BY queued_at
-                LIMIT ?
-                """,
-                (limit,)
-            )
+            if after is None:
+                cursor.execute(
+                    """
+                    SELECT node_id, queued_at, retry_count
+                    FROM pending_embeddings
+                    ORDER BY queued_at, node_id
+                    LIMIT ?
+                    """,
+                    (limit,)
+                )
+            else:
+                queued_at, node_id = after
+                cursor.execute(
+                    """
+                    SELECT node_id, queued_at, retry_count
+                    FROM pending_embeddings
+                    WHERE (queued_at, node_id) > (?, ?)
+                    ORDER BY queued_at, node_id
+                    LIMIT ?
+                    """,
+                    (queued_at, node_id, limit)
+                )
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to claim pending embeddings: {str(e)}")

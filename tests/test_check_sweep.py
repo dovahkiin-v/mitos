@@ -24,6 +24,7 @@ are REAL content hashes); zero LLM, zero telemetry, zero writes. Run under
 ``./venv/bin/python -m pytest`` (bare ``python`` lacks the deps).
 """
 
+import hashlib
 import os
 import tempfile
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,7 @@ from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
 
 from _conflict_helpers import _keyed_substrate, _match
+from _point_hits import point_hit
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +288,8 @@ def test_declared_strong_neighbour_never_shadows_an_undeclared_conflict(
         store=temp_store,
         top_k=1,
     )
-    assert [c.node["id"] for c in result] == [id_undeclared]
+    assert [c.node["id"] for c in result.result] == [id_undeclared]
+    assert result.gather_cut is False
 
 
 # --------------------------------------------------------------------------- #
@@ -584,10 +587,13 @@ class _EdgeFaultStore:
 
 
 class _ReVerifyFaultStore:
-    """Gather's S3 re-verify read raises — a graph fault, not semantic degradation."""
+    """Gather's resolver read raises — a graph fault, not semantic degradation."""
 
-    def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+    def resolve_point_ids(self, point_ids: List[str]) -> Any:
         raise DatabaseError("graph read failed mid-sweep")
+
+    def get_modifiers_map(self, node_ids: List[str]) -> Any:
+        raise AssertionError("the resolver faulted first")
 
 
 def test_get_edges_fault_propagates_from_snapshot_corpus() -> None:
@@ -598,13 +604,16 @@ def test_get_edges_fault_propagates_from_snapshot_corpus() -> None:
 
 
 def test_gather_internal_store_fault_propagates_out_of_iter_sweep() -> None:
-    """§9-11b: a graph-store fault inside gather's re-verify propagates out of the
+    """§9-11b: a graph-store fault inside gather's resolver read propagates out of the
     sweep — never converted to ``Unavailable`` (KD5: only the two semantic-substrate
     faults degrade)."""
     node = _pure_node("hash-a", "fault-a")
     snapshot = CorpusSnapshot(nodes=(node,), edge_index=build_strong_edge_index([]))
+    # The store is a fault double holding no graph, so the hit is authored raw: a
+    # point naming a node (id derived, never hardcoded) whose re-verify read faults.
+    neighbour_id = hashlib.sha256(b"neighbour").hexdigest()
     embed, vector = _keyed_substrate(
-        {node["core_axiom"]: [_match("neighbour", 0.9)]}
+        {node["core_axiom"]: [point_hit(neighbour_id, 0.9, slug="neighbour")]}
     )
     with pytest.raises(DatabaseError):
         list(
@@ -637,11 +646,11 @@ class _CountingReadsStore:
         self.edges_calls += 1
         return self._inner.get_edges()
 
-    def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        return self._inner.get_node_by_slug(slug)
+    def resolve_point_ids(self, point_ids: List[str]) -> Any:
+        return self._inner.resolve_point_ids(point_ids)
 
-    def get_node_state(self, node_id: str) -> str:
-        return self._inner.get_node_state(node_id)
+    def get_modifiers_map(self, node_ids: List[str]) -> Any:
+        return self._inner.get_modifiers_map(node_ids)
 
 
 def test_snapshot_reads_the_store_exactly_once_each(temp_store: GraphStore) -> None:

@@ -28,10 +28,12 @@ from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
 from mitos.parser import ParsedEntry
-from mitos.recall import assess_query_recall
+from mitos.recall import absence_clause, assess_query_recall
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer, assemble_render
+
+from _point_hits import CannedVector
 
 
 @pytest.fixture
@@ -243,20 +245,13 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    """Stand-in vector store — replays a fixed ranked match list.
+class _FakeVector(CannedVector):
+    """Stand-in vector store — replays a fixed ranked match list through the shared leaf.
 
     Records the ``limit`` it was last called with (so a test can prove ``--limit``
     threads through un-truncated) and slices its match list to ``[:limit]`` (so a
-    test can prove a lowered ``--limit`` trims and a raised one does not no-op)."""
-
-    def __init__(self, matches):
-        self._matches = matches
-        self.last_limit = None
-
-    def query(self, vector, limit: int = 5):
-        self.last_limit = limit
-        return self._matches[:limit]
+    test can prove a lowered ``--limit`` trims and a raised one does not no-op); every
+    hit carries its node's ``point_id``."""
 
 
 def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
@@ -316,18 +311,19 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
 def test_modifiers_survive_brief_trim(ws) -> None:
     """The staleness flag is ALWAYS attached — even on a brief payload where
     rejected_paths is trimmed. A lightweight scan that lost the heavy field still needs
-    to know the axiom has been moved on from."""
-    from mitos import mcp_server
+    to know the axiom has been moved on from. (2g: the degraded scope dump, the path
+    that used `_decision_payload(store=)`, is `degraded.scope_dump`.)"""
+    from mitos.degraded import scope_dump
     config, m = ws
-    _rec(m, "hot")
-    _rec(m, "hot-v2", amends="hot")
+    _rec(m, "hot", scope=["heat"])
+    _rec(m, "hot-v2", scope=["other"], amends="hot")
     store = GraphStore(config.db_path, read_only=True)
-    node = store.get_node_by_slug("hot")
 
-    brief = mcp_server._decision_payload(node, 1.0, brief=True, store=store)
+    brief = scope_dump(store, "heat", limit=None, full_top=0).decisions[0]
+    assert brief["slug"] == "hot"
     assert "rejected_paths" not in brief and brief["amended_by"] == ["hot-v2"]
 
-    full = mcp_server._decision_payload(node, 1.0, brief=False, store=store)
+    full = scope_dump(store, "heat", limit=None, full_top=None).decisions[0]
     assert full["rejected_paths"] and full["amended_by"] == ["hot-v2"]
 
 
@@ -791,11 +787,16 @@ def test_cli_query_filters_superseded_and_stamps(ws, capsys) -> None:
     assert target["amended_by"] == ["q-amender"]
     assert target["rejected_paths"]
 
-    # text: dead-v1 omitted, q-target's ⚠ marker shown.
+    # text: dead-v1 is no ranked match, q-target's ⚠ marker shown. Since 2f the
+    # retired decision the ranking passed is named — in its own partition block and
+    # the lead (it outranked the top live hit), never as a numbered match.
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
     out = capsys.readouterr().out
-    assert "dead-v1" not in out
+    ranked = [ln for ln in out.splitlines() if ln[:1].isdigit() and ". " in ln]
+    assert ranked and all("dead-v1" not in ln for ln in ranked)
+    block = out.split("Retired decisions this ranking passed")[1].split("→ ")[0]
+    assert "dead-v1" in block and "superseded_by: dead-v2" in block
     assert "q-target" in out and "⚠" in out and "amended by" in out and "q-amender" in out
 
 
@@ -869,8 +870,11 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
-    _, band_note = assess_query_recall(lever=None, top_score=None, result_count=0,
-                                       config=config, surface="cli")
+    _, legend = assess_query_recall(top_score=None, result_count=0,
+                                    config=config, surface="cli")
+    # 6b: the miss's note is its legend, then the absence clause.
+    band_note = f"{legend} " + absence_clause(register="query", surface="cli",
+                                              config=config, scope=None)
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],
                     "project": config.project,
@@ -883,6 +887,16 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
     assert "No matching decisions found." in capsys.readouterr().out
+
+
+def _dead_v1_handle(m) -> dict:
+    """The blackout handle of ``dead-v1`` at 0.9, superseded by the live ``dead-v2``.
+
+    2f rewrote these four rows on intent: the handle gained the node's ``id`` and the
+    hit's ``score``; its successor is live, so no ``live_end`` (the stamp names it).
+    """
+    return {"slug": "dead-v1", "id": m.store.resolve_slug("dead-v1")[0],
+            "state": "superseded", "score": 0.9, "superseded_by": ["dead-v2"]}
 
 
 def test_cli_query_blackout_vector(ws, capsys) -> None:
@@ -900,7 +914,7 @@ def test_cli_query_blackout_vector(ws, capsys) -> None:
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
     assert resp["matches"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
 
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
@@ -909,22 +923,38 @@ def test_cli_query_blackout_vector(ws, capsys) -> None:
     assert "dead-v1" in out and "dead-v2" in out and "superseded" in out
 
 
+def _deep_corpus(store: GraphStore, n: int = 51) -> list:
+    """Commits ``n`` live decisions (``deep-0..``) and returns their canned matches,
+    best first — more live decisions than any clamped ``limit`` can ask for."""
+    for i in range(n):
+        e = ParsedEntry("decision", f"deep-{i}", 1, 5)
+        e.axiom = f"Deep decision {i}."
+        e.rejected_paths = "Rejected the obvious alternative."
+        e.scope = ["x"]
+        store.commit_parsed_entry(e)
+    return [{"slug": f"deep-{i}", "score": 0.9 - i * 0.001} for i in range(n)]
+
+
 def test_cli_query_limit_threads_through(ws, capsys) -> None:
-    """`--limit` SETS the top-k: a value above the default-5 must reach
-    vector_store.query un-truncated (the §6 no-op-above-default trap), a low value
-    trims, and out-of-range values clamp calmly to [1, RANKED_LIMIT_CEILING]."""
+    """`--limit` SETS the window: above the default-5 it deepens it un-truncated (the
+    §6 no-op-above-default trap), a low value trims, and out-of-range values clamp
+    calmly to [1, RANKED_LIMIT_CEILING]. Since 2c the vector call is always at the
+    over-fetch bound, so the window is what `limit` sets: 51 live decisions in the
+    fetch yield exactly the clamped count."""
     from mitos.display import RANKED_LIMIT_CEILING
+    from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND
     config, m = ws
-    _rec(m, "q-target", scope=["x"])
-    store = GraphStore(config.db_path, read_only=True)
+    canned = _deep_corpus(m.store)
 
     for requested, expected in [(20, 20), (3, 3), (999, RANKED_LIMIT_CEILING), (0, 1), (None, 5)]:
-        fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
-        stub = _StubManager(store, _FakeEmbed(), fake_vec)
+        fake_vec = _FakeVector(list(canned))
+        stub = _StubManager(m.store, _FakeEmbed(), fake_vec)
         with patch("mitos.cli.MitosSyncManager", return_value=stub):
             cmd_query(config, "a claim that is not any slug", as_json=True, limit=requested)
-        capsys.readouterr()
-        assert fake_vec.last_limit == expected, f"--limit {requested} → {fake_vec.last_limit}, want {expected}"
+        resp = json.loads(capsys.readouterr().out)
+        assert [h["slug"] for h in resp["matches"]] == [f"deep-{i}" for i in range(expected)], \
+            f"--limit {requested} → {len(resp['matches'])}, want {expected}"
+        assert fake_vec.calls == [(RANKED_OVERFETCH_BOUND, False)]
 
 
 def test_cli_surface_blackout_vector(ws, capsys) -> None:
@@ -941,7 +971,7 @@ def test_cli_surface_blackout_vector(ws, capsys) -> None:
         cmd_surface(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
     assert resp["active_decisions"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
     assert "dead-v1" in resp["note"]
 
 
@@ -981,7 +1011,7 @@ def test_mcp_query_blackout_vector(ws) -> None:
         resp = json.loads(mcp_server.query_decisions("a claim that is not any slug",
             project=config.workspace_dir))
     assert resp["matches"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
 
 
 def test_mcp_surface_blackout_vector(ws) -> None:
@@ -997,30 +1027,37 @@ def test_mcp_surface_blackout_vector(ws) -> None:
         resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug",
             project=config.workspace_dir))
     assert resp["active_decisions"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
 
 
 def test_mcp_limit_threads_through(ws) -> None:
-    """The MCP `limit` arg SETS the top-k threaded to vector_store.query; clamps calmly."""
+    """The MCP `limit` arg SETS the window on both ranked tools; clamps calmly. The
+    vector call is at the over-fetch bound (see the CLI twin above)."""
     from mitos import mcp_server
     from mitos.display import RANKED_LIMIT_CEILING
+    from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND
     config, m = ws
-    _rec(m, "q-target", scope=["x"])
+    canned = _deep_corpus(m.store)
     store = GraphStore(config.db_path, read_only=True)
 
     for requested, expected in [(20, 20), (3, 3), (999, RANKED_LIMIT_CEILING), (0, 1)]:
-        fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
+        want = [f"deep-{i}" for i in range(expected)]
+        fake_vec = _FakeVector(list(canned), store=store)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec)):
-            mcp_server.query_decisions("a claim that is not any slug", limit=requested,
-                project=config.workspace_dir)
-        assert fake_vec.last_limit == expected
-        fake_vec2 = _FakeVector([{"slug": "q-target", "score": 0.8}])
+            resp = json.loads(mcp_server.query_decisions(
+                "a claim that is not any slug", limit=requested,
+                project=config.workspace_dir))
+        assert [h["slug"] for h in resp["matches"]] == want
+        assert fake_vec.calls == [(RANKED_OVERFETCH_BOUND, False)]
+        fake_vec2 = _FakeVector(list(canned), store=store)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec2)):
-            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested,
-                project=config.workspace_dir)
-        assert fake_vec2.last_limit == expected
+            resp = json.loads(mcp_server.surface_decisions(
+                query="a claim that is not any slug", limit=requested,
+                project=config.workspace_dir))
+        assert [h["slug"] for h in resp["active_decisions"]] == want
+        assert fake_vec2.calls == [(RANKED_OVERFETCH_BOUND, False)]
 
 
 def test_cli_mcp_blackout_parity(ws) -> None:

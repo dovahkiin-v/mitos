@@ -4,12 +4,19 @@ This module defines Protocol classes for GraphStore, VectorStore, and
 EmbeddingProvider to decouple Mitos components and support seamless swap-ins.
 """
 
-from typing import Protocol, List, Dict, Optional, Any, Tuple, Set
+from typing import (Protocol, List, Dict, Optional, Any, FrozenSet, Tuple, Set, Iterable,
+                    Sequence)
 from mitos.parser import ParsedEntry
+from mitos.retrieval_walk import PointResolution
 from mitos.store import CommitDelta
+from mitos.vector_store import RejectionPoint, RejectionSearch
 
 class EmbeddingProvider(Protocol):
     """Protocol for cache-aware, prefix-based text embedding providers."""
+
+    # The resolved embedding model id (``MITOS_MODEL_OVERRIDE_EMBEDDING``
+    # honoured). The rejection index stamps it on every point it writes.
+    model_id: str
 
     def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
         """Gets embedding vector for a single text.
@@ -23,14 +30,18 @@ class EmbeddingProvider(Protocol):
         """
         ...
 
-    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Gets embedding vectors for a batch of texts.
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Embeds document texts in one provider call, bypassing the cache.
 
         Args:
-            texts: List of text blocks.
+            texts: At most one batch of unprefixed document texts.
 
         Returns:
-            List of embedding vectors.
+            One non-empty vector per text, in order; ``[]`` for empty input.
+
+        Raises:
+            ValueError: If the batch exceeds the declared bounds.
+            EmbeddingError: If the call fails or the answer is malformed.
         """
         ...
 
@@ -58,8 +69,9 @@ class VectorStore(Protocol):
             point_id: The SHA-256 node ID.
             vector: The embedding vector values.
             payload: Node metadata.
-            may_create: Whether this write covers the workspace's active set and may
-                therefore bring an absent index into existence. Required and
+            may_create: Whether this write covers the decision index's expected set
+                (every decision plus the active open questions) and may therefore
+                bring an absent index into existence. Required and
                 keyword-only — every write site declares (see
                 :meth:`~mitos.vector_store.QdrantVectorStore.upsert`).
         """
@@ -69,18 +81,30 @@ class VectorStore(Protocol):
         self,
         vector: List[float],
         limit: int = 5,
+        *,
+        with_payload: bool = True,
     ) -> List[Dict[str, Any]]:
         """Queries for the semantically nearest vectors.
 
         Recall is scope-blind by contract — scope is a downstream discoverability
         hint, never a recall filter (see :meth:`QdrantVectorStore.query`).
 
+        Every hit carries ``point_id``, the index's own id for the point as a
+        string — for a mitos write, ``hash_to_uuid(node_id)``, never the 64-hex
+        node id itself (unlike :meth:`upsert`'s ``point_id`` argument). It is the
+        hit's identity; :meth:`GraphStoreProtocol.resolve_point_ids` maps it to its
+        node. A hit with no id is a protocol fault, raised, never a hit.
+
         Args:
             vector: The query embedding vector.
             limit: Maximum matches to return.
+            with_payload: True (the default) gives
+                ``{point_id, slug, scope, state, kind, embedding_text, score}``
+                per hit; False gives exactly ``{point_id, score}``, with no
+                payload key at all.
 
         Returns:
-            A list of dictionary results with payload and scores.
+            A list of hit dicts in ranked order.
         """
         ...
 
@@ -95,6 +119,120 @@ class VectorStore(Protocol):
         """
         ...
 
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes exactly these points, by the index's own ids; confirmed or raised.
+
+        The ids are the strings :meth:`list_point_ids` returns, never re-hashed —
+        unlike :meth:`upsert`'s ``point_id`` argument, which is a node id. A point
+        whose node has left the graph has only its listed id to be named by. Empty
+        input sends nothing. Nothing is swallowed and nothing is created (see
+        :meth:`~mitos.vector_store.QdrantVectorStore.delete_points`).
+
+        Args:
+            point_ids: The listed point ids to delete.
+
+        Raises:
+            VectorStoreUnreachableError: If the index did not answer.
+            CollectionMissingError: If the index's collection does not exist.
+            VectorStoreError: If the index refused or did not confirm the delete.
+        """
+        ...
+
+
+
+class RejectionIndex(Protocol):
+    """Protocol for the rejection index: one point per rejected item, in a sibling collection.
+
+    Named apart from :class:`VectorStore` on purpose (``search`` and
+    ``upsert_points``, never ``query`` and ``upsert``): its ids are item UUIDs taken
+    as given, its payload is the owner and the model, and a rejection hit must
+    never be taken for a decision hit. Every method but ``search``'s time budget
+    types its failures one way: unreachable, missing collection, or refused (see
+    :class:`~mitos.vector_store.QdrantRejectionIndex`).
+    """
+
+    def search(
+        self, vector: List[float], limit: int, *, budget_seconds: float
+    ) -> RejectionSearch:
+        """Searches the nearest items under a caller-bounded wait.
+
+        Args:
+            vector: The query embedding.
+            limit: Maximum hits to return.
+            budget_seconds: The wait bound, in seconds.
+
+        Returns:
+            ``searched=True`` with hits in ranked order, or ``searched=False`` and
+            no hits when the wait ran over the budget or the budget was already
+            spent (not positive) — never a raise for either.
+        """
+        ...
+
+    def retrieve_present(self, point_ids: Sequence[str]) -> Set[str]:
+        """Returns the subset of these point ids the index holds.
+
+        Args:
+            point_ids: The ids to ask about. Empty sends nothing.
+
+        Returns:
+            The present ids, as strings.
+        """
+        ...
+
+    def list_owner_point_ids(self, owner_id: str, page_size: int = 256) -> Set[str]:
+        """Lists every point one owner holds.
+
+        Args:
+            owner_id: The owning decision's 64-hex node id.
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            The owner's point-id strings.
+        """
+        ...
+
+    def list_point_ids(self, page_size: int = 256) -> Set[str]:
+        """Lists every point id in the index.
+
+        Args:
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            Every point-id string in the index.
+        """
+        ...
+
+    def list_point_owners(self, page_size: int = 256) -> Dict[str, Optional[str]]:
+        """Lists every point id in the index with the owner its payload names.
+
+        Args:
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            ``{point_id: owner_id}``, the owner None when the payload names none.
+        """
+        ...
+
+    def upsert_points(
+        self, points: Sequence[RejectionPoint], *, model: str, may_create: bool
+    ) -> None:
+        """Writes items with their ids as given, each write confirmed.
+
+        Args:
+            points: The items to write. Empty sends nothing.
+            model: The embedding model id, recorded on every point.
+            may_create: Whether this write may create an absent collection.
+                Required and keyword-only — every write site declares.
+        """
+        ...
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes exactly these points by their ids; confirmed or raised.
+
+        Args:
+            point_ids: The point ids to delete. Empty sends nothing.
+        """
+        ...
 
 class GraphStoreProtocol(Protocol):
     """Protocol for the relational, SQLite-backed decision graph."""
@@ -110,6 +248,53 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             A list of matching node IDs.
+        """
+        ...
+
+    def resolve_point_ids(self, point_ids: Iterable[str]) -> PointResolution:
+        """Maps vector-index point ids to their nodes in one batched, state-agnostic read.
+
+        Each id is taken exactly as :meth:`VectorStore.query` returns it, normalized
+        by removing dashes and lowercasing, and must then be 32 hex characters: the
+        prefix of a 64-hex node id. Inputs are deduplicated by the raw string, and
+        every distinct raw string lands in exactly one bucket of the result:
+
+        - ``nodes``: the one node carrying that prefix, in the reader-facing shape
+          with ``computed_state`` (exactly :meth:`get_node_state`'s semantics) and
+          no modifier stamps — stamps are a separate read
+          (:meth:`get_modifiers_map`). Retired nodes resolve.
+        - ``orphans``: no node carries the prefix (or the id is malformed), found by
+          the read returning nothing — never by asking a node's state, which
+          answers ``"active"`` for an id the graph does not hold.
+        - ``ambiguous``: two or more nodes share the prefix; reported with their ids
+          and resolved to neither.
+
+        Args:
+            point_ids: Point ids as the vector index returned them.
+
+        Returns:
+            The partition of the input. Empty input runs no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ...
+
+    def resolve_point_states(self, point_ids: Iterable[str]) -> PointResolution:
+        """The light twin of :meth:`resolve_point_ids`: same partition, each node only
+        ``{"id", "kind", "computed_state"}``.
+
+        The ranked reads walk every hit on it and hydrate only what the answer shows
+        with :meth:`resolve_point_ids`.
+
+        Args:
+            point_ids: Point ids as the vector index returned them.
+
+        Returns:
+            The partition of the input, with light nodes. Empty input runs no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
         """
         ...
 
@@ -149,6 +334,60 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             The computed state string.
+        """
+        ...
+
+    def get_node_states(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Maps each id the graph holds to its computed state, in one batched read.
+
+        The same vocabulary as :meth:`get_node_state`, but an id the graph does
+        not hold is absent from the map rather than answered ``active``, so a
+        caller tests existence by membership.
+
+        Args:
+            node_ids: Content-hash node ids, exact (not point-id prefixes).
+
+        Returns:
+            Node id → computed state, for the held ids only.
+        """
+        ...
+
+    def get_active_decision_ids(self) -> FrozenSet[str]:
+        """Returns the ids of the active-view decisions, unhydrated.
+
+        The population ``check``'s corpus sweep judges (drifted included, unscoped),
+        read as ids only. ``check.probe_stale_index`` keeps a backlog row only when
+        its node is in this set.
+
+        Returns:
+            The active decision node ids.
+        """
+        ...
+
+    def get_decision_index_expected_ids(self) -> FrozenSet[str]:
+        """Returns the decision index's expected set, as ids, unhydrated.
+
+        Every decision node in every computed state plus the open questions that
+        survive Stage 1. ``recall.missing_index_is_a_gap`` reaches it by duck typing
+        from inside the check family's fence (``conflict.gather_candidates``), which
+        is why it is on this protocol; ``get_active_node_ids`` has no duck-typed
+        caller and stays off it.
+
+        Returns:
+            The node ids the decision index should hold a point for.
+        """
+        ...
+
+    def rejection_index_expects_items(self) -> bool:
+        """Reports whether some decision's ``rejected_paths`` holds at least one item.
+
+        True exactly when the rejection index's expected set is non-empty.
+        ``recall.missing_rejection_index_is_a_gap`` reaches it by duck typing, as
+        ``missing_index_is_a_gap`` reaches :meth:`get_decision_index_expected_ids`,
+        which is why it is on this protocol.
+
+        Returns:
+            True iff some decision's field enumerates an item.
         """
         ...
 
@@ -240,6 +479,33 @@ class GraphStoreProtocol(Protocol):
         Returns:
             A mapping of node_id -> {reverse_relation_key: [modifier_slug, ...]},
             containing only nodes that actually have modifiers.
+        """
+        ...
+
+    def get_live_ends(self, node_ids: List[str]) -> Dict[str, List[str]]:
+        """For each id whose kill chain passes through a retired successor, the live ends it reaches.
+
+        Args:
+            node_ids: The retired nodes to follow.
+
+        Returns:
+            Node id → live-end slugs, only for ids with a retired immediate
+            successor; ``[]`` when the chain reaches no live decision.
+        """
+        ...
+
+    def get_live_axioms(self, slugs: Sequence[str]) -> Dict[str, str]:
+        """Maps each slug naming a live decision now to that decision's axiom, in one read.
+
+        The stamp label map's read: matched by casefold through the active view,
+        keyed by the input spelling, values uncut.
+
+        Args:
+            slugs: Slugs as the stamps spell them.
+
+        Returns:
+            Input spelling → raw axiom, for each input naming exactly one live
+            decision.
         """
         ...
 

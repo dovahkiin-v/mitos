@@ -15,6 +15,7 @@ Facade fake ``node`` dicts are RICHER than 2b's ``{}`` — the facade hits
 (``candidate_payload`` → ``letter_payload``).
 """
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,11 @@ from mitos.conflict import (
 )
 from mitos.errors import EmbeddingError
 from mitos.parser import ParsedEntry
+from mitos.retrieval_walk import PointResolution
+from mitos.store import MODIFIER_EDGE_KEYS
+from mitos.vector_store import hash_to_uuid
+
+from _point_hits import CannedVector
 
 
 # --------------------------------------------------------------------------- #
@@ -46,6 +52,9 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+_STAMP_KEYS = frozenset(MODIFIER_EDGE_KEYS.values())
+
+
 class _FakeEmbed:
     """Returns a fixed document-space vector, or raises the configured error."""
 
@@ -58,27 +67,50 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    """Returns canned ``(slug, score)`` matches for the over-fetch query."""
+class _FakeVector(CannedVector):
+    """Returns canned ``(slug, score)`` matches for the over-fetch query.
 
-    def __init__(self, matches: List[Dict[str, Any]]) -> None:
-        self._matches = matches
-
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        return list(self._matches)
+    Routes through the shared canned-hit leaf, bound to the row's ``_FakeStore``,
+    so every hit carries the ``point_id`` of the node its slug names.
+    """
 
 
 class _FakeStore:
-    """Resolves slugs to hydrated nodes from a dict; every resolved node is ``active``."""
+    """Resolves point ids to nodes from a dict; every resolved node is ``active``.
+
+    Since 2d the gather reads a store through the walk's batched resolver plus one
+    stamp read, so this double answers both the way the real store does: the
+    resolver's node carries ``computed_state`` and no modifier stamps, and
+    ``get_modifiers_map`` returns each node's non-empty stamps (ledger entry-001).
+    """
 
     def __init__(self, nodes: Dict[str, Dict[str, Any]]) -> None:
         self._nodes = nodes
 
-    def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        return self._nodes.get(slug)
+    def resolve_slug(self, slug: str) -> List[str]:
+        """The canned leaf's slug derivation (every node, as the real store's)."""
+        node = self._nodes.get(slug)
+        return [node["id"]] if node is not None else []
 
-    def get_node_state(self, node_id: str) -> str:
-        return "active"
+    def resolve_point_ids(self, point_ids: List[str]) -> PointResolution:
+        by_point = {hash_to_uuid(n["id"]): n for n in self._nodes.values()}
+        nodes = {
+            pid: {**{k: v for k, v in by_point[pid].items() if k not in _STAMP_KEYS},
+                  "computed_state": "active"}
+            for pid in point_ids if pid in by_point
+        }
+        return PointResolution(nodes=nodes,
+                               orphans=[pid for pid in point_ids if pid not in nodes],
+                               ambiguous={})
+
+    def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
+        by_id = {n["id"]: n for n in self._nodes.values()}
+        stamps = {}
+        for node_id in node_ids:
+            held = {k: v for k, v in by_id[node_id].items() if k in _STAMP_KEYS and v}
+            if held:
+                stamps[node_id] = held
+        return stamps
 
 
 class _RecordingJudge:
@@ -105,7 +137,9 @@ def _node(slug: str, *, axiom: Optional[str] = None, scope: Optional[List[str]] 
           rejected: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
     """A hydrated store node carrying the keys the facade reads (+ optional modifier stamps)."""
     node = {
-        "id": f"id-{slug}",
+        # A content-hash-shaped id, derived from the slug (never hardcoded), so the
+        # canned leaf can build the hit's point id from it.
+        "id": hashlib.sha256(slug.encode("utf-8")).hexdigest(),
         "slug": slug,
         "kind": "decision",
         "core_axiom": axiom if axiom is not None else f"axiom for {slug}",
@@ -188,11 +222,12 @@ def _run(
     surface_threshold: float = 0.85,
 ) -> Any:
     """Drives the facade with hand-rolled fakes + explicit dials."""
+    fake_store = _FakeStore(nodes if nodes is not None else {})
     return run_conflict_check(
         entry if entry is not None else _entry(),
         embed_provider=embed if embed is not None else _FakeEmbed(),
-        vector_store=_FakeVector(matches if matches is not None else []),
-        store=_FakeStore(nodes if nodes is not None else {}),
+        vector_store=_FakeVector(matches if matches is not None else [], store=fake_store),
+        store=fake_store,
         judge=judge,
         floor=floor,
         top_k=top_k,

@@ -1329,8 +1329,9 @@ def test_a_sentinel_never_sits_inside_an_entrys_rotation_span() -> None:
     sentinel inside a span is carried into the archive while its partner stays behind.
     A stranded `<!-- ROTATED START` is an unterminated HTML comment, and
     `strip_html_comments` carries that state across lines — blanking every entry below
-    it for `parse_decisions_file`, the lexical fallback's only reader. Degraded search
-    would go silently blind over text sitting right there in the file.
+    it for `parse_decisions_file`, the prototype reader (the lexical fallback read
+    through it until 2g moved it to `parse_entry_stream`), which would go silently
+    blind over text sitting right there in the file.
 
     Excluding the sentinels from BOTH spans keeps the pair intact under any rotation
     order: whichever entry moves, the pair stays put wrapping nothing, which is a

@@ -206,7 +206,8 @@ def test_query_decisions_verb_choice_guidance_is_front_loaded():
 
 
 def test_query_decisions_states_the_band_axis_inside_the_head_window():
-    """The verb-choice redirect now carries WHICH QUESTION each band answers.
+    """The verb-choice redirect carries the question the band answers, which is
+    the same on both verbs: how this ranking did.
 
     A byte-count gate cannot see a trim that silently deletes the clause, so the
     content gets its own row. Asserted inside the 600-char window rather than
@@ -214,33 +215,102 @@ def test_query_decisions_states_the_band_axis_inside_the_head_window():
     later edit that moved it behind the window would leave the budget row green
     while the teaching left every truncating client.
 
-    The axis is the QUESTION each answer is a verdict on, never what the two verbs
-    retrieve — that is measured identical, and "surface returns the active set" is
-    measured false.
+    Until 6c the axis was which question each band is a verdict on, with
+    `surface_decisions`' band said to say whether precedent exists. 6b's notes
+    claim that for neither verb, so the head now says the band is verb-neutral and
+    names the exhaustive read as what shows an absence. The verbs still differ by
+    the question posed, never by what they retrieve (measured identical). The old
+    pin asserted the bare words "whether precedent exists", which the negated
+    sentence also contains, so this row asserts the negated form and the absence
+    of the old clause.
     """
     head = _flat(_descriptions()["query_decisions"][:600])
-    assert "confidence" in head and "whether precedent exists" in head, (
-        "query_decisions' description no longer says which question each recall "
-        "verb's band is a verdict on — an agent holding five matches at 0.61 is "
-        "back to guessing which verb it should have called."
+    assert "surface_decisions" in head and "list_decisions" in head
+    assert "On both verbs `confidence` rates this ranking, never whether precedent exists" in head, (
+        "query_decisions' head no longer says what the band rates — an agent "
+        "holding five matches at 0.61 is back to guessing what the band settles."
     )
+    assert "says whether precedent exists" not in head
 
 
 def test_surface_decisions_states_the_band_axis():
     """The sibling half. Its phrases are gated by the ceiling alone: the window
     this tool is under is the required-arguments one, which measures where
-    `query` and `project` end, not where this contrast sits.
+    `query` and `project` end, not where this sentence sits.
 
-    The two descriptions must not converge: neither gains a `Returns:`-block gloss
-    for the other's fields, and this one keeps the corpus-level reading of the band
-    while `query_decisions` keeps the ranking-level one.
+    Until 6c the two descriptions kept opposite readings of the band (corpus here,
+    ranking there). They now converge on the band, which rates the ranking on both
+    verbs, and stay distinct on the question posed and the register.
     """
     desc = _flat(_descriptions()["surface_decisions"])
-    assert "whether precedent exists" in desc and "confidence" in desc
-    assert "rates that ranking, not the corpus" in desc, (
-        "surface_decisions no longer contrasts its own band with query_decisions' "
-        "— the differentiator sentence was trimmed rather than extended"
+    assert ("`confidence` (`strong`/`weak`/`none` when semantic ranking ran), which "
+            "rates this ranking on both verbs") in desc
+    assert "verdict on whether precedent exists" not in desc
+    assert "rates that ranking, not the corpus" not in desc, (
+        "surface_decisions still contrasts its band with query_decisions' — the "
+        "two bands are the same arithmetic over the same kind of ranking"
     )
+
+
+# The query-phrasing teaching (vision §4.7): phrasing moves the score, so a query
+# names the mechanism and subject. Test-side, because no note carries it.
+_TEACHING = "by the mechanism and subject, not by the conclusion"
+
+
+@pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
+def test_both_ranked_descriptions_teach_the_query_phrasing(tool):
+    """Inside the `query:` Args entry, where a caller is when it writes the
+    string — not merely somewhere in the description."""
+    desc = _descriptions()[tool]
+    start, end = _arg_entry_span(desc, "query")
+    assert _TEACHING in _flat(desc[start:end]), tool
+
+
+@pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
+def test_the_ranked_descriptions_name_band_evidence(tool):
+    """`band_evidence` is named inside `Returns` on both; `surface_decisions`, the
+    one description that spells out the bands, also names its four keys."""
+    desc = _flat(_descriptions()[tool])
+    returns = desc.index("Returns:")
+    assert desc.find("band_evidence", returns) > returns, tool
+    if tool == "surface_decisions":
+        keys = "(`top_score`, `top_cluster`, `edge`, `next_score`)"
+        assert desc.find("`band_evidence` " + keys, returns) > returns
+
+
+@pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
+def test_the_ranked_descriptions_name_the_rejection_section(tool):
+    """Inverted by 5b from `test_the_ranked_descriptions_do_not_yet_name_the_rejection_section`:
+    5a shipped the section with a PROVISIONAL floor and pinned the descriptions silent;
+    5b calibrated the floor and ships the prose with it (constraint 12). Each ranked
+    description names both keys and §4.6's meaning (the owner's own context, the band
+    not rating it), inside `Returns`, past every required argument. The selector must
+    match the tool: an empty description would pass vacuously."""
+    desc = _flat(_descriptions()[tool]).lower()
+    assert "returns:" in desc and tool.split("_")[0] in desc
+    returns = desc.index("returns:")
+    for phrase in ("rejection_matches", "rejection_section", "its own context", "whatever the band"):
+        assert phrase in desc, (tool, phrase)
+        assert desc.index(phrase) > returns, (tool, phrase, "outside Returns")
+
+
+def test_query_decisions_documents_the_field_selector_after_project():
+    """5c: `field` is documented past `project`, so the required-argument window (and
+    the head) did not move; its doc names the one value, what it searches, what
+    `limit`/`full_top` count there and the exact-slug exit it never takes; `Returns`
+    says what the answer is with it."""
+    desc = _descriptions()["query_decisions"]
+    project = _arg_entry_span(desc, "project")
+    field = _arg_entry_span(desc, "field")
+    assert field[0] > project[1]
+    assert project[1] <= REQUIRED_ARGS_WINDOW
+    doc = _flat(desc[field[0]:field[1]])
+    for phrase in ('"rejected_paths"', "was this rejected, and by what?",
+                   "searched alone", "`limit` then counts rejected options",
+                   "`full_top` counts their decisions", "never dereferenced"):
+        assert phrase in doc, phrase
+    returns = _flat(desc[desc.index("Returns:"):])
+    assert "With `field`, the answer is `rejection_matches` alone" in returns
 
 
 _REQUIRED_PAIRS = _required_pairs()
@@ -488,3 +558,94 @@ def test_container_shape_is_stated_in_the_first_sentence(tool, arg):
             f"{tool}'s `{arg}` takes one string, but its first sentence says "
             f"'list' ({doc!r}) — the word an agent reads as ['a', 'b']."
         )
+
+
+# --- 7a → 7b: the pause's tombstone partition, and its prose ----------------------------
+#
+# 7a shipped the partition and pinned this prose silent; 7b ships the receipts and the
+# prose together, so both rows are inverted here, deliberately (constraint 12). Floors
+# are imported from the constants, never copied, so a recalibration reds the prose.
+
+def _setup_md():
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "SETUP.md")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _setup_pause_passage():
+    text = _flat(_setup_md())
+    start = text.index("**Link related decisions.**")
+    return text[start:text.index("---", start)]
+
+
+def test_record_decision_description_teaches_the_tombstone_partition():
+    """Inverted from 7a's ``…does_not_yet_mention_tombstones``."""
+    desc = _flat(_descriptions()["record_decision"])
+    assert "`tombstones`: retired decisions near the draft" in desc
+    assert "naming its live successor" in desc
+    assert "a relation to that (a reversal supersedes it) or acknowledgement clears one" in desc
+    # 9b (D5), inverted from "only the latter if successor_ambiguous": a relation to a
+    # decision descended from the successor clears an ambiguous tombstone too, so the
+    # description says only what is refused.
+    assert "only the latter" not in desc
+    assert "successor_ambiguous: a successor's slug is refused" in desc
+    assert "On a retired decision it names its successors; relate to those, not its slug" in desc
+    assert "a neighbour or tombstone may lie past it" in desc
+    # The runtime message carries the tombstone floor; the description quotes none.
+    from mitos.sync import _TOMBSTONE_FLOOR, _floor_text
+    assert _floor_text(_TOMBSTONE_FLOOR) not in desc
+
+
+def test_record_decision_description_quotes_the_live_floor_from_its_constant():
+    from mitos.sync import _NEIGHBOR_REVIEW_THRESHOLD, _floor_text
+    desc = _flat(_descriptions()["record_decision"])
+    assert f"≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)}-similar unlinked `neighbors`" in desc
+
+
+def test_setup_md_pause_passage_names_both_floors_and_the_successor_rule():
+    """Inverted from 7a's ``…still_quotes_the_live_floor_alone``."""
+    from mitos.sync import _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR, _floor_text
+    passage = _setup_pause_passage()
+    assert f"strongly similar (≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)}) to the draft" in passage
+    assert f"`tombstones` are retired decisions at ≥{_floor_text(_TOMBSTONE_FLOOR)}" in passage
+    assert "relate to its live successor" in passage
+    assert "A retired decision is never a relation target" in passage
+    # 9b (D5), inverted from "clears only by acknowledgement" / "That is the same-slug
+    # case": acknowledgement is one way out, the same-slug case the usual one.
+    assert "clears only by acknowledgement" not in passage
+    assert "refuses that slug as a relation target, so acknowledge it" in passage
+    assert "The usual case is the same-slug one" in passage
+    assert "naming a decision descended from its successor" in passage
+    assert "any relation to one whose slug names a single decision" in passage
+    assert "`acknowledged_tombstones`" in passage
+
+
+def test_skill_text_teaches_the_tombstones_and_both_acknowledged_lists():
+    from mitos import cli
+    text = cli._skill_md_text("<<SENTINEL>>")
+    tail = text.split("<<SENTINEL>>", 1)[1]
+    linking = tail[tail.index("## Linking decisions"):]
+    assert "`acknowledged_tombstones`" in linking and "`acknowledged_neighbors`" in linking
+    # 9b (D5), inverted from "`successor_ambiguous` clears only by acknowledgement".
+    assert "clears only by acknowledgement" not in linking
+    assert "refuses that slug as a relation target, so acknowledge it" in linking
+    assert "naming a decision descended from its successor" in linking
+    assert "any relation to one whose slug names a single decision" in linking
+    assert "same-slug supersession, where the slug reads the live decision" in linking
+    assert "never to its slug" in linking and "`amend_commentary` by its id" in linking
+    # The clauses the description no longer carries live here.
+    assert "`rotation`" in tail and "`scope_overflow`" in tail
+
+
+def test_skill_text_teaches_the_sibling_note():
+    """7c: the pause's ``descends_from_declared`` is taught in the skill (the
+    description has no room), with the declaration that does not clear it."""
+    from mitos import cli
+    text = cli._skill_md_text("<<SENTINEL>>")
+    tail = text.split("<<SENTINEL>>", 1)[1]
+    linking = tail[tail.index("## Linking decisions"):]
+    sentence = next(s for s in linking.split(". ") if "`descends_from_declared`" in s)
+    assert "descends from a decision this draft declares" in sentence
+    assert "the declaration does not clear it" in linking
+    assert "judge it like any other neighbour" in linking

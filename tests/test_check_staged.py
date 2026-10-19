@@ -1019,3 +1019,144 @@ def test_14d_above_threshold_with_yes_proceeds(workspace, monkeypatch) -> None:
                          assume_yes=True, as_json=False)
 
     assert code == 1
+
+
+# --------------------------------------------------------------------------- #
+# 2d — a gather cut above the floor is counted, never a degradation
+# --------------------------------------------------------------------------- #
+
+def _cut_neighbourhood(*, last_above: bool) -> List[Dict[str, Any]]:
+    """``active-q`` first, then orphan points filling a 21-point raw bound.
+
+    The bound is moved to 21 by the caller, so the gather reads it whole and holds one
+    live decision. Its last point's score sits just above or just below the check's
+    floor, which is the whole difference between a cut and its uncut twin.
+    """
+    from mitos import conflict
+    from _point_hits import orphan_hit
+    floor = conflict.CONFLICT_SIMILARITY_FLOOR
+    tail = floor + 0.01 if last_above else floor - 0.01
+    count = conflict.CONFLICT_OVERFETCH_LIMIT
+    return [_match("active-q", 0.9)] + [
+        orphan_hit(0.89 - (0.89 - tail) * i / (count - 1), tag=f"staged-cut-{i}")
+        for i in range(count)]
+
+
+def _staged_cut_run(tmp_path, monkeypatch, capsys, *, last_above: bool, as_json: bool):
+    """One staged run in a fresh workspace of its own, so a cut and its twin share none."""
+    from mitos import conflict
+    config = MitosConfig(str(tmp_path / f"ws-{last_above}-{as_json}"))
+    store = GraphStore(config.db_path)
+    monkeypatch.setattr(conflict, "CONFLICT_RAW_BOUND", conflict.CONFLICT_OVERFETCH_LIMIT + 1)
+    _seed_active(store)
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    # Bound to this run's graph: the twin's workspace is a second graph in the same test.
+    embed, vector = _keyed_substrate(
+        {_PENDING_AXIOM: _cut_neighbourhood(last_above=last_above)}, store=store)
+    monkeypatch.setattr(cli, "_build_check_substrate", lambda cfg: (embed, vector, None))
+    _wire_judge(monkeypatch, _finding_judge(batch_id=f"cut-{last_above}-{as_json}"))
+    capsys.readouterr()
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=True, as_json=as_json)
+    return code, capsys.readouterr().out
+
+
+def test_2d_staged_json_counts_a_cut_and_changes_nothing_else(tmp_path, monkeypatch,
+                                                             capsys) -> None:
+    """``gathers_cut`` counts the cut proposal; exit, degradations and findings match
+    the uncut twin. Break B9 (a cut bumping the exit to 2) reds this row."""
+    cut_code, cut_out = _staged_cut_run(tmp_path, monkeypatch, capsys,
+                                        last_above=True, as_json=True)
+    twin_code, twin_out = _staged_cut_run(tmp_path, monkeypatch, capsys,
+                                          last_above=False, as_json=True)
+    cut, twin = json.loads(cut_out), json.loads(twin_out)
+    assert cut["gathers_cut"] == 1 and twin["gathers_cut"] == 0
+    assert cut_code == twin_code == cut["exit_code"] == 1
+    assert cut["degradations"] == twin["degradations"] == []
+    assert cut["findings_new"] == twin["findings_new"] == 1
+    assert set(cut) == set(twin)
+
+
+def test_2d_staged_text_reports_the_cut_line_only_when_cut(tmp_path, monkeypatch,
+                                                          capsys) -> None:
+    _, cut_out = _staged_cut_run(tmp_path, monkeypatch, capsys, last_above=True,
+                                 as_json=False)
+    assert "Neighbour search was cut short for 1 pending decision" in cut_out
+    _, twin_out = _staged_cut_run(tmp_path, monkeypatch, capsys, last_above=False,
+                                  as_json=False)
+    assert "Neighbour search was cut short" not in twin_out
+
+
+def test_2d_staged_json_carries_gathers_cut_through_main(workspace, monkeypatch,
+                                                         capsys) -> None:
+    """The outer frame: ``mitos -p <ws> check --staged --json`` through ``main()``."""
+    import sys
+    from mitos import conflict
+    from mitos.cli import cmd_init
+    config, _store, _telemetry = workspace
+    # `main()` resolves `-p` to a workspace, so this one is initialised like a real one.
+    config = MitosConfig(os.path.join(config.workspace_dir, "initialised"))
+    cmd_init(config)
+    store = GraphStore(config.db_path)
+    monkeypatch.setattr(conflict, "CONFLICT_RAW_BOUND", conflict.CONFLICT_OVERFETCH_LIMIT + 1)
+    _seed_active(store)
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    embed, vector = _keyed_substrate({_PENDING_AXIOM: _cut_neighbourhood(last_above=True)},
+                                     store=store)
+    monkeypatch.setattr(cli, "_build_check_substrate", lambda cfg: (embed, vector, None))
+    _wire_judge(monkeypatch, _finding_judge(batch_id="cut-main"))
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", config.workspace_dir, "check",
+                                      "--staged", "--json", "--yes"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    obj = json.loads(capsys.readouterr().out)
+    assert obj["gathers_cut"] == 1 and obj["degradations"] == []
+
+
+def test_2d_staged_no_pending_json_carries_a_zero_gathers_cut(workspace, capsys) -> None:
+    """The free short-circuit's ``--json`` is not carved out: the key is always present."""
+    config, store, telemetry = workspace
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=True)
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["gathers_cut"] == 0
+
+
+def test_2d_a_contract_fault_escapes_check_staged_rather_than_reading_as_unavailable(
+        workspace, monkeypatch) -> None:
+    """``check --staged`` catches store faults narrowly; a ``WalkContractError`` (a
+    ``TypeError``) escapes, never a degraded gate. Break B13 reds this row."""
+    from mitos.retrieval_walk import WalkContractError
+    config, store, _telemetry = workspace
+    _seed_active(store)
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    _wire_substrate(monkeypatch, {_PENDING_AXIOM: [_match("active-q", 0.9)]})
+    _wire_judge(monkeypatch, _finding_judge(batch_id="contract"))
+    monkeypatch.setattr(GraphStore, "get_modifiers_map", lambda self, ids: ["not a dict"])
+    with pytest.raises(WalkContractError):
+        cli.cmd_check(config, staged=True, scope=None, fresh=False, assume_yes=True,
+                      as_json=True)
+
+
+def test_2d_a_same_slug_successor_reaches_a_staged_batch_once(workspace, monkeypatch,
+                                                              capsys) -> None:
+    """Retired X and live Y share a slug. Before 2d Y was gathered twice, and the
+    batch's slug list held one slug twice; the judge's reply then failed to parse
+    (``JUDGMENT``). Now Y is judged once and the gate parses clean."""
+    from test_point_identity import same_slug_lineage
+    from _point_hits import point_hit
+    config, store, _telemetry = workspace
+    retired, successor = same_slug_lineage(store)
+    _drain_outbox(store)
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    _wire_substrate(monkeypatch, {_PENDING_AXIOM: [point_hit(retired, 0.93),
+                                                   point_hit(successor, 0.88)]})
+    _wire_judge(monkeypatch, _SequenceJudge([
+        _execution([("database", True, 0.2, "They stand together.")], batch_id="same-slug")]))
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False, assume_yes=True,
+                         as_json=True)
+    obj = json.loads(capsys.readouterr().out)
+    assert code == 0, obj
+    assert obj["degradations"] == [] and obj["batches_executed"] == 1

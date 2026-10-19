@@ -28,9 +28,11 @@ from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE,
+from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE, _floor_text,
                         _NEIGHBOR_REVIEW_THRESHOLD, _PAUSE_DIGEST_CLAUSE,
                         _PAUSE_RESOLVING_RELATIONS, _draft_digest)
+
+from _point_hits import CannedVector
 
 
 @pytest.fixture
@@ -54,12 +56,8 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    def __init__(self, matches):
-        self._matches = matches
-
-    def query(self, vector, limit=5):
-        return self._matches
+class _FakeVector(CannedVector):
+    """Canned matches through the shared leaf (every hit carries its ``point_id``)."""
 
     def upsert(self, *a, **k):
         pass
@@ -68,7 +66,7 @@ class _FakeVector:
 def _arm(m, matches):
     """Wire fake embeddings/vector so the review runs deterministically."""
     m.embed_provider = _FakeEmbed()
-    m.vector_store = _FakeVector(matches)
+    m.vector_store = _FakeVector(matches, store_of=lambda: m.store)
 
 
 # --------------------------------------------------------------------------- #
@@ -180,9 +178,16 @@ def test_strong_match_band_declared_target_still_commits(ws):
     assert res["status"] == "created", res
 
 
-def test_threshold_value_matches_adr():
-    """The floor is 0.80 — pinned so a drive-by retune goes through the ADR."""
-    assert _NEIGHBOR_REVIEW_THRESHOLD == 0.80
+def test_threshold_is_pinned_by_the_calibration_record():
+    """7a retired the literal `== 0.80` pin that stood here: the floor is a calibrated
+    constant now, and the calibration record's pin row (`test_calibrated_constants.py`)
+    holds its value, so a drive-by retune reds there, against its measured placement."""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "golden"))
+    import test_calibrated_constants as pins
+    assert "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD" in pins.CALIBRATED_CONSTANTS
+    assert pins._runtime_value("mitos.sync._NEIGHBOR_REVIEW_THRESHOLD") == _NEIGHBOR_REVIEW_THRESHOLD
 
 
 def test_threshold_is_inclusive(ws):
@@ -750,11 +755,14 @@ class _RaisingVector:
     def __init__(self, exc):
         self._exc = exc
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         raise self._exc
 
     def upsert(self, *a, **k):
         pass
+
+    def delete_points(self, point_ids):
+        raise self._exc
 
 
 def test_active_oq_in_window_pauses_on_genuine_decision(ws):
@@ -849,19 +857,21 @@ def test_degraded_vector_store_commits_with_notice(ws):
     assert GraphStore(config.db_path).get_node_by_slug("deg-vector") is not None
 
 
-def test_graph_fault_during_pause_read_commits_with_notice(ws):
+@pytest.mark.parametrize("read", ["resolve_point_ids", "get_modifiers_map"])
+def test_graph_fault_during_pause_read_commits_with_notice(ws, read):
     """T3 (the call-site catch): a propagated DatabaseError fails open, never crashes.
 
     gather_candidates propagates graph-store faults by design; the record call site
-    catches exactly (DatabaseError, ValidationError). Phase B uses get_node /
-    commit_parsed_entry / get_outgoing_edge_targets — none of them the patched read — so the
-    commit proceeds. (Nothing post-commit calls the patched method anymore: the
-    `related` echo and its blanket-catch scan were deleted.)
+    catches exactly (DatabaseError, ValidationError). Since 2d the gather's two graph
+    reads are the walk's resolver and its own live-window stamp read, and either
+    fault lands here (the stamp read never degrades to "stamps lost" on this path).
+    Phase B uses get_node / commit_parsed_entry / get_outgoing_edge_targets — none of
+    them the patched read — so the commit proceeds.
     """
     config, m = ws
     _seed(m, "gf-prior", "The sync lock is held during commit.")
     _arm(m, [{"slug": "gf-prior", "score": 0.9}])
-    with patch.object(m.store, "get_node_by_slug",
+    with patch.object(m.store, read,
                       side_effect=DatabaseError("disk I/O error")):
         res = m.record_decision_entry("The sync lock is held for the commit duration.",
                                       "rej", ["s"], slug="gf-new")
@@ -1768,7 +1778,7 @@ def test_cli_pause_header_states_the_floor_and_the_count(ws, capsys):
     config, _ = ws
     err = _cli_pause(config, [_neighbour("one"), _neighbour("two")], capsys)
     header = next(line for line in err.splitlines() if line.startswith("⚠ Paused"))
-    assert (f"is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} similar to 2 existing "
+    assert (f"is ≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} similar to 2 existing "
             "decision(s) you did not reference") in header
     assert header.endswith("Nothing written.")
 
@@ -2597,7 +2607,7 @@ def test_f10_the_text_receipt_prints_one_line_per_form(ws, capsys):
     """Row 13 — the three forms through `cmd_record`, and none without the flag."""
     config, m = ws
     _seed(m, "txt-seed", "Use SQLite for the store.")
-    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+    floor = _floor_text(_NEIGHBOR_REVIEW_THRESHOLD)
 
     def record(slug, matches, **kw):
         capsys.readouterr()
@@ -2678,7 +2688,7 @@ class _CreatableVector:
     def __init__(self):
         self.exists = False
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         if not self.exists:
             raise CollectionMissingError("absent")
         return []
@@ -2688,6 +2698,10 @@ class _CreatableVector:
             if not may_create:
                 raise CollectionMissingError("absent")
             self.exists = True
+
+    def delete_points(self, point_ids):
+        if not self.exists:
+            raise CollectionMissingError("absent")
 
 
 def test_f10_a_fresh_workspace_reads_empty_not_null(ws):
@@ -2717,3 +2731,126 @@ def test_the_stamp_sentence_is_said_only_over_a_stamped_neighbour(ws):
     loud = _echo_pause(m, _ECHO_GATHERED)
     assert any(n.get("amended_by") for n in loud["neighbors"])
     assert loud["message"].count(_STAMP_ANCHOR) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The gather cut above the pause's floor (recall-confidence 2d)
+#
+# The review's gather reads its whole raw bound; when it holds fewer than the 20
+# live decisions it fills and its last point still scores at or above the pause's
+# floor, a live neighbour may lie past what it read. The pause and both record
+# receipts say so in `neighbor_review_cut`, one composed sentence carrying no
+# command, so MCP, CLI `--json` and CLI text carry the same string. These rows run
+# the REAL `_review_neighbors` (a patched one never fills the sink), with the raw
+# bound moved to 21 so a canned fetch can fill it: orphan points take the slots, and
+# their last score decides the cut.
+# --------------------------------------------------------------------------- #
+
+def _cut_fetch(*, last_above: bool, live=()):
+    """``live`` neighbours, then orphan points filling the rest of a 21-point bound."""
+    from mitos.conflict import CONFLICT_OVERFETCH_LIMIT
+    from _point_hits import orphan_hit
+    floor = _NEIGHBOR_REVIEW_THRESHOLD
+    hits = [{"slug": slug, "score": 0.95} for slug in live]
+    tail = floor + 0.01 if last_above else floor - 0.01
+    count = CONFLICT_OVERFETCH_LIMIT + 1 - len(hits)
+    hits += [orphan_hit(0.94 - (0.94 - tail) * i / (count - 1), tag=f"cut-{i}")
+             for i in range(count)]
+    return hits
+
+
+@pytest.fixture
+def small_bound(monkeypatch):
+    from mitos import conflict
+    from mitos.conflict import CONFLICT_OVERFETCH_LIMIT
+    monkeypatch.setattr(conflict, "CONFLICT_RAW_BOUND", CONFLICT_OVERFETCH_LIMIT + 1)
+
+
+@pytest.mark.parametrize("last_above", [True, False])
+def test_a_cut_review_rides_the_pause_and_its_twin_does_not(ws, small_bound, last_above):
+    config, m = ws
+    _seed(m, "cut-prior", "The sync lock is held during commit.")
+    _arm(m, _cut_fetch(last_above=last_above, live=["cut-prior"]))
+    res = m.record_decision_entry("The sync lock is held for the whole commit.", "rej",
+                                  ["s"], slug="cut-new")
+    assert res["status"] == "needs_review"
+    if last_above:
+        cut = res["neighbor_review_cut"]
+        assert "21 points" in cut and "1 live decision" in cut
+        assert f"{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} floor" in cut
+        assert "mitos" not in cut     # a receipt dict string names no command
+    else:
+        assert "neighbor_review_cut" not in res
+
+
+@pytest.mark.parametrize("acknowledge", [False, True])
+@pytest.mark.parametrize("last_above", [True, False])
+def test_a_cut_review_rides_both_created_receipts(ws, small_bound, acknowledge, last_above):
+    """Unacknowledged: the pre-commit gather. Acknowledged: its post-commit re-run."""
+    config, m = ws
+    _arm(m, _cut_fetch(last_above=last_above))
+    res = m.record_decision_entry("A decision with no live neighbour in reach.", "rej",
+                                  ["s"], slug="cut-created",
+                                  acknowledge_neighbors=acknowledge)
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+    assert ("neighbor_review_cut" in res) is last_above
+    if acknowledge:
+        assert res["acknowledged_neighbors"] == []
+
+
+@pytest.mark.parametrize("acknowledge", [False, True])
+def test_a_review_that_could_not_run_never_carries_a_cut(ws, small_bound, acknowledge):
+    """The two keys never ride one receipt: the sink fills only on a healthy gather."""
+    config, m = ws
+    m.embed_provider = _FakeEmbed()
+    m.vector_store = _RaisingVector(VectorStoreError("connection refused"))
+    res = m.record_decision_entry("A decision whose review cannot run.", "rej", ["s"],
+                                  slug="cut-unavailable", acknowledge_neighbors=acknowledge)
+    assert res["status"] == "created"
+    assert "neighbor_review_cut" not in res
+    if acknowledge:
+        assert res["acknowledged_neighbors"] is None
+    else:
+        assert "neighbor_review_unavailable" in res
+
+
+@pytest.mark.parametrize("acknowledge", [False, True])
+def test_the_cut_statement_is_one_value_on_mcp_and_both_cli_encodings(
+        ws, small_bound, capsys, monkeypatch, acknowledge):
+    """Parity: key and value equal on MCP and CLI ``--json`` (through ``main()``), and
+    the same sentence on CLI text. Break B8 reds the text or receipt leg."""
+    from mitos import mcp_server
+    from mitos.cli import main
+
+    config, m = ws
+    factory = _armed_real_manager_factory(_cut_fetch(last_above=True))
+    ack = ["--acknowledge-neighbors"] if acknowledge else []
+
+    def run_cli(slug, *extra):
+        # A distinct axiom per write: a repeated one answers `exists`, not `created`.
+        with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+            monkeypatch.setattr(sys, "argv", _record_argv(
+                config.workspace_dir, f"A decision read past its bound ({slug}).",
+                "--rejected", "rej", "--slug", slug, *ack, *extra))
+            try:
+                main()
+            except SystemExit as exc:
+                assert exc.code in (0, None), exc.code
+
+    capsys.readouterr()
+    run_cli("cut-json", "--json")
+    cli_json = json.loads(capsys.readouterr().out)
+    run_cli("cut-text")
+    text = capsys.readouterr()
+    with patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        mcp = json.loads(mcp_server.record_decision(
+            "A decision read past its bound (cut-mcp).", "rej", ["s"], slug="cut-mcp",
+            acknowledge_neighbors=acknowledge, project=config.workspace_dir))
+
+    assert cli_json["status"] == mcp["status"] == "created"
+    assert cli_json["neighbor_review_cut"] == mcp["neighbor_review_cut"]
+    assert set(cli_json) - {"slug", "id"} == set(mcp) - {"slug", "id"}
+    assert cli_json["neighbor_review_cut"] in text.err
+    assert "neighbor_review_unavailable" not in cli_json

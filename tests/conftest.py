@@ -9,6 +9,7 @@ exercise those features re-enable them explicitly (``monkeypatch.delenv(...)``).
 
 import os
 
+import _point_hits
 import live_helpers
 
 import pytest
@@ -224,6 +225,108 @@ def hermetic_mitos_env(request, monkeypatch, tmp_path):
             monkeypatch.delenv(name, raising=False)
 
 
+class OfflineRejectionIndexRefused(Exception):
+    """Raised by the offline stand-in for ``QdrantRejectionIndex``'s constructor."""
+
+
+def _refuse_rejection_index(*args, **kwargs):
+    raise OfflineRejectionIndexRefused(
+        "offline tests never construct a real QdrantRejectionIndex; bind a "
+        "FakeRejectionIndex factory at mitos.sync.QdrantRejectionIndex (and at "
+        "mitos.cli.QdrantRejectionIndex for status) instead — the ranked reads' "
+        "seam is _ranked_rejection_index, bound by offline_rejection_read_seam"
+    )
+
+
+@pytest.fixture(autouse=True)
+def offline_rejection_index(request, monkeypatch):
+    """Keeps every non-live manager's rejection index ``None`` unless a row binds one.
+
+    ``MitosSyncManager`` builds its ``QdrantRejectionIndex`` last inside the
+    constructor ``try`` that builds the provider and the vector store, so a raise
+    here leaves ``rejection_index`` ``None`` and the inline rejection leg off. Without
+    it, a row whose real constructors succeed on a dummy key would send rejection
+    probes to whatever ``QDRANT_URL`` names — the box's live :7333 for some rows,
+    nothing at all on keyless CI — so the offline lane would behave differently on
+    the two (4b scout, D-1: about 70 rows in 10 files). One rule rather than a file
+    list: a row about the leg binds a ``FakeRejectionIndex`` factory with
+    ``monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", …)``, which overrides
+    this. ``LIVE_MODULES`` are exempt, as they are from the credential strip.
+
+    ``cmd_status`` builds its own (4d) for the rejection listing, so the ``mitos.cli``
+    binding is refused too: without it every offline row that patches
+    ``_check_qdrant`` to reachable would scroll the live :7333. Its construction sits
+    inside status's best-effort ``try``, so the refusal reads as "could not list".
+    A row that needs a listing binds the factory at both seams.
+
+    The ranked reads (5a) build their index through a seam of their own,
+    ``_ranked_rejection_index`` in ``mitos.cli`` and ``mitos.mcp_server``, which
+    :func:`offline_rejection_read_seam` binds; this refusal never reaches them,
+    because the seam function is replaced whole rather than the class it names.
+    """
+    if request.node.path.name not in LIVE_MODULES:
+        monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", _refuse_rejection_index)
+        monkeypatch.setattr("mitos.cli.QdrantRejectionIndex", _refuse_rejection_index)
+
+
+@pytest.fixture(autouse=True)
+def offline_rejection_read_seam(request, monkeypatch):
+    """Binds an empty, present ``FakeRejectionIndex`` at both ranked-read seams.
+
+    Every ranked read (``surface_decisions``, ``query_decisions``, ``mitos surface``,
+    ``mitos query``) searches the rejection index through
+    ``_ranked_rejection_index(config)``. Offline, that would send a real search to
+    whatever ``QDRANT_URL`` names — the live :7333 on this box, nothing on keyless
+    CI — and a ``None`` seam would put an ``unavailable`` clause on every offline
+    ranked note (a state production cannot reach: the constructor does no I/O). So
+    each non-live test gets one fresh fake, present and empty, at both seams: every
+    existing ranked-read row composes a searched-empty section (no key, no clause)
+    and stays byte-identical. A row about the section binds its own index at the
+    seam(s) it drives; a write-then-read row binds the SAME instance at the write
+    seam (``mitos.sync.QdrantRejectionIndex``) too. ``LIVE_MODULES`` are exempt.
+
+    The seam *functions* are replaced, not ``QdrantRejectionIndex``: a status row
+    that binds a fake factory at ``mitos.cli.QdrantRejectionIndex`` must not feed
+    the read seam, nor the reverse.
+    """
+    if request.node.path.name in LIVE_MODULES:
+        return
+    from _rejection_index_double import FakeRejectionIndex
+
+    index = FakeRejectionIndex(present=True)
+    monkeypatch.setattr("mitos.cli._ranked_rejection_index", lambda config: index)
+    monkeypatch.setattr("mitos.mcp_server._ranked_rejection_index", lambda config: index)
+
+
+# Record every GraphStore construction, so a canned vector double with no explicit
+# store can bind to the one graph its test built (tests/_point_hits.py).
+_point_hits.install_store_recorder()
+
+
+@pytest.fixture(autouse=True)
+def point_hit_fixture_faults():
+    """Fails a test that ends with an unconsumed canned-hit fixture fault (2a, G1).
+
+    A canned vector double never raises on a fixture mistake — a slug naming no
+    node or several, a double with no graph to bind, an unknown keyed vector —
+    because every reader wraps its search in a broad catch, and a raise there
+    reads as a degraded or empty window, which an absence-asserting row would
+    pass over (vision §6.2 constraint 8). The double records the fault instead,
+    and this teardown fails the test outside any reader's catch. The same record
+    holds the test's ``GraphStore`` constructions for the doubles' fallback
+    binding; both are cleared per test.
+    """
+    _point_hits.begin_test()
+    yield
+    faults = _point_hits.end_test()
+    if faults:
+        pytest.fail(
+            "unconsumed canned-hit fixture fault(s) — the test's vector double could "
+            "not honour the point-id contract:\n  " + "\n  ".join(faults),
+            pytrace=False,
+        )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def sweep_leaked_qdrant_collections():
     """After the whole suite, delete test-ONLY collections from the shared Qdrant.
@@ -292,6 +395,16 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_scenarios_live.py",
     "test_collection_absence_live.py",
     "test_status_overview_live.py",
+    "test_calibration_live.py",
+    "test_point_identity_live.py",
+    "test_ranked_walk_live.py",
+    "test_rejection_index_live.py",
+    "test_rejection_inline_live.py",
+    "test_rejection_drain_live.py",
+    "test_rejection_covering_live.py",
+    "test_rejection_section_live.py",
+    "test_rejection_lookup_live.py",
+    "test_mcp_recall_walk_live.py",
 )
 
 

@@ -194,6 +194,9 @@ class _Upserts:
     def upsert(self, *a, **kw):
         raise AssertionError("the embedding raised first; nothing reaches upsert")
 
+    def delete_points(self, point_ids):
+        raise AssertionError("the embedding raised first; nothing reaches a delete")
+
 
 def _mcp(config, exc, tool="surface_decisions", **kw):
     comps = (GraphStore(config.db_path, read_only=True), _Boom(exc), object())
@@ -252,14 +255,15 @@ def test_header_dump_note_and_write_warning_carry_one_phrase(ws, capsys, cause):
 
 
 @pytest.mark.parametrize("cause", PROVIDER_CAUSES)
-def test_the_partial_list_note_names_the_same_phrase(cause):
-    """A fault after hits were appended keeps them; the note names the injected cause."""
+def test_the_dump_note_names_the_same_phrase(cause):
+    """The degraded answer with results — the scope dump, its only one since 5d
+    retired the partial-list arm — names the injected cause."""
     phrase = provider_cause_phrase(cause)
     for surface in ("cli", "mcp"):
         _, note = assess_surface_recall(
             semantic_ran=False, top_score=None, result_count=2, scope="x",
-            surface=surface, lever=None, scope_total=None, degraded_reason=phrase)
-        assert note.startswith(f"Semantic recall unavailable ({phrase}) — showing the ")
+            surface=surface, scope_total=2, degraded_reason=phrase)
+        assert note.startswith(f"Semantic recall unavailable ({phrase}) — showing all 2 ")
 
 
 @pytest.mark.parametrize("cause", PROVIDER_CAUSES)
@@ -284,10 +288,19 @@ def test_no_encoding_carries_the_provider_body(ws, capsys, cause):
     m, captured = _record_with(config, exc, capsys, f"blob-{cause}")
     assert SENTINEL not in captured.err + captured.out
 
-    # The drain retries the queued row with the same provider and reports on stdout.
+    # The drain retries the queued rows with the same provider and reports on stdout.
+    # The outbox holds the `ws` fixture's two records, then this one, in queue order.
+    # An outage (auth / quota / transient) stops the walk at its first row; an
+    # `unknown` failure is per-row, so the walk tries all three.
     m.drain_pending_embeddings()
     drained = capsys.readouterr()
-    assert f"Failed to drain embedding for 'blob-{cause}': " in drained.out
+    lines = [ln for ln in drained.out.splitlines() if "Failed to drain embedding for '" in ln]
+    phrase = provider_cause_phrase(cause)
+    if cause == "unknown":
+        assert len(lines) == 3, drained.out
+        assert f"Failed to drain embedding for 'blob-{cause}': " in drained.out
+    else:
+        assert lines == [f"[Warning] Failed to drain embedding for 'cache-strategy': {phrase}"], drained.out
     assert SENTINEL not in drained.out + drained.err
 
 
@@ -332,7 +345,7 @@ def test_the_rendered_unused_scope_prefix_on_mcp_names_no_command():
     counts = {"auth": {"decisions": 3, "open_questions": 0}}
     _, note = assess_surface_recall(
         semantic_ran=True, top_score=None, result_count=0, scope="ghost",
-        scope_counts=counts, surface="mcp", lever=None, degraded_reason=None)
+        scope_counts=counts, surface="mcp", degraded_reason=None)
     assert "unused scope tag" in note and "mitos " not in note
     recovery = scope_filter_recovery(scope="ghost", scope_counts=counts, surface="mcp")
     assert recovery is not None
@@ -379,14 +392,14 @@ def test_the_mocked_cutover_arm_prints_a_recipe_for_this_project(offline, tmp_pa
 def test_a_degraded_call_without_a_reason_raises(scope_total):
     with pytest.raises(ValueError, match="degraded_reason"):
         assess_surface_recall(semantic_ran=False, top_score=None, result_count=2,
-                              scope="x", surface="mcp", lever=None,
+                              scope="x", surface="mcp",
                               scope_total=scope_total, degraded_reason=None)
 
 
 def test_the_reason_is_a_required_keyword():
     with pytest.raises(TypeError, match="degraded_reason"):
         assess_surface_recall(semantic_ran=True, top_score=0.9, result_count=1,
-                              scope=None, surface="mcp", lever=None)
+                              scope=None, surface="mcp")
     with pytest.raises(TypeError):
         degraded_reason_from_error(None)
 
@@ -395,8 +408,9 @@ def test_the_reason_is_a_required_keyword():
 # Stretch — a print site added later cannot print the provider body
 # --------------------------------------------------------------------------- #
 
-_EMBED_CALLS = {"get_embedding", "get_embeddings_batch", "_best_effort_embed",
-                "drain_pending_embeddings"}
+_EMBED_CALLS = {"get_embedding", "_best_effort_embed",
+                "drain_pending_embeddings", "embed_documents", "_embed_decision_inline",
+                "_write_rejection_items_inline", "drain_rejection_backlog", "_embed_batch"}
 
 
 def _embedding_handlers(tree):
@@ -443,3 +457,19 @@ def test_no_sync_print_site_interpolates_an_embedding_exception_bare():
     assert len(routed) >= 5, len(routed)
     offenders = [line for h, name in handlers for line in _interpolates_bare(h, name)]
     assert offenders == [], f"sync.py lines print an embedding exception bare: {offenders}"
+
+
+def test_no_cli_print_site_interpolates_an_embedding_exception_bare():
+    """The same sweep over ``cli.py``, where ``sync --embed-only`` wraps both drains."""
+    import ast
+    import inspect
+    from mitos import cli
+    tree = ast.parse(inspect.getsource(cli))
+    handlers = list(_embedding_handlers(tree))
+    # Population guard: the two `--embed-only` drain handlers (4c) are found.
+    routed = [h for h, name in handlers
+              if any(isinstance(n, ast.Call) and getattr(n.func, "id", None) == "describe_embed_failure"
+                     for n in ast.walk(h))]
+    assert len(routed) >= 2, len(routed)
+    offenders = [line for h, name in handlers for line in _interpolates_bare(h, name)]
+    assert offenders == [], f"cli.py lines print an embedding exception bare: {offenders}"

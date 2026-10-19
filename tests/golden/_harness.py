@@ -12,6 +12,7 @@ import tempfile
 from typing import Any, Dict, List
 
 from mitos.parser import parse_entry_stream
+from mitos.rejections import enumerate_rejected_paths, item_point_id
 from mitos.store import GraphStore
 
 GOLDEN_DIR = os.path.dirname(__file__)
@@ -55,6 +56,20 @@ def build_reference_graph(db_path: str) -> GraphStore:
     return store
 
 
+def _rejected_items(node_id: str, rejected_paths: str) -> Dict[str, Any]:
+    """Enumerates a decision's ``rejected_paths`` the way the rejection index will.
+
+    The enumeration is owner-free, so the owner-bound point id is added here, per
+    part. A rule change in ``mitos/rejections.py`` therefore arrives as a reviewed
+    oracle diff on this key, never as a silent re-id.
+    """
+    enumeration = enumerate_rejected_paths(rejected_paths).to_dict()
+    for item in enumeration["items"]:
+        for part in item["parts"]:
+            part["point_id"] = item_point_id(node_id, part["text"])
+    return enumeration
+
+
 def snapshot(store: GraphStore) -> Dict[str, Any]:
     """Captures the deterministic graph facts the oracle compares against.
 
@@ -62,7 +77,8 @@ def snapshot(store: GraphStore) -> Dict[str, Any]:
         store: A populated GraphStore.
 
     Returns:
-        A dict with per-node state/modifiers/lineage/id and the sorted active view.
+        A dict with per-node state/modifiers/lineage/id (and, for decisions, the
+        enumerated rejected_items) and the sorted active view.
     """
     nodes: Dict[str, Any] = {}
     id_to_slug: Dict[str, str] = {}
@@ -79,6 +95,8 @@ def snapshot(store: GraphStore) -> Dict[str, Any]:
             "modifiers": store.get_modifiers(nid),
             "lineage": [n.get("slug") for n in store.get_lineage(nid)],
         }
+        if node["kind"] == "decision":
+            nodes[node["slug"]]["rejected_items"] = _rejected_items(nid, node["rejected_paths"])
     # Typed edge set, id→slug mapped and sorted; created_at is dropped (it is a
     # non-deterministic application-supplied timestamp, MI-10).
     edges = sorted(

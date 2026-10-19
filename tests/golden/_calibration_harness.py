@@ -1,0 +1,819 @@
+"""Layer C's service-touching half: its own collection, and the two recording readers.
+
+Layer C records similarity values through the readers that ship, in both embedding
+spaces. The collection holds every Harbor node, the retired ones included, which is
+what makes a retired precedent's value measurable at all. Layer B's ``populate_index``
+indexes the active set only, and so does the conflict eval that reuses it; when 3b lands
+the single expected-set store read, `populate_layer_c` should call it.
+
+Each read goes through a `RecordingVectorStore` wrapped around the collection. The
+query form calls MCP ``surface_decisions`` with the workspace components patched to
+hand it the proxy; the draft form calls ``conflict.gather_candidates`` with the proxy.
+Both readers make exactly one ``query`` call, and the proxy keeps what it returned,
+scores included, before the reader drops retired hits into a list without scores.
+
+Hits are joined to nodes by their point id: ``VectorStore.query`` returns each hit's
+``point_id`` (2a), and `index_graph` maps ``hash_to_uuid(node_id)`` to each node of the
+expected set. The map is built here, independently of ``GraphStore.resolve_point_ids``:
+an instrument that resolved through the code it measures could not catch that code being
+wrong. Labels stay slugs, so the sealed fixtures and every earlier run stay comparable;
+fixtures still name nodes by slug, which is why the slug-uniqueness assertion stays.
+
+A rejection-target fixture is also read for its items. The per-item shape (one point per
+rejected item part, ``rejections.rejection_points``) is the index that ships (ruling 2),
+so it is written and searched through the shipped client, ``QdrantRejectionIndex``
+(5b): on Harbor a throwaway collection in production's shape, on the measurement copy
+the copy's own ``rejection_collection``. `read_rejection_items` takes the whole
+collection in one search and checks that every point came back, so "every point valued"
+is a checked fact rather than an assumption about the index. The per-decision shape
+(one point per decision holding its whole field) has no shipped reader; it is kept on
+Harbor only as ruling 2's recorded evidence and read raw by `search_points` with
+``exact`` set. Every item hit is labelled by this module's own map from
+``rejections.rejection_points`` over the graph, never through ``resolve_point_ids`` or
+``fill_rejections``, for the reason above.
+
+With a per-item client bound (`CalibrationIndex.items`), `read_query_form` also binds
+``mcp_server._ranked_rejection_index`` to it, so the envelope carries the shipped
+rejection section, and checks that section against the instrument's own ranking
+(`check_section_agreement`): the shipped leg end to end, measured by a reader that does
+not share its code. Without one (a run over a workspace with no rejection index) the
+section is recorded as read and nothing is compared. The draft form's gather passes no
+rejection leg, so it needs no binding.
+
+This module imports ``_semantic_harness`` and never ``_conflict_harness``, which pulls
+``anthropic`` in; Layer C makes no judge call.
+"""
+
+import importlib
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from unittest.mock import patch
+
+import requests
+
+import mitos
+from mitos import conflict, lexical, recall, sync
+from mitos.identity import canonical_core_string_norm, embedding_text
+from mitos.mcp_server import surface_decisions
+from mitos.rejections import enumerate_rejected_paths, rejection_points
+from mitos.vector_store import RejectionPoint, hash_to_uuid
+
+sys.path.insert(0, os.path.dirname(__file__))
+import _calibration_record as R  # noqa: E402
+import _semantic_harness as H  # noqa: E402
+
+# The query form's window. The draft form reads the gather's own window
+# (``conflict.CONFLICT_OVERFETCH_LIMIT``), which is what the pause sees.
+RECORD_LIMIT = 10
+# Retagged by 2c: the query form now reads through the shared identity walk (one call at
+# the over-fetch bound, ids only), so runs before and after can be told apart. Retagged
+# by 2d: the draft form's gather reads through the same walk (one call at the gather raw
+# bound, ids only). Retagged by 5b: the query form's envelope carries the shipped
+# rejection leg's section, and items are read through the shipped rejection client.
+# Not retagged by 6a: every query-form hit now carries its lexical overlap with the
+# query, but it is derived from the node already in hand, not read through a new path,
+# and the runs that first carry it (`harbor-20261017-15ccebb` on) record this string.
+# Retagged by 7a: the draft form's targets and negatives are valued from the gather's
+# whole fetch, and every retired-precedent read asks the shipped tombstone review.
+READER = ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
+          "+conflict.gather_candidates(retrieval_walk)+sync._review_tombstones")
+# The per-item reader (5b): one shipped-client search over the whole collection,
+# labelled by this module's own map.
+ITEM_READER = "QdrantRejectionIndex.search(limit=all)+rejections.rejection_points"
+# The instrument's search waits this long: it reads the whole collection, not the
+# ranked read's fetch, and an overrun here would be a missing measurement, not a
+# section state. The shipped leg keeps its own budget.
+ITEM_SEARCH_BUDGET_SECONDS = 5.0
+# How far an envelope match's score may sit from the instrument's for the same item.
+AGREEMENT_TOLERANCE = 1e-6
+# The reader's own live predicate (``surface_decisions`` and ``gather_candidates`` both).
+LIVE_STATES = ("active", "drifted")
+MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
+
+
+class RecordingVectorStore:
+    """Wraps a vector store and keeps every ``query`` call's limit, raw result and
+    ``with_payload`` flag, as ``(limit, result, with_payload)``.
+
+    Duck-typed on purpose: the readers call only ``query``, and every other attribute
+    passes through. It defines no ``__len__`` or ``__bool__``, so the readers' truthiness
+    test on the store sees a plain object.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls: List[Tuple[int, List[Dict[str, Any]], bool]] = []
+
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
+        # Forwards the keyword: since 2c the ranked readers pass ``with_payload=False``,
+        # and a wrapper rejecting it would raise inside the reader's catch-all and turn
+        # every read into a degraded one. The result stays at index 1.
+        result = self._inner.query(vector, limit=limit, with_payload=with_payload)
+        self.calls.append((limit, result, with_payload))
+        return result
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        self._inner.delete_points(point_ids)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+@dataclass
+class ItemIndex:
+    """The per-item rejection index a read searches, and the map it labels hits with.
+
+    ``client`` is a ``QdrantRejectionIndex`` (or a test double honouring its
+    ``search``); ``points`` maps every point id the collection should hold to ``(owner
+    slug, ordinal, part index)``, built by `item_points_of` from the graph, never from
+    the collection. Ids are the lowercase dashed UUIDs Qdrant returns.
+    """
+
+    client: Any
+    points: Dict[str, Tuple[str, int, int]]
+
+
+@dataclass
+class ShapeCollections:
+    """Harbor's two rejection-index shapes, populated, and the maps a read labels hits with.
+
+    ``items_index`` is a ``QdrantRejectionIndex`` on the per-item collection, written in
+    production's shape; ``fields_vstore`` a ``QdrantVectorStore`` on the per-decision
+    one. ``item_points`` maps a per-item point id to ``(owner slug, ordinal, part
+    index)``; ``field_points`` maps a per-decision point id to its owner slug. Both ids
+    are the lowercase dashed UUIDs Qdrant returns.
+    """
+
+    items_index: Any
+    fields_vstore: Any
+    item_points: Dict[str, Tuple[str, int, int]]
+    field_points: Dict[str, str]
+
+    @property
+    def counts(self) -> Dict[str, int]:
+        return {"per_item": len(self.item_points), "per_decision": len(self.field_points)}
+
+    @property
+    def items(self) -> ItemIndex:
+        """The per-item shape as the reader binds it (`CalibrationIndex.items`)."""
+        return ItemIndex(self.items_index, self.item_points)
+
+
+@dataclass
+class CalibrationIndex:
+    """The built Harbor graph, its Layer C collection and what a read needs to label hits.
+
+    ``items`` is the per-item rejection index a read searches (Harbor: the live module's
+    shape fixture binds ``shapes.items``; the copy: the dense worker binds the copy's
+    own ``rejection_collection``). ``shapes`` is Harbor's two throwaway shape
+    collections, which add the per-decision shape. An item-measured read without
+    ``items`` raises rather than recording a result with no items.
+    """
+
+    store: Any
+    provider: Any
+    vstore: Any
+    workspace: str
+    nodes: List[Dict[str, Any]]
+    nodes_by_slug: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    nodes_by_point_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    live_by_slug: Dict[str, bool] = field(default_factory=dict)
+    shapes: Optional[ShapeCollections] = None
+    items: Optional[ItemIndex] = None
+
+    @property
+    def decision_count(self) -> int:
+        return sum(1 for n in self.nodes if n["kind"] == "decision")
+
+
+@dataclass
+class FormRead:
+    """One fixture read: the derived result plus what the live rows check it against."""
+
+    result: Dict[str, Any]
+    calls: List[Tuple[int, List[Dict[str, Any]]]]
+    envelope: Optional[Dict[str, Any]] = None
+    candidates: Optional[Any] = None   # the draft form's ``conflict.Gathering``
+    shape_searches: Optional[Dict[str, int]] = None
+    item_ranking: Optional[List[Dict[str, Any]]] = None  # the instrument's collapsed items
+    # 7a: the shipped tombstone review's shown slugs on a retired-precedent draft read
+    # (the agreement ran); None on any other read or a build without the review.
+    tombstones: Optional[List[str]] = None
+
+
+class SectionDisagreement(Exception):
+    """The envelope's rejection section is not the instrument's ranking cut at the floor.
+
+    Also raised when the section was not searched or not whole, since then nothing can
+    be compared. A fault for the fixture: the run it belongs to is unrecordable.
+    """
+
+
+class TombstoneDisagreement(Exception):
+    """A retired-precedent target at or above the tombstone floor is not a tombstone.
+
+    ``read_draft_form`` asks the shipped review (``sync._review_tombstones``) over the
+    gathering it holds, with nothing declared: every retired target the instrument
+    measured at or above the floor must come back as a tombstone, or the instrument and
+    the surface disagree. A fault for the fixture, like `SectionDisagreement`.
+    """
+
+
+class DraftReadUnavailable(Exception):
+    """``gather_candidates`` returned ``Unavailable``; the caller decides skip or fail."""
+
+    def __init__(self, unavailable: Any) -> None:
+        super().__init__(f"Unavailable(reason={unavailable.reason.value}): {unavailable.detail}")
+        self.unavailable = unavailable
+
+
+# ---------------------------------------------------------------------------
+# Population
+# ---------------------------------------------------------------------------
+
+def expected_set(store: Any) -> List[Dict[str, Any]]:
+    """Returns every decision node, any state, plus the open questions the graph holds.
+
+    The production expected set (vision §4.5). Decisions come from ``get_all_nodes``,
+    which keeps retired ones; open questions from ``get_open_questions``.
+    """
+    decisions = [n for n in store.get_all_nodes() if n["kind"] == "decision"]
+    return decisions + list(store.get_open_questions())
+
+
+def index_graph(store: Any, provider: Any = None, vstore: Any = None) -> CalibrationIndex:
+    """Builds the index's maps over the expected set; touches no service.
+
+    ``live`` per slug is the readers' own predicate: a decision whose ``get_node_state``
+    is active or drifted. An open question is never live, and ``get_node_state`` is never
+    asked about one (it answers ``"active"`` for a resolved question, since state comes
+    only from kill edges). The offline fixture rows call this with no provider and no
+    vector store, to resolve item refs over a built graph.
+
+    Returns:
+        A `CalibrationIndex` without a workspace (the caller sets it).
+    """
+    nodes = expected_set(store)
+    slugs = [n["slug"] for n in nodes]
+    duplicates = sorted({s for s in slugs if slugs.count(s) > 1})
+    assert not duplicates, (
+        f"slugs must be unique: fixtures name nodes by slug and labels are slugs "
+        f"(hits join by point id); duplicated: {duplicates}"
+    )
+    index = CalibrationIndex(store=store, provider=provider, vstore=vstore, workspace="", nodes=nodes)
+    for node in nodes:
+        index.nodes_by_slug[node["slug"]] = node
+        index.nodes_by_point_id[hash_to_uuid(node["id"])] = node
+        index.live_by_slug[node["slug"]] = (
+            node["kind"] == "decision" and store.get_node_state(node["id"]) in LIVE_STATES
+        )
+    assert len(index.nodes_by_point_id) == len(nodes), "two nodes share a point id"
+    return index
+
+
+def populate_layer_c(store: Any, provider: Any, vstore: Any) -> CalibrationIndex:
+    """Embeds the expected set into the Layer C collection, with production's payload.
+
+    The payload's ``state`` is the literal ``"active"`` on every point, a retired one
+    included, because every production write path writes that literal; the reader then
+    sees what it would see in production. The maps come from `index_graph`.
+
+    Args:
+        store: The built Harbor ``GraphStore``.
+        provider: The embedding provider on the model-keyed golden cache.
+        vstore: The ``QdrantVectorStore`` bound to the Layer C collection.
+
+    Returns:
+        A `CalibrationIndex` without a workspace (the caller sets it).
+    """
+    index = index_graph(store, provider, vstore)
+    for node in index.nodes:
+        text = H._derive_embedding_text(node)
+        vector = provider.get_embedding(text, is_query=False)
+        payload = {
+            "slug": node["slug"],
+            "scope": node.get("scope") or [],
+            "state": "active",
+            "kind": node["kind"],
+            "embedding_text": text,
+        }
+        # The raw 64-hex node id; upsert hashes it. A covering write: the collection holds
+        # the whole expected set, so it may bring the collection into existence.
+        vstore.upsert(node["id"], vector, payload, may_create=True)
+    return index
+
+
+def _decisions(index: CalibrationIndex) -> List[Dict[str, Any]]:
+    """Every decision in the expected set, retired ones included (§4.6: their items stay)."""
+    return [n for n in index.nodes if n["kind"] == "decision"]
+
+
+def item_points_of(index: CalibrationIndex) -> Dict[str, Tuple[str, int, int]]:
+    """Maps every rejection point of every decision to ``(owner slug, ordinal, part)``.
+
+    Built from ``rejections.rejection_points`` over the graph, retired owners included
+    (§4.6: their items stay), so it is the instrument's own answer to "which item is
+    this point", independent of the collection being read.
+    """
+    points: Dict[str, Tuple[str, int, int]] = {}
+    for node in _decisions(index):
+        for pid, ref in rejection_points(node["id"], node.get("rejected_paths") or "").items():
+            points[pid] = (node["slug"], ref.ordinal, ref.part_index)
+    return points
+
+
+def populate_shape_collections(index: CalibrationIndex, items_index: Any, fields_vstore: Any) -> ShapeCollections:
+    """Embeds both rejection-index shapes over every decision, each text as a document.
+
+    Per item, in production's shape (5b): one point per ``rejections.rejection_points``
+    entry, its part text embedded, written through ``QdrantRejectionIndex.upsert_points``
+    under its own id with the payload ``{owner_id, model}``. Per decision: one point at
+    ``hash_to_uuid(node id)``, holding ``canonical_core_string_norm(field)`` embedded,
+    payload ``{"owner": node id}``; nothing reads it but `search_points`. An empty field
+    contributes no point in either shape.
+
+    Args:
+        index: A populated `CalibrationIndex` (its provider embeds).
+        items_index: A ``QdrantRejectionIndex`` bound to the per-item collection.
+        fields_vstore: A ``QdrantVectorStore`` bound to the per-decision collection.
+
+    Returns:
+        The `ShapeCollections`.
+    """
+    item_points = item_points_of(index)
+    field_points: Dict[str, str] = {}
+    points: List[RejectionPoint] = []
+    for node in _decisions(index):
+        field_text = node.get("rejected_paths") or ""
+        for pid, ref in rejection_points(node["id"], field_text).items():
+            vector = index.provider.get_embedding(ref.text, is_query=False)
+            points.append(RejectionPoint(point_id=pid, owner_id=node["id"], vector=vector))
+        whole = canonical_core_string_norm(field_text)
+        if whole:
+            vector = index.provider.get_embedding(whole, is_query=False)
+            fields_vstore.upsert(node["id"], vector, {"owner": node["id"]}, may_create=True)
+            field_points[hash_to_uuid(node["id"])] = node["slug"]
+    items_index.upsert_points(points, model=index.provider.model_id, may_create=True)
+    return ShapeCollections(items_index, fields_vstore, item_points, field_points)
+
+
+def resolve_item_refs(index: CalibrationIndex, fixture: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Resolves a fixture's ``{owner, option}`` refs to items of the built graph.
+
+    ``option`` names the one item of the owner's field whose identity text (the item
+    without its marker) starts with it, both under ``canonical_core_string_norm``. The
+    match is case-sensitive. An ordinal is never authored, because a later edit of the
+    line can shift it; the prefix survives a renumbering.
+
+    Args:
+        index: An index over the built graph (`index_graph` suffices).
+        fixture: A validated fixture.
+
+    Returns:
+        ``{"targets": [...], "negatives": [...]}``, each ref as ``{owner, option, ordinal,
+        part_ids, field_id}``: the item's part point ids and its owner's whole-field id.
+        A negative also carries its ``kind`` (generic or vocabulary).
+
+    Raises:
+        ValueError: Naming the fixture, on an owner that is not a decision of the graph,
+            or an option matching no item or several.
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {"targets": [], "negatives": []}
+    for key, role in (("target_items", "targets"), ("negative_items", "negatives")):
+        for ref in fixture.get(key, []):
+            node = index.nodes_by_slug.get(ref["owner"])
+            if node is None or node["kind"] != "decision":
+                raise ValueError(f"fixture {fixture['id']!r}: item owner {ref['owner']!r} is not a decision of the graph")
+            field_text = node.get("rejected_paths") or ""
+            option = canonical_core_string_norm(ref["option"])
+            items = enumerate_rejected_paths(field_text).items
+            matches = [i for i in items if canonical_core_string_norm(i.identity_text).startswith(option)]
+            if len(matches) != 1:
+                named = [i.identity_text[:60] for i in matches]
+                raise ValueError(
+                    f"fixture {fixture['id']!r}: option {ref['option']!r} of {ref['owner']!r} matches "
+                    f"{len(matches)} items {named}; it must name exactly one"
+                )
+            item = matches[0]
+            part_ids = [pid for pid, p in rejection_points(node["id"], field_text).items()
+                        if p.ordinal == item.ordinal]
+            resolved = {"owner": ref["owner"], "option": ref["option"], "ordinal": item.ordinal,
+                        "part_ids": part_ids, "field_id": hash_to_uuid(node["id"])}
+            if "kind" in ref:
+                resolved["kind"] = ref["kind"]
+            out[role].append(resolved)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Reads
+# ---------------------------------------------------------------------------
+
+def label_hits(index: CalibrationIndex, raw: List[Dict[str, Any]], exclude: List[str], *,
+               query: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Labels raw hits with slug, kind, liveness and self for `derive_result`.
+
+    Each hit joins to its node through its ``point_id`` — never its payload slug, which
+    an ids-only read does not carry — and the label is the node's slug. A point id this
+    collection was not built from asserts: the collection holds exactly the expected set.
+
+    With ``query`` (the query form, 6a), each hit also carries ``overlap``: the share of
+    the query's terms its slug and mechanisms hold (`_calibration_record.overlap`, through
+    the shipped tokenizer). The node is already in hand, so it costs no read.
+    """
+    hits = []
+    for h in raw:
+        node = index.nodes_by_point_id.get(h["point_id"])
+        assert node is not None, f"hit {h['point_id']!r} is not a point this collection was built from"
+        slug = node["slug"]
+        hits.append({
+            "slug": slug,
+            "value": h["score"],
+            "kind": node["kind"],
+            "live": index.live_by_slug[slug],
+            "self": slug in exclude,
+        })
+        if query is not None:
+            hits[-1]["overlap"] = R.overlap(query, slug, node.get("mechanisms") or [],
+                                            terms=lexical._query_terms,
+                                            stopwords=lexical.DISPLAY_STOPWORDS)
+    return hits
+
+
+def _one_call(proxy: RecordingVectorStore, fixture: Dict[str, Any]) -> List[Dict[str, Any]]:
+    assert len(proxy.calls) == 1, (
+        f"fixture {fixture['id']!r}: the reader made {len(proxy.calls)} proxied query "
+        f"calls; exactly one is the shipped shape"
+    )
+    return proxy.calls[0][1]
+
+
+def search_points(base_url: str, collection: str, vector: List[float], limit: int) -> List[Dict[str, Any]]:
+    """One raw ``POST …/points/search`` with ``exact`` set, for Harbor's per-decision shape.
+
+    The per-decision shape has no shipped reader, so it keeps this raw read as ruling 2's
+    recorded evidence; ``exact`` makes "every point valued" a declaration rather than a
+    consequence of the collection sitting below HNSW's indexing threshold. The per-item
+    shape is read through the shipped client instead (`read_rejection_items`).
+
+    Returns:
+        ``[{"id", "score", "payload"}]``, best first.
+
+    Raises:
+        requests.HTTPError: On a non-2xx answer.
+        ValueError: If the body's ``result`` is not a list of hits.
+    """
+    resp = requests.post(
+        f"{base_url.rstrip('/')}/collections/{collection}/points/search",
+        json={"vector": vector, "limit": limit, "with_payload": True, "params": {"exact": True}},
+        timeout=5,
+    )
+    resp.raise_for_status()
+    result = resp.json().get("result")
+    if not isinstance(result, list):
+        raise ValueError(f"search on {collection!r} returned result {result!r}, not a list")
+    return [{"id": h["id"], "score": h["score"], "payload": h.get("payload")} for h in result]
+
+
+def search_items(index: CalibrationIndex, vector: List[float], fixture_id: str) -> List[Dict[str, Any]]:
+    """The instrument's uncensored per-item ranking: one shipped-client search, every point.
+
+    ``limit`` is the map's point count and the search must return exactly that many hits,
+    each a point of the map, so a value is never missing for an approximate index or a
+    stray point. Hits are labelled from ``index.items.points``.
+
+    Returns:
+        ``[{point_id, owner, ordinal, part, value, owner_live}]``, best first.
+
+    Raises:
+        ValueError: If no per-item index is bound, naming the fixture.
+        AssertionError: If the search overran or did not return every point, or a hit is
+            not a point the map holds.
+    """
+    items = index.items
+    if items is None:
+        raise ValueError(
+            f"fixture {fixture_id!r}: measure `item` needs a per-item rejection index "
+            f"(CalibrationIndex.items is unset)"
+        )
+    search = items.client.search(vector, len(items.points), budget_seconds=ITEM_SEARCH_BUDGET_SECONDS)
+    assert search.searched, f"fixture {fixture_id!r}: the per-item search overran its budget"
+    assert len(search.hits) == len(items.points), (
+        f"fixture {fixture_id!r}: per_item search returned {len(search.hits)} of {len(items.points)} points"
+    )
+    hits = []
+    for h in search.hits:
+        assert h.point_id in items.points, f"per_item hit {h.point_id!r} is not a point of the graph's map"
+        owner, ordinal, part = items.points[h.point_id]
+        hits.append({"point_id": h.point_id, "owner": owner, "ordinal": ordinal, "part": part,
+                     "value": h.score, "owner_live": index.live_by_slug[owner]})
+    return hits
+
+
+def read_rejection_items(
+    index: CalibrationIndex, fixture: Dict[str, Any], vector: List[float],
+    item_hits: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Reads a rejection-target fixture's items and derives ``items``; the one item reader.
+
+    ``per_item`` always, through the shipped client (`search_items`; pass ``item_hits``
+    to reuse a search already made with this vector). ``per_decision`` only when Harbor's
+    throwaway ``shapes`` are bound, through `search_points`, which must return every
+    point too. Either way ``absent`` on a ref can only mean an unresolved ref, never a
+    censored low score.
+
+    Returns:
+        The pure ``items`` value and the number of searches made per shape.
+    """
+    refs = resolve_item_refs(index, fixture)
+    hits_by_shape = {"per_item": item_hits if item_hits is not None
+                     else search_items(index, vector, fixture["id"])}
+    searches = {"per_item": 1}
+    shapes = index.shapes
+    if shapes is not None:
+        points = shapes.field_points
+        raw = search_points(shapes.fields_vstore.base_url, shapes.fields_vstore.collection, vector, len(points))
+        searches["per_decision"] = 1
+        assert len(raw) == len(points), (
+            f"fixture {fixture['id']!r}: per_decision search returned {len(raw)} of {len(points)} points"
+        )
+        hits = []
+        for h in raw:
+            assert h["id"] in points, f"per_decision hit {h['id']!r} is not a point this population wrote"
+            owner = points[h["id"]]
+            hits.append({"point_id": h["id"], "owner": owner, "ordinal": None, "part": None,
+                         "value": h["score"], "owner_live": index.live_by_slug[owner]})
+        hits_by_shape["per_decision"] = hits
+    return R.derive_item_result(fixture, hits_by_shape, refs), searches
+
+
+def section_of(envelope: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The envelope's rejection matches, reduced to slug, ordinal, score and letter."""
+    return [{"slug": m["slug"], "ordinal": m["ordinal"], "score": m["score"], "letter": m["letter"]}
+            for m in envelope.get("rejection_matches") or []]
+
+
+def expected_section(item_hits: List[Dict[str, Any]], floor: float, bound: int) -> List[Dict[str, Any]]:
+    """The section the instrument predicts: its collapsed items at or above ``floor``, first ``bound``.
+
+    Collapsed with Layer C's own ``_collapse`` (an item's parts at its best part's
+    value), never through ``fill_rejections``.
+    """
+    units = R._collapse(item_hits, per_item=True)
+    return [{"slug": u["key"][0], "ordinal": u["key"][1], "score": u["value"]}
+            for u in units if u["value"] >= floor][:bound]
+
+
+def check_section_agreement(fixture_id: str, envelope: Dict[str, Any],
+                            item_hits: List[Dict[str, Any]], floor: float, bound: int) -> None:
+    """Checks the shipped section against the instrument's ranking at the floor in force.
+
+    The envelope's ``(slug, ordinal)`` list must equal `expected_section`'s, in order,
+    each score within ``AGREEMENT_TOLERANCE``. A section that was not searched or is not
+    whole compares nothing and is a disagreement too.
+
+    Raises:
+        SectionDisagreement: Naming the fixture and both lists.
+    """
+    state = envelope.get("rejection_section")
+    if state is not None:
+        raise SectionDisagreement(f"fixture {fixture_id!r}: the section is {state!r}; nothing to compare")
+    shown = section_of(envelope)
+    predicted = expected_section(item_hits, floor, bound)
+    same = [(m["slug"], m["ordinal"]) for m in shown] == [(p["slug"], p["ordinal"]) for p in predicted]
+    if not same or any(abs(m["score"] - p["score"]) > AGREEMENT_TOLERANCE for m, p in zip(shown, predicted)):
+        raise SectionDisagreement(
+            f"fixture {fixture_id!r}: shipped section {[(m['slug'], m['ordinal'], m['score']) for m in shown]} "
+            f"!= instrument {[(p['slug'], p['ordinal'], p['score']) for p in predicted]} "
+            f"(floor {floor}, bound {bound})"
+        )
+
+
+def read_query_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:
+    """Reads a query-form fixture through MCP ``surface_decisions``.
+
+    The text is embedded once here first, through the same provider: the reader
+    swallows an embedding fault into a degraded envelope, so this is where a quota
+    fault can propagate. The reader's own embed is then a cache hit with the same vector.
+
+    With a per-item index bound, the read binds ``mcp_server._ranked_rejection_index``
+    to its client, searches the items with the same vector, and checks the envelope's
+    section against that ranking (`check_section_agreement`) for every query-form
+    fixture, not only rejection targets. ``section`` and ``section_state`` are recorded
+    on every query-form result either way. An item-measured fixture derives ``items``.
+
+    Raises:
+        SectionDisagreement: With a per-item index bound, when the section disagrees.
+    """
+    vector = index.provider.get_embedding(fixture["text"], is_query=True)
+    proxy = RecordingVectorStore(index.vstore)
+    with patch("mitos.mcp_server.get_workspace_components") as components:
+        components.return_value = (index.store, index.provider, proxy)
+        if index.items is not None:
+            with patch("mitos.mcp_server._ranked_rejection_index", return_value=index.items.client):
+                envelope = json.loads(
+                    surface_decisions(fixture["text"], project=index.workspace, limit=RECORD_LIMIT, brief=True)
+                )
+        else:
+            envelope = json.loads(
+                surface_decisions(fixture["text"], project=index.workspace, limit=RECORD_LIMIT, brief=True)
+            )
+    # The raw ranking the shipped path received, up to `RECORD_LIMIT`: since 2c the
+    # walk fetches at the over-fetch bound (every Harbor point), so the slice keeps the
+    # recorded window the size it always was.
+    raw = _one_call(proxy, fixture)[:RECORD_LIMIT]
+    hits = label_hits(index, raw, fixture.get("exclude", []), query=fixture["text"])
+    result = R.derive_result(fixture, hits, envelope.get("confidence"), None,
+                             envelope_evidence=envelope.get("band_evidence"))
+    result["section"] = section_of(envelope)
+    result["section_state"] = envelope.get("rejection_section")
+    item_hits = ranking = None
+    if index.items is not None:
+        item_hits = search_items(index, vector, fixture["id"])
+        ranking = expected_section(item_hits, -1.0, len(item_hits))
+        check_section_agreement(fixture["id"], envelope, item_hits,
+                                recall.REJECTION_MATCH_FLOOR, recall.REJECTION_SECTION_BOUND)
+    searches = None
+    if fixture["measure"] == "item":
+        result["items"], searches = read_rejection_items(index, fixture, vector, item_hits)
+    return FormRead(result=result, calls=proxy.calls, envelope=envelope, shape_searches=searches,
+                    item_ranking=ranking)
+
+
+def read_draft_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:
+    """Reads a draft-form fixture through ``conflict.gather_candidates`` (the pause's gather).
+
+    Embeds the gather's own text once first, for the same reason as `read_query_form`:
+    the gather turns an embedding fault into ``Unavailable``.
+
+    Raises:
+        DraftReadUnavailable: When the gather returns ``Unavailable``.
+    """
+    index.provider.get_embedding(
+        embedding_text({"kind": "decision", "axiom": fixture["text"]}), is_query=False
+    )
+    proxy = RecordingVectorStore(index.vstore)
+    gathering = conflict.gather_candidates(
+        fixture["text"], embed_provider=index.provider, vector_store=proxy, store=index.store
+    )
+    if isinstance(gathering, conflict.Unavailable):
+        raise DraftReadUnavailable(gathering)
+    # 7a: targets and negatives are valued from the gather's whole fetch (at the raw
+    # bound since 2d), so a retired target ranked past the 20th raw point is measured
+    # wherever it sits (vision §5.3); over the measurement copy's 595 points it can be.
+    # The recorded raw window keeps its first `CONFLICT_OVERFETCH_LIMIT` hits, the size it
+    # always was, and on Harbor every value is unchanged.
+    raw = _one_call(proxy, fixture)
+    hits = label_hits(index, raw, fixture.get("exclude", []))
+    result = R.derive_result(fixture, hits, None, _pause_floor_of(fixture))
+    result["hits"] = result["hits"][:conflict.CONFLICT_OVERFETCH_LIMIT]
+    tombstones = (check_tombstone_agreement(index, fixture, result, gathering)
+                  if fixture["class"] == "retired-precedent" else None)
+    return FormRead(result=result, calls=proxy.calls, candidates=gathering, tombstones=tombstones)
+
+
+def _pause_floor_of(fixture: Dict[str, Any]) -> float:
+    """The floor a draft fixture's class pauses at: a retired target meets the tombstone
+    floor (7a), every other class the live neighbour floor. A build before 7a has no
+    tombstone floor and its draft fixtures all read the live one."""
+    if fixture["class"] == "retired-precedent" and hasattr(sync, "_TOMBSTONE_FLOOR"):
+        return sync._TOMBSTONE_FLOOR
+    return sync._NEIGHBOR_REVIEW_THRESHOLD
+
+
+def check_tombstone_agreement(index: CalibrationIndex, fixture: Dict[str, Any],
+                              result: Dict[str, Any], gathering: Any) -> Optional[List[str]]:
+    """Asserts the shipped review shows every retired target at or above its floor (§6.6).
+
+    Calls ``sync._review_tombstones`` on the gathering the reader already holds, on a
+    store-only manager shell, with nothing declared and no bound, and requires each
+    target whose measured value is at or above the tombstone floor among the shown
+    tombstones. Feature-detected: a build without the review reads as before (``None``).
+
+    Returns:
+        The shown tombstones' slugs, or ``None`` on a build without the review.
+
+    Raises:
+        TombstoneDisagreement: When a target at or above the floor is not shown.
+    """
+    if not hasattr(sync.MitosSyncManager, "_review_tombstones"):
+        return None
+    shell = object.__new__(sync.MitosSyncManager)
+    shell.store = index.store
+    review = shell._review_tombstones(
+        gathering,
+        sync.DeclaredReview(slugs=set(), ids_by_target={}, ids=set(), direct_ids={}),
+        shown_neighbors=[], bound=None)
+    shown = [t["slug"] for t in review.shown]
+    floor = sync._TOMBSTONE_FLOOR
+    missing = [t["slug"] for t in result["targets"]
+               if t["value"] is not None and t["value"] >= floor and t["slug"] not in shown]
+    if missing:
+        raise TombstoneDisagreement(
+            f"fixture {fixture['id']!r}: target(s) {missing} sit at or above the tombstone "
+            f"floor {floor} but the shipped review shows {shown}"
+        )
+    return shown
+
+
+def read_fixture(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:
+    """Reads one fixture through the reader its form names."""
+    if fixture["form"] == "query":
+        return read_query_form(index, fixture)
+    return read_draft_form(index, fixture)
+
+
+# ---------------------------------------------------------------------------
+# Runs
+# ---------------------------------------------------------------------------
+
+def constants_in_force() -> Dict[str, Any]:
+    """Returns the runtime value of every name in the threshold population: the "before"."""
+    out: Dict[str, Any] = {}
+    for dotted in R.threshold_population(MITOS_DIR):
+        module, _, name = dotted.rpartition(".")
+        out[dotted] = getattr(importlib.import_module(module), name)
+    return out
+
+
+def run_provenance(provider: Any, index: Optional[CalibrationIndex] = None) -> Dict[str, Any]:
+    """Extends ``_semantic_harness.provenance()`` for a Layer C run.
+
+    The model is the provider's own, so one value flows to the cache path, the provider
+    and the record. The three judge keys are dropped: Layer C makes no judge call. With a
+    per-item index bound, ``item_reader`` names it and ``record_limit.items`` is
+    ``"all"`` (the item read takes the whole collection); with Harbor's shapes,
+    ``shape_points`` gives both shapes' point counts, else ``item_points`` the per-item
+    count. ``constants_in_force`` carries the rejection floor; the section bound rides
+    beside it.
+    """
+    prov = H.provenance()
+    for key in ("judgment_model", "judgment_model_id", "prompt_version"):
+        prov.pop(key, None)
+    prov["embedding_model"] = provider.model_id
+    prov["reader"] = READER
+    prov["record_limit"] = {"query": RECORD_LIMIT, "draft": conflict.CONFLICT_OVERFETCH_LIMIT}
+    if index is not None and index.items is not None:
+        prov["item_reader"] = ITEM_READER
+        prov["record_limit"]["items"] = "all"
+        if index.shapes is not None:
+            prov["shape_points"] = index.shapes.counts
+        else:
+            prov["item_points"] = len(index.items.points)
+    prov["constants_in_force"] = constants_in_force()
+    prov["rejection_section_bound"] = recall.REJECTION_SECTION_BOUND
+    return prov
+
+
+def build_run(index: CalibrationIndex, results: List[Dict[str, Any]], corpus: str = "harbor") -> Dict[str, Any]:
+    """Assembles a run from fixture results (``run_id`` is minted by ``append_run``).
+
+    A harbor run carries ``shapes``, the rejection-shape comparison, computed by the pure
+    module from the item-measured results; a dense run never does.
+    """
+    run = {
+        "corpus": corpus,
+        "decision_count": index.decision_count,
+        "node_count": len(index.nodes),
+        "provenance": run_provenance(index.provider, index),
+        "fixtures": results,
+        "classes": R.summarize_classes(results),
+    }
+    if corpus == "harbor":
+        run["shapes"] = R.summarize_shapes(results)
+    return run
+
+
+# ---------------------------------------------------------------------------
+# The smoke: Layer B's fixtures in Layer C's shape, unlabelled
+# ---------------------------------------------------------------------------
+
+def adapt_layer_b_oracle(oracle: Dict[str, Any], axiom_by_slug: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Adapts ``oracle.semantic.json`` into unlabelled Layer C fixtures for the smoke.
+
+    Each ``retrieval`` entry becomes a query-form read (targets = ``expect_relevant``,
+    negatives = ``expect_absent``); each ``conflict`` entry becomes a draft-form read of
+    its proposal's axiom, target = its candidate, with the proposal excluded as the
+    self-hit. Ids come from the position, because two retrieval entries share a query.
+    Every class is ``null``, so ``append_run`` refuses a run built from these.
+    """
+    fixtures = []
+    for i, entry in enumerate(oracle["retrieval"]):
+        fixtures.append({
+            "id": f"layerb-retrieval-{i}", "class": None, "form": "query",
+            "text": entry["query"], "targets": list(entry["expect_relevant"]),
+            "negatives": list(entry.get("expect_absent", [])), "measure": "target",
+            "notes": f"Layer B retrieval[{i}]" + (f" ({entry['probe']})" if entry.get("probe") else ""),
+        })
+    for i, entry in enumerate(oracle["conflict"]):
+        fixtures.append({
+            "id": f"layerb-conflict-{i}", "class": None, "form": "draft",
+            "text": axiom_by_slug[entry["proposal"]], "targets": [entry["candidate"]],
+            "negatives": [], "measure": "target", "exclude": [entry["proposal"]],
+            "notes": f"Layer B conflict[{i}] ({entry['kind']})",
+        })
+    return R.validate_fixtures(fixtures, require_class=False)

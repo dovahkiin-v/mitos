@@ -573,13 +573,19 @@ def _v1b_schema(conn: sqlite3.Connection) -> None:
 # --- V1c schema (Phase 1c): migration ladder step 3 ----------------------------
 #
 # ``embedding_seed`` — the durable record that ``pending_embeddings`` covers the
-# graph's active set. A row present means exactly one thing, and nothing else may
-# read it into meaning: **the outbox covers the active set**, because a command that
-# bounds it that way said so. It is written by the two operator-invoked verbs that
+# decision index's expected set (every decision plus the active open questions —
+# ``GraphStore.get_decision_index_expected_ids``; the graph's active set until
+# recall-confidence 3b widened it). A row present means exactly one thing, and nothing
+# else may read it into meaning: **the outbox covers the expected set**, because a
+# command that bounds it that way said so. It is written by the two operator-invoked verbs that
 # actually deliver that property (``rebuild``/``cutover``'s prune, and
-# ``reconcile``'s enqueue pass) and read by exactly one consumer,
-# ``MitosSyncManager.drain_pending_embeddings``, which clears it the moment the
-# outbox empties and the claim stops being true.
+# ``reconcile``'s enqueue pass). It has two readers: ``mitos status`` prints it, and
+# ``MitosSyncManager.drain_pending_embeddings`` acts on it — the only one that does.
+# The drain spends the marker it read once its walk has attempted every row standing
+# at its entry with the collection present, or once the backlog is empty; an outage
+# or a refusal keeps it (phase 3a of the recall-confidence vision, which retired the
+# older "clears it the moment the outbox empties" rule once a poison row could stay
+# queued for good).
 #
 # Why a graph table rather than a file in ``.mitos/``: the fact being recorded is
 # *about* ``pending_embeddings``, a graph table, and the graph is the exact artifact
@@ -688,6 +694,102 @@ def _v2a_scope_ordinal(conn: sqlite3.Connection) -> None:
         conn: An open, writable SQLite connection inside the runner's transaction.
     """
     for statement in _V2A_SCOPE_ORDINAL_STATEMENTS:
+        conn.execute(statement)
+
+
+# Step 5 (recall-confidence vision, phase 4a): the rejection index's graph half. This
+# is that vision's one planned graph schema change, and it is three pure adds — no
+# rebuild, no data movement, no backfill (``reconcile`` derives every rejected item
+# from the graph, so an upgraded graph starts with an empty backlog and no marker):
+#
+# 1. ``rejection_backlog`` — one row per decision whose rejected items await a write
+#    to the sibling rejection collection, with retry state of its own. It is its own
+#    table and never a column on ``pending_embeddings``, because the two rows clear
+#    independently: each clears only when its own index took the write.
+#    ``enqueue_seq`` is ``AUTOINCREMENT`` because it is the compare token a clear or a
+#    failure note must present: SQLite never reuses an ``AUTOINCREMENT`` value within
+#    a graph, and every enqueue deletes and re-inserts the row, so no later enqueue
+#    can repeat a token a reader holds (a per-row counter restarts after a clear, and
+#    ``queued_at`` repeats across a rebuild replay or a clock step). It also orders
+#    the queue, so a walk keysets on the primary key and needs no second index.
+#    ``AUTOINCREMENT`` creates SQLite's internal ``sqlite_sequence`` table; a schema
+#    listing names it.
+#    The death story: a row dies when its index took the write (a clear that names
+#    the row's seq), or with its node. Nodes leave a graph only when ``rebuild`` or
+#    ``cutover`` replaces the whole file, and the backlog goes with the old file. The
+#    foreign key is plain (no ``ON DELETE CASCADE``, like every V1a table): a row
+#    naming no node cannot be inserted, and a future node-delete path meets the FK
+#    and decides, as it would at ``pending_embeddings``.
+# 2. ``rejection_seed`` — the rejection index's seed marker, the twin of
+#    ``embedding_seed`` above and spent by its own index's drain only. It is a table
+#    of its own rather than a second row in ``embedding_seed``: that table's
+#    single-row ``CHECK (id = 1)`` and its pinned vocabulary would need a
+#    CHECK-widening rebuild plus a discriminator column every older build's
+#    ``WHERE id = 1`` read would misread, and separate tables make "neither index
+#    spends the other's licence" structural. Not a ``graph_meta(key, value)`` table
+#    either, for the reason ``embedding_seed``'s comment gives (P19).
+# 3. ``idx_pending_embeddings_queue`` — the decision outbox's keyset index, so the
+#    drain's ``ORDER BY queued_at, node_id`` claim seeks instead of scanning and
+#    sorting the whole table on every claim (WIRING_LEDGER entry-007). It rides this
+#    rung because a later index would owe a rung of its own (P20).
+#
+# Every statement is ``IF NOT EXISTS``, so a replay is a no-op twice over: the
+# runner's version gate, and DDL that does nothing on an applied schema. An older
+# build's ladder has no step above 4 and runs nothing over a v5 graph; it neither
+# reads nor writes either new table. No ``CURRENT_TIMESTAMP`` default (MI-10).
+
+# The four producers that may establish the rejection index's coverage. Single-sourced
+# like ``EMBEDDING_SEED_ESTABLISHED_BY`` and interpolated into the CHECK the same way.
+# ``import`` is here and not in the decision marker's set because an import into an
+# empty graph is a producer of this marker.
+REJECTION_SEED_ESTABLISHED_BY: Tuple[str, ...] = (
+    "rebuild",
+    "cutover",
+    "reconcile",
+    "import",
+)
+
+_V4A_REJECTION_ESTABLISHED_BY_SQL: str = (
+    "(" + ", ".join(f"'{verb}'" for verb in REJECTION_SEED_ESTABLISHED_BY) + ")"
+)
+
+_V4A_REJECTION_SUBSTRATE_STATEMENTS: Tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS rejection_backlog (
+        enqueue_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id     TEXT NOT NULL UNIQUE,
+        queued_at   TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (node_id) REFERENCES nodes (id)
+    ) STRICT;
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS rejection_seed (
+        id             INTEGER NOT NULL,
+        established_by TEXT NOT NULL,
+        established_at TEXT NOT NULL,
+        PRIMARY KEY (id),
+        CHECK (id = 1),
+        CHECK (established_by IN {_V4A_REJECTION_ESTABLISHED_BY_SQL})
+    ) STRICT;
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_queue "
+    "ON pending_embeddings (queued_at, node_id);",
+)
+
+
+def _v4a_rejection_substrate(conn: sqlite3.Connection) -> None:
+    """Migration step 5: create the rejection backlog, its seed marker and the outbox index.
+
+    Three pure adds (see the comment above), idempotent for MI-3 replay by
+    construction. Runs inside ``run_migrations``' transaction; does NOT touch
+    ``user_version`` or ``BEGIN``/``COMMIT`` (the runner owns both), and issues one
+    statement per ``conn.execute`` — never ``executescript``.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction.
+    """
+    for statement in _V4A_REJECTION_SUBSTRATE_STATEMENTS:
         conn.execute(statement)
 
 
@@ -916,3 +1018,17 @@ MIGRATION_STEPS.append((3, _v1c_schema))
 # [...]``: ``run_migrations``'s default arg binds the list *object* at def-time
 # (PATTERNS; §7 gotcha).
 MIGRATION_STEPS.append((4, _v2a_scope_ordinal))
+
+
+# --- Rejection substrate registration (recall-confidence phase 4a) -------------
+#
+# Append step 5 — ``rejection_backlog``, ``rejection_seed`` and the outbox's keyset
+# index (see the comment above ``_v4a_rejection_substrate``). The ladder head becomes
+# 5, so a populated v4 graph has a pending step and Phase 1a's pre-ladder snapshot
+# fires on its real ``v4→v5`` boot with ZERO change to that harness, retaining one
+# graph-sized ``graph.sqlite.snapshot_v4`` per upgrading workspace. Read-only stores
+# never run the ladder, so the store's backlog and marker reads treat a missing table
+# as "rung not applied". Use ``.append`` — NEVER rebind ``MIGRATION_STEPS = [...]``:
+# ``run_migrations``'s default arg binds the list *object* at def-time (PATTERNS; §7
+# gotcha).
+MIGRATION_STEPS.append((5, _v4a_rejection_substrate))

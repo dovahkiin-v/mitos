@@ -1,8 +1,9 @@
 """One closed classifier for an embedding-provider failure.
 
 When semantic recall degrades, three places say why: the read header
-(``lexical.degraded_reason_from_error``), ``surface``'s scope-dump note
-(``recall.assess_surface_recall``, which receives the phrase as a string) and the
+(``lexical.degraded_reason_from_error``), ``surface``'s scope-dump note (the dump
+sentence ``recall.assess_surface_recall``'s degraded arm words for
+``degraded.dump_section``, which receives the phrase as a string) and the
 write-path warning (``sync.py``). They say it from this module and nowhere else,
 so for one exception they cannot tell three different stories.
 
