@@ -1,5 +1,17 @@
 # Completed
 
+## 2026-10-19
+
+- **`v-mitos-recall-confidence-20261014` — Recall confidence: recall reaches all of what the corpus knows, and its confidence is a measured claim that shows its evidence.** 34 leaf phases. What it decided, what it rejected, what it retired. Layer C and a committed calibration record (seven pinned constants); a ranked window of live decisions resolved by point id, naming the retired decisions it passed and where its edge lies; a deliberate graveyard re-seeded by `reconcile`; a rejection index with a rejection section on both ranked reads and a field-scoped lookup; a band re-derived from the record with its evidence on the envelope; a record pause that names the retired decisions a draft re-treads; stamp labels. Graph ladder step 5. Shipped at **`mitos 0.20.0`** — merge `2e44dc1`.
+  P1 lines (payloads that changed shape):
+  - `limit` on both ranked reads now counts **live decisions**, not raw points; retired points no longer take window slots.
+  - Additive keys on both ranked reads: `retired_partition` (+ `retired_partition_omitted`), `rejection_matches` / `rejection_section`, `band_evidence`, `stamp_labels` (+ `stamp_labels_unread`); degraded reads name what they did not compute (`not_computed`).
+  - The record pause gains `tombstones` (+ `tombstones_omitted`), `neighbors_omitted`, `descends_from_declared` and `neighbor_review_cut`; the acknowledged receipt gains `acknowledged_tombstones`; a retired node's `exists` receipt gains its handle (`superseded_by` / `corrected_by`, `live_end`, `successor_ambiguous`).
+  - `query_decisions` takes a new `field` argument (`mitos query --field`); a 0.19 server **refuses** it.
+  - Older builds over a reconciled workspace crowd their windows and their gather with re-seeded retired points: move every build first, then `reconcile` (SETUP.md's upgrade section).
+  - Each decision's `rejected_paths` now goes to the embedding provider beside its axiom.
+  - The band's thresholds moved (`strong` 0.75 → 0.8087, `weak` 0.60 → 0.6375), so the same score can read a different band.
+
 ## 2026-10-13
 
 - **`v-mitos-ax-hardening-3-20260919` — AX Hardening 3: every surface says exactly what happened.** 37 leaf phases. The commit gate (`hook-install` / `hook-run`, a local predicate that spends nothing), one audit-debt quantity (`check_coverage`), ranked-read depth (`full_top`, `rejected_paths_withheld`), a drift-refusing pause (`draft_digest`), echo integrity (`mechanisms_normalized`, by-handle `context` / `invalidates_if`), a refusing MCP argument boundary, classified degraded causes, and tool-call markup refused at write. Also first publishes 0.18.4's judge-enum fix. Shipped at **`mitos 0.19.0`** — merge `4f579dc`. This entry was written on 2026-10-19, at the recall-confidence merge: the 0.19.0 merge's lines 11–13 (unscope, the SHIPPED flips, this entry) did not run then, and that vision's 9c ran the out-of-repo half (lines 11–12).
