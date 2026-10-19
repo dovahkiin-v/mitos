@@ -1,5 +1,17 @@
 # Completed
 
+## 2026-10-13
+
+- **`v-mitos-ax-hardening-3-20260919` — AX Hardening 3: every surface says exactly what happened.** 37 leaf phases. The commit gate (`hook-install` / `hook-run`, a local predicate that spends nothing), one audit-debt quantity (`check_coverage`), ranked-read depth (`full_top`, `rejected_paths_withheld`), a drift-refusing pause (`draft_digest`), echo integrity (`mechanisms_normalized`, by-handle `context` / `invalidates_if`), a refusing MCP argument boundary, classified degraded causes, and tool-call markup refused at write. Also first publishes 0.18.4's judge-enum fix. Shipped at **`mitos 0.19.0`** — merge `4f579dc`. This entry was written on 2026-10-19, at the recall-confidence merge: the 0.19.0 merge's lines 11–13 (unscope, the SHIPPED flips, this entry) did not run then, and that vision's 9c ran the out-of-repo half (lines 11–12).
+  P1 lines (payloads that changed shape):
+  - The `created` receipt's `mechanisms` is now **as authored**, not folded, with `mechanisms_normalized` beside it naming each fold.
+  - Lexical `matched_terms` drops stopwords and counts what it dropped.
+  - An unknown MCP argument is now **refused** instead of silently dropped.
+  - Tool-call markup in a field is refused at `record_decision` / `amend_commentary`.
+  - `show_node` / `mitos show --json` on an open question returns the stored topic under `topic` (it held the slug) and the slug under a new `slug` key.
+  - `degraded_reason` changes text for an `EmbeddingError`, a missing collection and a pre-V1a graph.
+  - Additive: `audit_debt`, `check_notice`, `acknowledged_neighbors`, the edge echo's `target_*` keys, `full_top`, `rejected_paths_withheld`, `draft_digest`, and by-handle `mechanisms` / `invalidates_if` / `context`.
+
 ## 2026-09-18
 
 - **`v-mitos-surface-entropy-20260905` — Surface entropy.** Rotation made durable and given reach on both write paths; authored scope order; an honest render ceiling at both tiers with the vacated-scope sweep; the scope-health report; `mitos amend-commentary` and the eighth MCP tool; `status` reports buffer size and `skill.md` drift. 22 leaf phases, 35 contract rows. Shipped at **`mitos 0.18.0`** — merge `4dbe4b8`. Known issue: archives rotated by a released 0.17.4 or earlier hold each batch oldest-first, and `mitos rebuild` may refuse with `missing_target` — reverse the blocks, newest on top, and rebuild (`SETUP.md`).
